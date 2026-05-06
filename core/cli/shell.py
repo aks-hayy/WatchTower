@@ -129,26 +129,6 @@ Note: Requires administrator/root privileges for packet capture."""
         from core.cli.modules.capture import CaptureModule
         CaptureModule(opts).run()
 
-        options = {}
-        if "--source" in args:
-            idx = args.index("--source")
-            if idx + 1 < len(args):
-                options["source"] = args[idx+1]
-        
-        module = AIModule(options)
-        if cmd == "chat":
-            module.run_chat()
-        elif cmd == "investigate":
-            try:
-                alert_id = int(args[1]) if len(args) > 1 else None
-                module.run_investigation(alert_id)
-            except ValueError:
-                console.print("[red]Error: Alert ID must be an integer.[/red]")
-        elif cmd == "status":
-            module.show_status()
-        else:
-            console.print(f"[red]Unknown AI command: {cmd}[/red]")
-
     def do_background(self, arg):
         """Configure Watchtower for persistent background monitoring.
 

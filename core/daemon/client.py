@@ -13,11 +13,15 @@ class DaemonClient:
 
     def _get_key(self):
         if not os.path.exists(self.key_file):
+            # print(f"DEBUG: Key file missing: {self.key_file}")
             return None
         try:
             with open(self.key_file, "r") as f:
-                return f.read().strip()
-        except Exception:
+                key = f.read().strip()
+                # print(f"DEBUG: Client read key from {self.key_file}")
+                return key
+        except Exception as e:
+            # print(f"DEBUG: Error reading key file: {e}")
             return None
 
     def _recv_line(self, sock):

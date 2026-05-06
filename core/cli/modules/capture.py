@@ -42,12 +42,10 @@ class CaptureModule:
         if "interface" in self.options and self.options["interface"]:
             interfaces = [self.options["interface"]]
         else:
-            # Auto-select primary
-            resolved = self.config.resolve_interface()
-            if resolved: interfaces = [resolved]
+            # Interactive Selection
+            interfaces = self._select_interfaces(multi=True)
 
         if not interfaces:
-            console.print("[red]Error: No network interface specified or found.[/red]")
             return
 
         if background:
@@ -79,39 +77,8 @@ class CaptureModule:
         from core.daemon.client import DaemonClient
         client = DaemonClient()
         
-        console.print("[bold cyan]--- Watchtower Background Mode Setup ---[/bold cyan]")
-        
-        # 1. Select Interfaces
-        import scapy.all as scapy
-        # Use scapy.conf.ifaces for richer interface metadata
-        ifaces = sorted(scapy.conf.ifaces.values(), key=lambda x: (not x.ip, x.name))
-        
-        table = Table(title="Available Interfaces")
-        table.add_column("ID", style="cyan", justify="right")
-        table.add_column("Name", style="bold white")
-        table.add_column("Description", style="dim")
-        table.add_column("IP Address", style="green")
-        
-        for i, iface in enumerate(ifaces):
-            ip_str = iface.ip if iface.ip and iface.ip != "0.0.0.0" else "-"
-            table.add_row(str(i), str(iface.name), str(iface.description), ip_str)
-        
-        console.print(table)
-        choice = console.input("[bold white]Select interface IDs to monitor (comma separated, or 'all'): [/bold white]")
-        
-        selected = []
-        if choice.lower() == 'all':
-            selected = [str(iface.name) for iface in ifaces if iface.ip] # Default to ones with IP
-        else:
-            try:
-                indices = [int(x.strip()) for x in choice.split(",")]
-                selected = [str(ifaces[idx].name) for idx in indices if 0 <= idx < len(ifaces)]
-            except (ValueError, IndexError):
-                console.print("[red]Invalid selection.[/red]")
-                return
-
+        selected = self._select_interfaces(multi=True, title="Watchtower Background Mode Setup")
         if not selected:
-            console.print("[yellow]No interfaces selected. Aborting.[/yellow]")
             return
 
         # 2. Activate
@@ -184,3 +151,43 @@ class CaptureModule:
         client = DaemonClient()
         status = client.get_status()
         return status.get("interfaces", [])
+
+    def _select_interfaces(self, multi=True, title="Interface Selection"):
+        """Show an interactive table and return a list of selected interface names."""
+        import scapy.all as scapy
+        ifaces = sorted(scapy.conf.ifaces.values(), key=lambda x: (not x.ip, x.name))
+        
+        console.print(f"\n[bold cyan]--- {title} ---[/bold cyan]")
+        table = Table(title="Available Interfaces")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="bold white")
+        table.add_column("Description", style="dim")
+        table.add_column("IP Address", style="green")
+        
+        for i, iface in enumerate(ifaces):
+            ip_str = iface.ip if iface.ip and iface.ip != "0.0.0.0" else "-"
+            table.add_row(str(i), str(iface.name), str(iface.description), ip_str)
+        
+        console.print(table)
+        prompt = "[bold white]Select interface IDs to monitor (comma separated, or 'all'): [/bold white]"
+        if not multi:
+            prompt = "[bold white]Select interface ID to monitor: [/bold white]"
+            
+        choice = console.input(prompt)
+        
+        selected = []
+        if multi and choice.lower() == 'all':
+            selected = [str(iface.name) for iface in ifaces if iface.ip]
+        else:
+            try:
+                indices = [int(x.strip()) for x in choice.split(",")]
+                selected = [str(ifaces[idx].name) for idx in indices if 0 <= idx < len(ifaces)]
+            except (ValueError, IndexError):
+                console.print("[red]Invalid selection.[/red]")
+                return []
+
+        if not selected:
+            console.print("[yellow]No interfaces selected.[/yellow]")
+            return []
+            
+        return selected

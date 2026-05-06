@@ -164,7 +164,14 @@ class ForensicsModule:
         # 4. Detailed Evidence for high risk
         for entity in alerted_entities:
             if entity.risk_score > 20:
-                alert_list = "\n".join([f"• [{a.severity}] {a.type}: {a.explanation}" for a in entity.alerts])
+                unique_alerts = {}
+                for a in entity.alerts:
+                    key = f"{a.type}:{a.explanation}"
+                    if key not in unique_alerts:
+                        unique_alerts[key] = a
+                
+                alert_lines = [f"• [{a.severity}] {a.type}: {a.explanation}" for a in unique_alerts.values()]
+                alert_list = "\n".join(alert_lines)
                 console.print(Panel(
                     alert_list,
                     title=f"Forensic Evidence for {entity.ip}",
@@ -265,8 +272,14 @@ class ForensicsModule:
         # 4. Alerts
         alerts = self.db.get_alerts(entity_ip=ip)
         if alerts:
+            unique_alerts = {}
+            for a in alerts:
+                key = f"{a.get('type')}:{a.get('explanation')}"
+                if key not in unique_alerts:
+                    unique_alerts[key] = a
+            
             behaviors = []
-            for alert in alerts:
+            for alert in unique_alerts.values():
                 severity = alert.get("severity", "MEDIUM")
                 color = "red" if severity == "CRITICAL" else "yellow"
                 behaviors.append(f"[{color}]• {alert.get('type', 'UNKNOWN')}:[/{color}] {alert.get('explanation', '')}")

@@ -275,9 +275,11 @@ class DaemonHandler(BaseRequestHandler):
             try:
                 auth_req = json.loads(auth_line)
                 if auth_req.get("auth") != auth_key:
+                    logger.warning(f"Unauthorized connection attempt from {self.client_address[0]}")
                     self.send_message({"status": "error", "message": "unauthorized"})
                     return
             except json.JSONDecodeError:
+                logger.warning(f"Invalid auth JSON from {self.client_address[0]}")
                 self.send_message({"status": "error", "message": "invalid_auth_json"})
                 return
 
