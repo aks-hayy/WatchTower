@@ -19,7 +19,6 @@ from core.packet_engine.flow_worker import flow_worker
 from core.packet_engine.evidence_worker import evidence_worker
 from core.packet_engine.persistence import DailyAccumulator
 from core.utils.logger import setup_logger
-from core.ai.worker import AIWorker
 
 logger = setup_logger("WatchtowerDaemon", log_file=os.path.join(context.logs_dir, "daemon.log"))
 
@@ -340,12 +339,6 @@ def run_daemon():
     from core.daemon.manager import DaemonManager
     DaemonManager.get_or_create_key()
 
-    # Start AI Worker
-    from core.storage.database import WatchtowerDB
-    db = WatchtowerDB()
-    ai_worker = AIWorker(db)
-    ai_worker.start()
-
     server = ThreadedTCPServer(("127.0.0.1", context.daemon_port), DaemonHandler)
     logger.info(f"Watchtower Daemon listening on port {context.daemon_port}")
 
@@ -362,7 +355,6 @@ def run_daemon():
         logger.info("KeyboardInterrupt — shutting down daemon.")
         manager.stop_all()
 
-    ai_worker.stop()
     server.shutdown()
     server.server_close()
     sys.exit(0)
