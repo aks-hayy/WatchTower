@@ -63,8 +63,6 @@ Watchtower is an **Identity-First** forensic platform. It doesn't just see packe
 ### 🖥️ Secure Architecture
 - **Admin Daemon** — Privileged background daemon handling all capture logic to keep user-facing tools safe
 - **Strict Data Isolation** — Offline PCAP analysis streams are isolated from live telemetry
-- **Bcrypt Security** — Military-grade password hashing for secure forensic access
-- **CLI Vault Gate** — Interactive shells require master credentials before yielding forensic access
 
 A UI AND AI LAYER WILL BE ADDED SOON.
 ---
