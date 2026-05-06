@@ -1,0 +1,186 @@
+import sys
+import os
+import datetime
+import signal
+import psutil
+import multiprocessing
+import threading
+from rich.console import Console
+from rich.table import Table
+from core.packet_engine.capture import start_capture
+from core.packet_engine.flow_worker import flow_worker
+from core.packet_engine.config import PacketEngineConfig
+from core.packet_engine.persistence import DailyAccumulator
+from core.packet_engine.ipc import get_ipc_key, IPC_PORT
+from multiprocessing.connection import Listener, Client
+import scapy.all as scapy
+
+
+console = Console()
+
+class CaptureModule:
+    PID_FILE = "data/engine.pid"
+    
+    def __init__(self, options):
+        self.options = options
+        self.config = PacketEngineConfig()
+        self.control_queue = multiprocessing.Queue()
+        self.ipc_key = get_ipc_key(self.config.data_dir)
+        self.ipc_port = IPC_PORT
+
+        if "interface" in options:
+            self.config.interface = options["interface"]
+
+    def run(self, background=False):
+        from core.daemon.manager import DaemonManager
+        DaemonManager.ensure_running(silent=True)
+
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+
+        interfaces = []
+        if "interface" in self.options and self.options["interface"]:
+            interfaces = [self.options["interface"]]
+        else:
+            # Auto-select primary
+            resolved = self.config.resolve_interface()
+            if resolved: interfaces = [resolved]
+
+        if not interfaces:
+            console.print("[red]Error: No network interface specified or found.[/red]")
+            return
+
+        if background:
+            client.set_background(True)
+
+        for iface in interfaces:
+            if self._is_running(iface):
+                console.print(f"[yellow]Engine for {iface} is already running.[/yellow]")
+                continue
+
+            console.print(f"[cyan]Starting capture on {iface}...[/cyan]")
+            res = client.start_engine(iface)
+            
+            if res.get("status") == "error":
+                console.print(f"[red]Error starting {iface}: {res.get('message')}[/red]")
+            elif res.get("status") == "started":
+                console.print(f"[green]✅ Engine started on {iface}[/green]")
+
+        if background:
+            console.print("[bold green]\nWATCHTOWER is now running in BACKGROUND MODE.[/bold green]")
+            console.print("[dim]Monitoring will continue even if you close this terminal.[/dim]")
+            console.print("[dim]Use 'tower stop' to terminate background engines.[/dim]")
+
+    def background(self):
+        """Interactive background mode setup."""
+        from core.daemon.manager import DaemonManager
+        DaemonManager.ensure_running(silent=True)
+        
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+        
+        console.print("[bold cyan]--- Watchtower Background Mode Setup ---[/bold cyan]")
+        
+        # 1. Select Interfaces
+        import scapy.all as scapy
+        # Use scapy.conf.ifaces for richer interface metadata
+        ifaces = sorted(scapy.conf.ifaces.values(), key=lambda x: (not x.ip, x.name))
+        
+        table = Table(title="Available Interfaces")
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Name", style="bold white")
+        table.add_column("Description", style="dim")
+        table.add_column("IP Address", style="green")
+        
+        for i, iface in enumerate(ifaces):
+            ip_str = iface.ip if iface.ip and iface.ip != "0.0.0.0" else "-"
+            table.add_row(str(i), str(iface.name), str(iface.description), ip_str)
+        
+        console.print(table)
+        choice = console.input("[bold white]Select interface IDs to monitor (comma separated, or 'all'): [/bold white]")
+        
+        selected = []
+        if choice.lower() == 'all':
+            selected = [str(iface.name) for iface in ifaces if iface.ip] # Default to ones with IP
+        else:
+            try:
+                indices = [int(x.strip()) for x in choice.split(",")]
+                selected = [str(ifaces[idx].name) for idx in indices if 0 <= idx < len(ifaces)]
+            except (ValueError, IndexError):
+                console.print("[red]Invalid selection.[/red]")
+                return
+
+        if not selected:
+            console.print("[yellow]No interfaces selected. Aborting.[/yellow]")
+            return
+
+        # 2. Activate
+        self.options["interface"] = None # Will loop manually
+        client.set_background(True)
+        
+        for iface in selected:
+            client.start_engine(iface)
+            console.print(f"[green]Started background capture on {iface}[/green]")
+            
+        console.print("\n[bold green]✅ Background persistence activated.[/bold green]")
+        console.print("You can now safely close Watchtower. The monitoring engines will remain active.")
+        
+        confirm = console.input("[yellow]Close Watchtower shell now? (y/N): [/yellow]")
+        if confirm.lower() == 'y':
+            sys.exit(0)
+
+    def stop(self, interface=None):
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+
+        if interface:
+            ifaces = [interface]
+        else:
+            ifaces = self._get_running_interfaces()
+            if not ifaces:
+                console.print("[yellow]No engines are currently running.[/yellow]")
+                return
+
+        for iface in ifaces:
+            res = client.stop_engine(iface)
+            if res.get("status") == "error":
+                console.print(f"[red]Failed to stop engine for {iface}: {res.get('message')}[/red]")
+            else:
+                console.print(f"[bold red]🛑 Engine for {iface} has been stopped.[/bold red]")
+
+    def dump(self, filename):
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+        
+        # Get active interface
+        ifaces = self._get_running_interfaces()
+        if not ifaces:
+            console.print("[red]No engines are running. Start an engine first.[/red]")
+            return
+            
+        interface = ifaces[0] # Default to first one
+        abs_path = os.path.abspath(filename)
+        console.print(f"[yellow]Triggering PCAP dump for {interface} to {abs_path}...[/yellow]")
+
+        res = client.dump_pcap(interface, filename)
+        if res.get("status") == "dump_triggered":
+            console.print(f"[green]✅ PCAP dump triggered via Daemon.[/green]")
+        else:
+            console.print(f"[red]Error: {res.get('message')}[/red]")
+
+    def _is_running(self, interface=None):
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+        status = client.get_status()
+        if not status.get("running"):
+            return False
+            
+        if interface:
+            return interface in status.get("interfaces", [])
+        return True
+
+    def _get_running_interfaces(self):
+        from core.daemon.client import DaemonClient
+        client = DaemonClient()
+        status = client.get_status()
+        return status.get("interfaces", [])

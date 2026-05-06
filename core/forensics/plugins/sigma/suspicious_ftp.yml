@@ -1,0 +1,11 @@
+title: Suspicious FTP Data Transfer (Sample)
+id: ftp-cleartext-sample
+status: test
+description: Detects FTP traffic which often indicates cleartext transfer or potential credentials exposure.
+logsource:
+  category: network_connection
+detection:
+  selection:
+    dst_port: 21
+  condition: selection
+level: medium

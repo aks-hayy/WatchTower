@@ -1,0 +1,66 @@
+# Subnet Roles & Sensitivity
+# Roles: GUEST, IOT, WORKSTATION, SERVER, CRITICAL
+subnets:
+  192.168.0.0/24:
+    role: IOT
+    sensitivity: 0.5
+    trust_local_discovery: true
+  10.0.0.0/24:
+    role: SERVER
+    sensitivity: 1.5
+    trust_local_discovery: false
+  172.16.0.0/16:
+    role: WORKSTATION
+    sensitivity: 1.0
+    trust_local_discovery: true
+
+# Watchtower Threat Intelligence & Whitelists
+
+# DNS Entropy Whitelist
+# These domains frequently trigger high entropy alerts but are known safe.
+dns_whitelist:
+  - "google.com"
+  - "gstatic.com"
+  - "googleapis.com"
+  - "microsoft.com"
+  - "windowsupdate.com"
+  - "akamaihd.net"
+  - "cloudfront.net"
+  - "amazonaws.com"
+  - "githubusercontent.com"
+  - "visualstudio.com"
+  - "azureedge.net"
+  - "office.com"
+  - "office365.com"
+  - "live.com"
+  - "bing.com"
+
+# Known C2 Ports
+c2_ports:
+  - 4444
+  - 5555
+  - 6666
+  - 8080
+  - 8888
+  - 1337
+
+# Internal IP Prefixes
+internal_prefixes:
+  - "10."
+  - "192.168."
+  - "172.16."
+  - "172.17."
+  - "172.18."
+  - "172.19."
+  - "172.20."
+  - "172.21."
+  - "172.22."
+  - "172.23."
+  - "172.24."
+  - "172.25."
+  - "172.26."
+  - "172.27."
+  - "172.28."
+  - "172.29."
+  - "172.30."
+  - "172.31."

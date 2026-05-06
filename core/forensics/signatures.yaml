@@ -1,0 +1,58 @@
+# Watchtower Device & Asset Signatures
+# Format:
+#   id: unique_id
+#   type: category
+#   role: asset_role
+#   match:
+#     ports: [list of open ports]
+#     banners: {port: regex_pattern}
+#     mdns_services: [list of strings]
+
+signatures:
+  - id: lg_webos_tv
+    type: "Smart TV (WebOS)"
+    role: IOT
+    match:
+      ports: [1900, 3000, 8080, 9955]
+      banners:
+        1900: "WebOS"
+      mdns_services: ["_airplay", "_raop", "_lg_smart_tv"]
+
+  - id: apple_device
+    type: "Apple Device"
+    role: WORKSTATION
+    match:
+      ports: [62078]
+      cert_regex: "Apple|iPhone|iPad|Mac"
+      mdns_services: ["_apple-mobdev2", "_companion-link"]
+
+  - id: windows_host
+    type: "Windows Workstation"
+    role: WORKSTATION
+    match:
+      ports: [135, 139, 445]
+      banners:
+        445: "Windows"
+      cert_regex: "Microsoft|Workgroup"
+
+  - id: synology_nas
+    type: "Synology NAS"
+    role: SERVER
+    match:
+      ports: [5000, 5001]
+      title_regex: "Synology|DiskStation"
+
+  - id: generic_printer
+    type: "Network Printer"
+    role: OFFICE
+    match:
+      ports: [9100, 515, 631]
+      mdns_services: ["_printer", "_ipp", "_pdl-datastream"]
+
+  - id: sonos_speaker
+    type: "Smart Speaker (Sonos)"
+    role: IOT
+    match:
+      ports: [1400, 1443]
+      banners:
+        1400: "Sonos"

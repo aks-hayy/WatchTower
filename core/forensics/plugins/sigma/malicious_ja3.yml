@@ -1,0 +1,11 @@
+title: Malicious Trickbot JA3 Fingerprint
+id: trickbot-ja3-sample
+status: test
+description: Detects a known malicious TLS fingerprint associated with Trickbot malware.
+logsource:
+  category: network_identity
+detection:
+  selection:
+    ja3_hash: "6734f37431670b3ab4292b8f60f29984"
+  condition: selection
+level: critical

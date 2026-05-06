@@ -1,0 +1,98 @@
+# ============================================================
+# Watchtower .gitignore
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+*.pyd
+
+# --- Virtual Environments ---
+WT/
+venv/
+.venv/
+env/
+
+# ─── Secrets & Keys (NEVER commit these) ─────────────────────────────────────
+.env
+*.key
+*.enc
+*.pem
+*.p12
+*.pfx
+
+# ─── Runtime Auth State ───────────────────────────────────────────────────────
+data/auth.key
+data/auth_creds.enc
+data/auth_biometric.json
+data/auth_challenge.tmp
+data/daemon.key
+data/ipc.key
+data/secret.key
+data/session.enc
+
+# ─── Database (contains captured network traffic — personal data) ─────────────
+data/watchtower.db
+data/watchtower.db-shm
+data/watchtower.db-wal
+data/logs/watchtower.db
+data/logs/watchtower.db-shm
+data/logs/watchtower.db-wal
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+data/engine.log
+data/engine.pid
+data/*.log
+data/logs/*.log
+data/queue_debug.log
+
+# ─── Runtime State ───────────────────────────────────────────────────────────
+data/interface_override.txt
+data/topology.html
+data/topology1.html
+data/today.json
+data/archives/
+data/forensics/
+data/reports/
+data/dive_*.txt
+
+# ─── Encrypted Daily Archives (personal network data) ─────────────────────────
+data/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.enc
+data/logs/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.enc
+
+# ─── Packet Captures (highly sensitive — never commit) ───────────────────────
+*.pcap
+*.pcapng
+*.cap
+
+# ─── Frontend Build ───────────────────────────────────────────────────────────
+flow-insights/node_modules/
+flow-insights/dist/
+flow-insights/bun.lockb
+flow-insights/.env
+flow-insights/.env.local
+
+# ─── IDE & OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Temp / Scratch ───────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+my_network_forensics.html
