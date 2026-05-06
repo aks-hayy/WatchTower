@@ -59,8 +59,9 @@ Repository = "https://github.com/aks-hayy/WatchTower---Network-Monitoring-and-Fo
 [project.scripts]
 tower = "core.packet_engine.main:main"
 
-[tool.setuptools]
-packages = ["core", "core.packet_engine", "core.forensics", "core.cli", "core.cli.modules", "core.storage", "core.utils", "core.daemon"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*"]
 
 [tool.ruff]
 line-length = 120

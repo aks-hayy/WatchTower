@@ -107,9 +107,11 @@ Watchtower natively supports the **Sigma Rules** standard for network-centric th
 git clone https://github.com/aks-hayy/WatchTower.git
 cd WatchTower
 
-# Install the backend
+# Install in development mode (registers the 'tower' command)
 pip install -e .
 ```
+
+> **Note:** If the `tower` command is not recognized after installation, ensure your Python `Scripts` directory is in your system `PATH`, or run the command within an activated virtual environment.
 
 ### First Steps
 
