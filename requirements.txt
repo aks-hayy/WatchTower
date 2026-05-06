@@ -4,26 +4,11 @@
 # Core capture & analysis
 scapy>=2.5.0
 
-# Web API server
-fastapi>=0.100.0
-uvicorn>=0.20.0
-pydantic>=2.0.0
-python-multipart>=0.0.6
-starlette>=0.27.0
-slowapi>=0.1.9
-httpx>=0.25.0
-
 # Database & ORM
 sqlalchemy>=2.0.0
 
 # Authentication & security
 cryptography>=41.0.0
-PyJWT>=2.8.0
-bcrypt>=4.0.0
-
-# AI providers (install at least one)
-openai>=1.30.0
-ollama>=0.1.0
 
 # Utilities
 requests>=2.28.0
