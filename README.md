@@ -174,15 +174,6 @@ For the complete command reference, see the **[User Guide](USAGE.md)**.
 - **Graceful Termination** — IPC uses robust event signaling for clean network socket release and database flushing
 - **SQLite with WAL** — Enables concurrent reads while the engine writes
 
----
-
-## 🛡️ Security
-
-- All credentials are hashed using `bcrypt` and encrypted at rest using Fernet symmetric encryption.
-- The `tower shell` requires successful Master Password authentication before granting interactive control.
-- JWT-based session tokens maintain terminal session persistence with 6-hour expiries.
-
----
 
 ## 📚 Documentation
 
