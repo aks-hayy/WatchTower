@@ -40,6 +40,23 @@ Offline detection runs through the same canonical finding sink used by live proc
 
 Endpoint enrichment is evidence-backed and separates address-only, observed, inferred, and externally researched identity. Public enrichment may include reverse DNS, ASN, organization, geolocation, certificate, domain, and reputation data when available. Every field includes source, retrieval time where applicable, confidence, and native evidence references.
 
+### Suspicion Triage
+
+The case includes a lightweight suspicion triage projection over existing WatchTower capabilities. It does not replace Behavioral Scoring V2 and does not create a second opaque risk score. It gathers corroborated signals from detector findings, Sigma matches run against the historical case, IOC/reputation results, protocol mismatches, authentication and cleartext exposure, scan or beacon behavior, unusual conversation outcomes, rare destinations, and artifact metadata.
+
+Each triage item is scoped to the case and targets one observable:
+
+- IP or endpoint
+- Bidirectional conversation or directional flow
+- Domain, URL, certificate, ASN, or service
+- Carved artifact or file hash
+
+Every item contains a deterministic fingerprint, target type and identifier, first/last seen time, concise reason, observed values versus threshold where applicable, contributing finding IDs, evidence references, detector/source, confidence, and status. Statuses are `open`, `confirmed`, `benign`, and `dismissed`. Manual analyst flags use the same record and require a reason; they do not fabricate a detector finding or change the authoritative score without an explicit disposition.
+
+The default candidate policy is conservative: external reachability, uncommon ports, or a public IP alone never creates a suspicious item. A candidate requires either one strong evidence source such as an IOC/reputation match or at least two independent weaker signals. The UI exposes a simple Suspicious queue and one-click `Flag for investigation` actions from IP, flow, domain, certificate, ASN, and artifact views. Existing CLI commands remain unchanged; their current dive, flow, alert, and evidence views can show the case-scoped triage state through compatibility projections.
+
+Suspicion items are filterable in findings, timeline, and topology. Dismissing or marking an item benign hides it from the default queue but preserves the evidence, actor, time, and reason for audit.
+
 ### Analyst UI
 
 The Forensics page becomes a case workspace with Overview, Findings, Entities, Conversations, Timeline, Topology, Artifacts, Streams, Evidence, and Export views. The case ID remains visible and addressable in the URL.
@@ -57,8 +74,9 @@ The API and CLI consume the same `ForensicCaseProjection` service. The UI receiv
 1. Additive case schema and source-scoped entity regression tests reproduce and fix the current UI-zero-entities defect.
 2. CLI and UI report projections return identical immutable case metrics and canonical records.
 3. Detection and enrichment produce explainable findings and identity provenance for all captured endpoints.
-4. UI case workspace, evidence pivots, and ranked topology are usable on the supplied PCAP corpus.
-5. All supplied PCAPs pass Rust CLI/UI parity, detection review, performance, and export acceptance tests.
+4. Suspicion triage surfaces explainable IP, flow, and entity candidates in the supplied study PCAPs without flagging every external peer.
+5. UI case workspace, evidence pivots, and ranked topology are usable on the supplied PCAP corpus.
+6. All supplied PCAPs pass Rust CLI/UI parity, detection review, performance, and export acceptance tests.
 
 ## Out of Scope
 
