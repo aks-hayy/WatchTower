@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package watchtower.mesh.v2;
+
+message JsonMessage {
+  bytes json = 1;
+}
+
+message TelemetryEnvelope {
+  string protocol_version = 1;
+  string node_id = 2;
+  uint64 sequence = 3;
+  string envelope_type = 4;
+  bytes payload_json = 5;
+  double created_at = 6;
+  string payload_digest = 7;
+  string digest_algorithm = 8;
+}
+
+service Mesh {
+  rpc Enroll(JsonMessage) returns (JsonMessage);
+  rpc Ingest(TelemetryEnvelope) returns (JsonMessage);
+}
+

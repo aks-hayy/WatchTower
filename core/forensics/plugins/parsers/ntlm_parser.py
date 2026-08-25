@@ -10,7 +10,7 @@ class NTLMParser(BaseParser):
         result = {}
         if TCP in packet and packet[TCP].payload:
             try:
-                payload = bytes(packet[TCP].payload)
+                payload = self.application_payload(packet, context)
                 if b"NTLMSSP" in payload:
                     idx = payload.find(b"NTLMSSP\x00\x03\x00\x00\x00")
                     if idx != -1:

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>SHA256,IMPHASH</HashAlgorithms>
+  <CheckRevocation />
+  <EventFiltering>
+    <!-- WatchTower correlates the complete Event ID 1 process lifetime with
+         Event ID 3 network connections. Empty include rules collect the
+         event class while the collector performs bounded redaction before
+         persistence. -->
+    <ProcessCreate onmatch="include" />
+    <NetworkConnect onmatch="include" />
+  </EventFiltering>
+</Sysmon>

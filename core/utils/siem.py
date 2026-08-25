@@ -1,7 +1,10 @@
 import logging
 import logging.handlers
 import json
+import socket
 from typing import Dict, Any
+
+from core import __version__
 
 class SIEMExporter:
     """
@@ -17,7 +20,6 @@ class SIEMExporter:
         
         if host:
             socktype = socket.SOCK_DGRAM if self.protocol == "UDP" else socket.SOCK_STREAM
-            import socket
             self.handler = logging.handlers.SysLogHandler(address=(host, port), socktype=socktype)
             self.logger.addHandler(self.handler)
             self.logger.setLevel(logging.INFO)
@@ -31,7 +33,7 @@ class SIEMExporter:
         # Simple JSON over Syslog
         message = {
             "product": "Watchtower",
-            "version": "1.0.0",
+            "version": __version__,
             "event": "ForensicAlert",
             "severity": alert.get("severity", "MEDIUM"),
             "type": alert.get("type"),

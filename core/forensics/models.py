@@ -58,11 +58,25 @@ class EntityProfile:
 
 @dataclass
 class ForensicReport:
+    report_id: Optional[int] = None
+    case_id: Optional[str] = None
+    analysis_id: Optional[str] = None
+    pcap_sha256: Optional[str] = None
+    capture_started_at: Optional[float] = None
+    capture_ended_at: Optional[float] = None
+    link_type: Optional[str] = None
+    parser_version: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
     source: str = "" # PCAP filename or "LIVE"
     entities: Dict[str, EntityProfile] = field(default_factory=dict) # IP -> Profile
     streams: Dict[Tuple, Dict[str, bytes]] = field(default_factory=dict) # flow_id -> {"to_server": b"", "to_client": b""}
     summary: Dict = field(default_factory=dict)
+    status: str = "RUNNING"
+    analysis_mode: str = "memory"
+    bytes_processed: int = 0
+    total_bytes: int = 0
+    error: Optional[str] = None
+    spool_path: Optional[str] = None
     
     def add_alert(self, ip: str, alert: ForensicAlert):
         if ip not in self.entities:

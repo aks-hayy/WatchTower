@@ -60,10 +60,16 @@ class DailyAccumulator:
 
     def _archive(self, day: str):
         """Encrypt the day's stats and save per interface."""
-        session = self.db._get_session()
         # Use text() for raw SQL queries in SQLAlchemy
         from sqlalchemy import text
-        rows = session.execute(text("SELECT DISTINCT source FROM daily_stats WHERE date = :day AND source LIKE 'live%'"), {"day": day}).fetchall()
+        with self.db.session_scope() as session:
+            rows = session.execute(
+                text(
+                    "SELECT DISTINCT source FROM daily_stats "
+                    "WHERE date = :day AND source LIKE 'live%'"
+                ),
+                {"day": day},
+            ).fetchall()
         sources = [r[0] for r in rows]
         if not sources:
             sources = ["live"]
@@ -83,20 +89,23 @@ class DailyAccumulator:
             enc_path.write_bytes(self._fernet.encrypt(plaintext))
 
     # -------------------------------------------------------- public API
-    def merge(self, snapshot, flow_table: dict | None = None, source: str = "live"):
+    def merge(self, snapshot, flow_table: dict | None = None, source: str = "live",
+              stats_source: str = None, capture_origin: dict = None, stats_snapshot=None):
         """Merge a WindowSnapshot into SQLite using high-performance bulk operations."""
         self._check_rollover()
 
         try:
             # 1. Merge aggregate daily stats & timeline
+            aggregate_source = stats_source or source
+            metrics = stats_snapshot or snapshot
             self.db.merge_daily_stats(
-                packets=snapshot.total_packets, bytes_count=snapshot.total_bytes,
-                flows=snapshot.total_flows, protocol_dist=snapshot.protocol_distribution,
-                port_dist=snapshot.port_distribution, top_talkers=snapshot.top_talkers,
-                source=source, commit=False
+                packets=metrics.total_packets, bytes_count=metrics.total_bytes,
+                flows=metrics.total_flows, protocol_dist=metrics.protocol_distribution,
+                port_dist=metrics.port_distribution, top_talkers=metrics.top_talkers,
+                source=aggregate_source, commit=False
             )
-            if snapshot.traffic_timeline:
-                self.db.merge_timeline(snapshot.traffic_timeline, source=source, commit=False)
+            if metrics.traffic_timeline:
+                self.db.merge_timeline(metrics.traffic_timeline, source=aggregate_source, commit=False)
 
             # 2. Merge alerts
             if snapshot.alerts:
@@ -110,7 +119,11 @@ class DailyAccumulator:
                         score=alert_dict.get("final_score", alert_dict.get("score", 0.0)),
                         explanation=alert_dict.get("explanation", ""),
                         evidence=alert_dict.get("evidence"),
-                        source=source, commit=False
+                        source=source, commit=False,
+                        capture_session_id=(capture_origin or {}).get("session_id"),
+                        capture_interface=(capture_origin or {}).get("device_id"),
+                        capture_backend=(capture_origin or {}).get("backend"),
+                        capture_type=(capture_origin or {}).get("source_type", "network"),
                     )
 
             # 3. Batch build flow and entity records
@@ -138,7 +151,11 @@ class DailyAccumulator:
                         "duration": round(f.last_seen - f.start_time, 2),
                         "l7_metadata": json.dumps(f.l7_metadata) if f.l7_metadata else None,
                         "session_date": today_str,
-                        "source": source
+                        "source": source,
+                        "capture_session_id": (capture_origin or {}).get("session_id"),
+                        "capture_interface": (capture_origin or {}).get("device_id"),
+                        "capture_backend": (capture_origin or {}).get("backend"),
+                        "capture_type": (capture_origin or {}).get("source_type", "network"),
                     })
 
                     # Update Entity Data in Map

@@ -1,0 +1,30 @@
+name: detector-calibration
+
+on:
+  pull_request:
+    paths:
+      - "core/forensics/plugins/detectors/**"
+      - "core/detection/**"
+      - "core/calibration/**"
+      - "core/forensics/engine.py"
+      - "core/packet_engine/**"
+      - "rust/watchtower-sensor/**"
+      - "calibration/corpus/**"
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  full-corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - run: python -m pip install -c requirements/container.lock -e ".[dev]"
+      - run: cargo build --locked --release
+        working-directory: rust/watchtower-sensor
+      - run: python scripts/run_calibration_ci.py
+      - run: tower plugins calibration verify

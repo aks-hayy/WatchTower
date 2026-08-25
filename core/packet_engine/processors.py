@@ -6,7 +6,7 @@ import os
 from collections import defaultdict
 from core.packet_engine.schemas import WindowSnapshot, AlertRecord
 from core.constants import (
-    C2_PORTS, INTERNAL_IP_PREFIXES, ALERT_COOLDOWN, 
+    INTERNAL_IP_PREFIXES, ALERT_COOLDOWN,
     SCAN_HIGH_SYN_COUNT, ALERT_THRESHOLD, EVIDENCE_TRIGGER
 )
 from core.packet_engine.utils import get_geoip_info
@@ -66,13 +66,8 @@ class SecurityScorer:
             for alert in forensic_alerts:
                 t_score += alert.score
 
-        # 3. Behavioral Peer Anomaly
-        if self.behavioral:
-            t_score += self.behavioral.check_peer_anomaly(flow.flow_id[0], flow.flow_id[1])
-
-        # Legacy & Manual rules
-        dst_ip, dst_port = flow.flow_id[1], flow.flow_id[3]
-        if dst_port in C2_PORTS: t_score += 20
+        # Destination enrichment is context, never a score by itself.
+        dst_ip = flow.flow_id[1]
         if hasattr(flow, "tcp_syn_count") and flow.tcp_syn_count > SCAN_HIGH_SYN_COUNT:
             t_score += 30
 
@@ -104,8 +99,6 @@ class AlertManager:
             # Apply Subnet Role Multiplier
             if hasattr(self, 'behavioral') and self.behavioral:
                 multiplier = self.behavioral.get_context_multiplier(flow.flow_id[0], threat_type)
-        elif flow.flow_id[3] in C2_PORTS: threat_type = "C2_PORT"
-
         # Re-check threshold after multiplier
         if (final_score * multiplier) <= ALERT_THRESHOLD:
             return []
@@ -116,27 +109,28 @@ class AlertManager:
             adj_score = final_score * multiplier
             severity = "CRITICAL" if adj_score > 100 else ("HIGH" if adj_score > 80 else "SUSPICIOUS")
             
-            main_alert = AlertRecord(
-                timestamp=now, entity_type="FLOW",
-                entity_id=f"{flow.flow_id[0]}->{flow.flow_id[1]}",
-                behavior_score=b_score, threat_score=t_score,
-                final_score=adj_score, severity=severity,
-                explanation=f"Threat detected (score: {adj_score:.1f})",
-                recommended_action="Investigate host"
-            )
-            new_alerts.append(main_alert)
-            self.alerts.append(main_alert)
-
-            # Add forensic sub-alerts
+            # Findings are always attached to a real subject. There is no synthetic
+            # "src->dst" entity and no second aggregate alert for the same evidence.
             for fa in forensic_alerts:
                 sub_alert = AlertRecord(
                     timestamp=fa.timestamp, entity_type="FORENSIC",
-                    entity_id=fa.entity_ip, behavior_score=0,
+                    entity_id=flow.flow_id[0], behavior_score=0,
                     threat_score=fa.score, final_score=fa.score,
                     severity=fa.severity, explanation=fa.explanation,
                     recommended_action="Run deep-dive"
                 )
                 new_alerts.append(sub_alert)
                 self.alerts.append(sub_alert)
+
+            if not forensic_alerts:
+                behavioral_alert = AlertRecord(
+                    timestamp=now, entity_type="HOST",
+                    entity_id=flow.flow_id[0], behavior_score=b_score,
+                    threat_score=t_score, final_score=adj_score, severity=severity,
+                    explanation=f"Behavioral threshold exceeded (score: {adj_score:.1f})",
+                    recommended_action="Review flow evidence",
+                )
+                new_alerts.append(behavioral_alert)
+                self.alerts.append(behavioral_alert)
         
         return new_alerts

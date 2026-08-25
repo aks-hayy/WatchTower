@@ -3,6 +3,9 @@ import sys
 import time
 import subprocess
 import uuid
+import json
+from pathlib import Path
+import psutil
 from core.context import context
 from core.daemon.client import DaemonClient
 
@@ -108,3 +111,60 @@ class DaemonManager:
         """Sends a shutdown command to the daemon."""
         client = DaemonClient()
         return client.shutdown()
+
+    @staticmethod
+    def restart_daemon(silent=False):
+        client = DaemonClient()
+        status = client.get_status()
+        if status.get("running"):
+            result = client.shutdown()
+            if result.get("status") == "error":
+                return {"status": "error", "message": result.get("message") or "Daemon shutdown failed"}
+            for _ in range(20):
+                time.sleep(0.25)
+                if not client.get_status().get("running"):
+                    break
+            else:
+                return {"status": "error", "message": "Daemon did not stop within five seconds"}
+        started = DaemonManager.ensure_running(silent=silent)
+        return {"status": "restarted" if started else "error", "running": bool(started)}
+
+    @staticmethod
+    def repair_state():
+        """Remove only a verified stale daemon identity record."""
+        path = Path(context.data_dir) / "daemon.instance.json"
+        status = DaemonClient().get_status()
+        if status.get("running"):
+            return {
+                "status": "healthy",
+                "daemon_instance_id": status.get("daemon_instance_id"),
+                "pid": status.get("pid"),
+            }
+        if not path.exists():
+            return {"status": "clean", "message": "No stale daemon state was present"}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        pid = int(state.get("pid") or 0)
+        if pid and psutil.pid_exists(pid):
+            try:
+                process = psutil.Process(pid)
+                return {
+                    "status": "blocked",
+                    "message": "The recorded process is still alive but is not answering WatchTower commands",
+                    "pid": pid,
+                    "executable": process.exe(),
+                }
+            except (psutil.Error, OSError):
+                return {
+                    "status": "blocked",
+                    "message": "The recorded PID is still allocated and cannot be verified safely",
+                    "pid": pid,
+                }
+        path.unlink(missing_ok=True)
+        return {
+            "status": "repaired",
+            "message": "Removed a stale daemon identity record; no process was terminated",
+            "stale_instance": state.get("daemon_instance_id"),
+        }

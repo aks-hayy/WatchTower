@@ -74,14 +74,7 @@ class BehavioralEngine:
         if pair in self._peer_cache:
             return 0.0
             
-        # Check DB
-        session = self.db._get_session()
-        from core.storage.models import BehavioralBaseline
-        exists = session.query(BehavioralBaseline).filter_by(
-            entity_ip=src_ip, pattern_key="comm_pair", pattern_data=dst_ip
-        ).first()
-        
-        if exists:
+        if self.db.behavioral_peer_seen(src_ip, dst_ip):
             self._peer_cache.add(pair)
             return 0.0
         

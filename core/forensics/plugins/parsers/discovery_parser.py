@@ -8,6 +8,7 @@ class DiscoveryParser(BaseParser):
     Extracts identities and device roles from mDNS, SSDP, and NetBIOS.
     """
     name = "Discovery Parser"
+    watched_ports = (53, 137, 1900, 5353)
 
     def parse(self, packet, context: Dict[str, Any] = None) -> Dict[str, Any]:
         results = {"identities": {}}

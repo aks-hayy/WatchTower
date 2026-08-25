@@ -23,7 +23,10 @@ class CaptureModule:
     
     def __init__(self, options):
         self.options = options
-        self.config = PacketEngineConfig()
+        self.config = PacketEngineConfig(
+            source_type=options.get("source_type") or "network",
+            capture_backend=options.get("backend"),
+        )
         self.control_queue = multiprocessing.Queue()
         self.ipc_key = get_ipc_key(self.config.data_dir)
         self.ipc_port = IPC_PORT
@@ -57,12 +60,15 @@ class CaptureModule:
                 continue
 
             console.print(f"[cyan]Starting capture on {iface}...[/cyan]")
-            res = client.start_engine(iface)
+            res = client.start_engine(
+                iface, backend=self.config.capture_backend,
+                source_type=self.config.source_type,
+            )
             
             if res.get("status") == "error":
                 console.print(f"[red]Error starting {iface}: {res.get('message')}[/red]")
             elif res.get("status") == "started":
-                console.print(f"[green]✅ Engine started on {iface}[/green]")
+                console.print(f"[green]Engine started on {res.get('interface', iface)}[/green]")
 
         if background:
             console.print("[bold green]\nWATCHTOWER is now running in BACKGROUND MODE.[/bold green]")
@@ -113,7 +119,7 @@ class CaptureModule:
             if res.get("status") == "error":
                 console.print(f"[red]Failed to stop engine for {iface}: {res.get('message')}[/red]")
             else:
-                console.print(f"[bold red]🛑 Engine for {iface} has been stopped.[/bold red]")
+                console.print(f"[bold red]Engine for {iface} has been stopped.[/bold red]")
 
     def dump(self, filename):
         from core.daemon.client import DaemonClient
@@ -131,7 +137,7 @@ class CaptureModule:
 
         res = client.dump_pcap(interface, filename)
         if res.get("status") == "dump_triggered":
-            console.print(f"[green]✅ PCAP dump triggered via Daemon.[/green]")
+            console.print("[green]PCAP dump triggered via daemon.[/green]")
         else:
             console.print(f"[red]Error: {res.get('message')}[/red]")
 
@@ -151,6 +157,35 @@ class CaptureModule:
         client = DaemonClient()
         status = client.get_status()
         return status.get("interfaces", [])
+
+    @staticmethod
+    def show_status(status):
+        """Render daemon and capture-engine health without exposing raw dictionaries."""
+        if not status.get("running"):
+            console.print("[red]WatchTower daemon is not running.[/red]")
+            return
+
+        engines = status.get("engines") or {}
+        table = Table(title="Capture Engine Status")
+        table.add_column("Interface", style="cyan")
+        table.add_column("Backend")
+        table.add_column("State")
+        table.add_column("Packets", justify="right")
+        table.add_column("Drops", justify="right")
+        table.add_column("Session", overflow="ellipsis", max_width=14)
+        for interface, engine in engines.items():
+            alive = all(engine.get(key) for key in ("capture_alive", "worker_alive", "evidence_alive"))
+            state = "[green]HEALTHY[/green]" if alive else "[red]DEGRADED[/red]"
+            table.add_row(
+                interface, str(engine.get("backend") or "?"), state,
+                f"{int(engine.get('received_packets') or 0):,}",
+                f"{int(engine.get('dropped_packets') or 0):,}",
+                str(engine.get("session_id") or "-"),
+            )
+        if engines:
+            console.print(table)
+        else:
+            console.print("[yellow]Daemon is running with no active capture engines.[/yellow]")
 
     def _select_interfaces(self, multi=True, title="Interface Selection"):
         """Show an interactive table and return a list of selected interface names."""

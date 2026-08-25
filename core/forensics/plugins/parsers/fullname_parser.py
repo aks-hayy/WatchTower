@@ -6,6 +6,7 @@ from core.forensics.base import BaseParser
 
 class FullNameParser(BaseParser):
     name = "Full Name Scraper"
+    watched_ports = (80, 445, 389, 636, 8080)
 
     def parse(self, packet, context: Dict[str, Any] = None) -> Dict[str, Any]:
         result = {}
@@ -18,7 +19,7 @@ class FullNameParser(BaseParser):
                 if "\\" in username_to_pivot:
                     username_to_pivot = username_to_pivot.split("\\")[-1]
 
-            full_name = self.scrape_full_name_from_data(bytes(packet.payload), username_to_pivot)
+            full_name = self.scrape_full_name_from_data(self.application_payload(packet, context), username_to_pivot)
             if full_name:
                 result.setdefault("identities", {})["full_name"] = full_name
                 
@@ -63,14 +64,14 @@ class FullNameParser(BaseParser):
                         if self._verify_name_quality(name) and name.lower() != username.lower():
                             return name
 
-            # 4. Unicode fallback
-            if not username:
-                unicode_pattern = rb"([A-Z]\x00(?:[a-z]\x00)+ \x00[A-Z]\x00(?:[a-z]\x00)+)"
-                unicode_match = re.search(unicode_pattern, payload)
-                if unicode_match:
-                    name = unicode_match.group(1).decode('utf-16le', errors='ignore').replace("\x00", "").strip()
-                    if self._verify_name_quality(name):
-                        return name
+            # 4. Unicode fallback. A confirmed username is useful context, but
+            # directory display names do not always resemble the account name.
+            unicode_pattern = rb"([A-Z]\x00(?:[a-z]\x00)+ \x00[A-Z]\x00(?:[a-z]\x00)+)"
+            unicode_match = re.search(unicode_pattern, payload)
+            if unicode_match:
+                name = unicode_match.group(1).decode('utf-16le', errors='ignore').replace("\x00", "").strip()
+                if self._verify_name_quality(name):
+                    return name
 
         except Exception:
             pass

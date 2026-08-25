@@ -17,6 +17,73 @@ class PacketEvent:
     l7_info: Dict = field(default_factory=dict)
     raw: Optional[bytes] = None
     interface: str = "auto"
+    session_id: Optional[str] = None
+    source_type: str = "network"
+    backend: str = "python"
+    link_type: str = "ethernet"
+    sensor_node_id: Optional[str] = None
+    source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CaptureOrigin:
+    session_id: str
+    source_type: str
+    device_id: str
+    backend: str
+    link_type: str = "ethernet"
+    api_version: int = 1
+
+
+@dataclass
+class PacketEventBatch:
+    origin: CaptureOrigin
+    events: List[PacketEvent] = field(default_factory=list)
+    sequence: int = 0
+
+
+@dataclass
+class FlowDeltaBatch:
+    origin: CaptureOrigin
+    flows: List[Dict] = field(default_factory=list)
+    sequence: int = 0
+
+
+@dataclass
+class CaptureHealth:
+    session_id: str
+    received_packets: int = 0
+    emitted_packets: int = 0
+    dropped_packets: int = 0
+    queue_full_events: int = 0
+    last_packet_at: float = 0.0
+    error: Optional[str] = None
+
+
+@dataclass
+class PipelineHealth:
+    session_id: str
+    processed_packets: int = 0
+    detector_errors: int = 0
+    evidence_dropped: int = 0
+    snapshot_dropped: int = 0
+    pending_packets: int = 0
+    queue_depth: int = 0
+    queue_depth_high_watermark: int = 0
+    queue_lag_ms: float = 0.0
+    queue_lag_max_ms: float = 0.0
+    processing_state: str = "running"
+    completion_reason: Optional[str] = None
+
+
+@dataclass
+class HardwareObservation:
+    timestamp: float
+    origin: CaptureOrigin
+    observation_type: str
+    subject: str
+    peer: Optional[str] = None
+    metadata: Dict = field(default_factory=dict)
 
 
 @dataclass
@@ -55,6 +122,18 @@ class AlertRecord:
 
 @dataclass
 class FlowAggregate:
+    REPLACE_METADATA_KEYS = frozenset({
+        "conversation_direction", "initiator_ip", "initiator_port", "responder_ip",
+        "responder_port", "reverse_byte_count", "reverse_packet_count",
+        "conversation_established", "conversation_syn_count", "conversation_syn_ack_count",
+        "conversation_rst_count", "conversation_to_responder_bytes",
+        "conversation_to_initiator_bytes", "conversation_to_responder_packets",
+        "conversation_to_initiator_packets", "outbound_bytes_p99",
+    })
+    OR_METADATA_KEYS = frozenset({
+        "peer_novelty", "intel_match", "protocol_corroboration", "auth_failure",
+        "role_policy_violation",
+    })
     flow_id: Tuple
     start_time: float
     last_seen: float
@@ -68,6 +147,7 @@ class FlowAggregate:
     raw_packets: List[bytes] = field(default_factory=list)
 
     tcp_syn_count: int = 0
+    tcp_syn_ack_count: int = 0
     tcp_rst_count: int = 0
     
     # Track when specific alert types were last triggered for this flow
@@ -91,18 +171,27 @@ class FlowAggregate:
         if flags:
             if "S" in flags and "A" not in flags: # Pure SYN (request)
                 self.tcp_syn_count += 1
+            if "S" in flags and "A" in flags:
+                self.tcp_syn_ack_count += 1
             if "R" in flags:
                 self.tcp_rst_count += 1
         
         if l7_info:
             for k, v in l7_info.items():
-                if k not in self.l7_metadata:
+                if k in self.OR_METADATA_KEYS:
+                    self.l7_metadata[k] = bool(self.l7_metadata.get(k)) or bool(v)
+                elif k in self.REPLACE_METADATA_KEYS:
+                    self.l7_metadata[k] = v
+                elif k not in self.l7_metadata:
                     self.l7_metadata[k] = v
                 elif isinstance(v, list):
+                    if not v:
+                        continue
                     if not isinstance(self.l7_metadata[k], list):
                         self.l7_metadata[k] = [self.l7_metadata[k]]
-                    if v[0] not in self.l7_metadata[k]:
-                        self.l7_metadata[k].extend(v)
+                    for item in v:
+                        if item not in self.l7_metadata[k]:
+                            self.l7_metadata[k].append(item)
                 elif v != self.l7_metadata[k]:
                     if not isinstance(self.l7_metadata[k], list):
                         self.l7_metadata[k] = [self.l7_metadata[k]]

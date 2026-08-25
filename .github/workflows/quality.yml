@@ -1,0 +1,32 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [v2-rewrite]
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22", cache: npm, cache-dependency-path: ui/package-lock.json}
+      - run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - run: python -m pip install -c requirements/container.lock -e ".[dev]"
+      - run: ruff check core tests tools scripts
+      - run: python tools/check_release_tree.py
+      - run: python -m pytest -q
+      - run: tower plugins calibration verify
+      - run: cargo test --locked
+        working-directory: rust/watchtower-sensor
+      - run: npm ci
+        working-directory: ui
+      - run: npm run lint
+        working-directory: ui
+      - run: npm run typecheck
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui

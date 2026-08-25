@@ -1,0 +1,47 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.dns.tunnel
+  finding_type: dns.tunnel.suspected
+  input_kind: packet
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: dns.tunnel.positive
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &dns_positive
+      packets:
+        - repeat: 20
+          interval: 1
+          src: 10.250.13.10
+          dst: 10.250.13.53
+          transport: udp
+          sport: 54000
+          dport: 53
+          dns:
+            qname: "{n:04x}0123456789abcdef0123456789abcdef.exfil.invalid"
+            qtype: TXT
+  - id: dns.tunnel.benign.integrated
+    label: benign
+    variant: benign
+    recipe: &dns_benign
+      packets:
+        - repeat: 5
+          interval: 1
+          src: 10.250.13.20
+          dst: 10.250.13.53
+          transport: udp
+          sport: 54100
+          dport: 53
+          dns:
+            qname: "www.microsoft.com"
+            qtype: A
+  - id: dns.tunnel.benign.bulk
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative benign DNS production case.
+    recipe: *dns_benign

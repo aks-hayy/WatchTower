@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package watchtower.mesh.v1;
+
+import "google/protobuf/struct.proto";
+
+// Generic Struct envelopes keep the transport forward-compatible while
+// WatchTower validates the versioned fields in core.mesh.contracts.
+service Mesh {
+  rpc Enroll(google.protobuf.Struct) returns (google.protobuf.Struct);
+  rpc Ingest(google.protobuf.Struct) returns (google.protobuf.Struct);
+}

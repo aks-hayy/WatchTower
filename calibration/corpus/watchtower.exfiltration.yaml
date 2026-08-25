@@ -1,0 +1,38 @@
+schema_version: 1
+defaults:
+  detector_id: watchtower.exfiltration
+  finding_type: exfil.volume_anomaly
+  input_kind: flow
+  modes: [isolation]
+  backends: [python]
+  unsupported:
+    integrated: Exfiltration corpus calibrates directional flow features without raw payload replay.
+cases:
+  - id: exfil.positive
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &exfil_positive
+      src: 10.250.11.10
+      dst: 8.8.8.8
+      sport: 52000
+      dport: 443
+      protocol: TCP
+      packet_count: 2000
+      byte_count: 157286400
+      start_time: 1
+      last_seen: 301
+      l7_metadata:
+        reverse_byte_count: 10485760
+        outbound_bytes_p99: 20971520
+        peer_novelty: true
+  - id: exfil.benign.bulk
+    repeat: 30
+    label: benign
+    variant: benign
+    recipe:
+      <<: *exfil_positive
+      byte_count: 52428800
+      l7_metadata:
+        reverse_byte_count: 52428800
+        outbound_bytes_p99: 20971520
+        peer_novelty: false

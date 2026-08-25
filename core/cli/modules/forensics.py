@@ -9,13 +9,18 @@ from rich.progress import Progress
 from rich.columns import Columns
 from rich.rule import Rule
 from rich.markup import escape
+from rich.text import Text
 
 
 from core.packet_engine.persistence import DailyAccumulator
-from core.packet_engine.utils import get_geoip_info, get_reverse_dns
 from core.forensics.engine import ForensicsEngine
+from core.backend_policy import backend_policy
 from core.forensics.models import ForensicReport
 from core.storage.database import WatchtowerDB
+from core.intelligence.local_assets import LocalAssetProfiler
+from core.investigation.service import InvestigationService
+from core.detection.operations import ScoringOperations
+from core.utils.network import format_endpoint
 
 console = Console()
 
@@ -25,6 +30,9 @@ class ForensicsModule:
         self.db = WatchtowerDB()
         self.acc = DailyAccumulator()
         self.engine = ForensicsEngine(db=self.db)
+        self.asset_profiler = LocalAssetProfiler(self.db)
+        self.investigator = InvestigationService(self.db)
+        self.scoring = ScoringOperations(self.db)
         # Keep last report in memory for stream following (needs raw data)
         self._last_report = None
 
@@ -33,9 +41,10 @@ class ForensicsModule:
         console.print("Commands: show flows, show alerts, analyze <file.pcap>, dive <ip>, graph")
 
     def analyze(self, arg):
-        parts = arg.split()
+        import shlex
+        parts = shlex.split(arg)
         if not parts:
-            console.print("Usage: analyze <file.pcap> [--keylog <keylog_file>]")
+            console.print("Usage: analyze <file.pcap> [--mode auto|memory|streaming] [--backend python|rust] [--keylog FILE]")
             return
             
         filename = parts[0]
@@ -55,6 +64,19 @@ class ForensicsModule:
                 console.print("[red]Error: Missing keylog file path after --keylog.[/red]")
                 return
 
+        mode = "auto"
+        backend = backend_policy.replay_backend()
+        for option, allowed in (("--mode", {"auto", "memory", "streaming"}), ("--backend", {"python", "rust"})):
+            if option in parts:
+                try:
+                    value = parts[parts.index(option) + 1]
+                    if value not in allowed: raise ValueError
+                    if option == "--mode": mode = value
+                    else: backend = value
+                except (IndexError, ValueError):
+                    console.print(f"[red]Invalid value for {option}.[/red]")
+                    return
+
         console.print(Panel(f"[bold cyan]Deep Forensic Analysis: {os.path.basename(filename)}[/bold cyan]\n[dim]Initializing engine and processing packets...[/dim]"))
         
         start_time = time.time()
@@ -67,23 +89,11 @@ class ForensicsModule:
                     progress.update(task, completed=(current/total)*100)
 
                 # ForensicsEngine now writes to SQLite automatically
-                report = self.engine.analyze_pcap(filename, progress_callback=update_progress, keylog_file=keylog_file)
+                report = self.engine.analyze_pcap(
+                    filename, progress_callback=update_progress, keylog_file=keylog_file,
+                    mode=mode, backend=backend,
+                )
                 self._last_report = report
-
-                from core.forensics.sigma_engine import SigmaEngine
-                sigma = SigmaEngine()
-                if sigma.rules:
-                    progress.update(task, description="[cyan]Running Sigma Rules...[/cyan]")
-                    alerts = sigma.run_hunt(source=self.engine._source)
-                    # The alerts are automatically added to DB and will be shown in _render_report 
-                    # when it pulls from the DB, but since the in-memory report is already built,
-                    # we should append them to the report.entities for immediate CLI rendering.
-                    for alert in alerts:
-                        ev = alert.evidence
-                        ip = ev.get("entity_ip") or ev.get("flow", "").split(" ")[0]
-                        if ip and ip in report.entities:
-                            report.entities[ip].alerts.append(alert)
-                            report.entities[ip].risk_score += alert.score
 
             duration = time.time() - start_time
             self._render_report(report, duration)
@@ -224,10 +234,22 @@ class ForensicsModule:
         identity_table.add_row("JA3 Hash", entity.get("ja3_hash") or "None")
         identity_table.add_row("JA4 Fingerprint", entity.get("ja4_string") or "None")
         identity_table.add_row("TLS Client", entity.get("tls_library") or "Standard Client")
-        identity_table.add_row("Risk Score", f"{entity.get('risk_score', 0):.1f}")
+        assessment = self._priority_assessment(ip)
+        identity_table.add_row(
+            "Investigation Priority",
+            f"{assessment['priority_score']:.1f}/100 {assessment['risk_level']}",
+        )
         identity_table.add_row("Source", entity.get("source", "unknown"))
 
         console.print(Panel(identity_table, title="[bold blue]Host Identification", border_style="blue"))
+
+        investigation = None
+        try:
+            investigation = self.investigator.investigate(ip, source=self.options.get("source"))
+            self._render_asset_profile(investigation.asset_profile)
+            self._render_investigation(self._with_v2_assessment(investigation.to_dict(), assessment))
+        except ValueError:
+            console.print(f"[yellow]Unable to classify invalid IP address: {escape(ip)}[/yellow]")
 
         # 2. Flows
         flows = self.db.get_entity_flows(ip)
@@ -269,23 +291,6 @@ class ForensicsModule:
             
             console.print(file_table)
 
-        # 4. Alerts
-        alerts = self.db.get_alerts(entity_ip=ip)
-        if alerts:
-            unique_alerts = {}
-            for a in alerts:
-                key = f"{a.get('type')}:{a.get('explanation')}"
-                if key not in unique_alerts:
-                    unique_alerts[key] = a
-            
-            behaviors = []
-            for alert in unique_alerts.values():
-                severity = alert.get("severity", "MEDIUM")
-                color = "red" if severity == "CRITICAL" else "yellow"
-                behaviors.append(f"[{color}]• {alert.get('type', 'UNKNOWN')}:[/{color}] {alert.get('explanation', '')}")
-            
-            console.print(Panel("\n".join(behaviors), title="[bold red]Malware Behavior & Alerts", border_style="red"))
-
         # 5. Top Destinations
         if flows:
             metrics_table = Table(title="Top Traffic Destinations", expand=True)
@@ -312,6 +317,98 @@ class ForensicsModule:
                 )
                 
             console.print(metrics_table)
+
+        return investigation
+
+    def _render_asset_profile(self, profile: dict):
+        """Render the shared passive profile used by lookup and dive."""
+        overview = Table(box=None, padding=(0, 2), expand=True)
+        overview.add_column("Asset Context", style="dim", width=22)
+        overview.add_column("Observed Value", style="bold white")
+        overview.add_row("Network Scope", profile.get("scope", "unknown"))
+        overview.add_row("Local Subnet", profile.get("subnet") or "N/A")
+        overview.add_row(
+            "Inferred Role",
+            f"{profile.get('role', 'Unclassified')} ({profile.get('role_confidence', 0) * 100:.0f}% confidence)",
+        )
+        overview.add_row("Role Evidence", "; ".join(profile.get("role_reasons") or ["None"]))
+        overview.add_row("Device Attribute Coverage", f"{profile.get('identity_completeness', 0) * 100:.0f}%")
+        overview.add_row(
+            "Asset Byte Direction",
+            f"out {profile.get('outbound_bytes', 0) / 1024:.1f} KB / in {profile.get('inbound_bytes', 0) / 1024:.1f} KB",
+        )
+        overview.add_row(
+            "Peer Exposure",
+            f"{len(profile.get('internal_peers') or [])} internal / {len(profile.get('external_peers') or [])} external",
+        )
+        console.print(Panel(overview, title="[bold cyan]Passive Asset Intelligence", border_style="cyan"))
+
+        services = profile.get("served_services") or []
+        consumed = profile.get("consumed_services") or []
+        if services or consumed:
+            service_table = Table(title="Observed Service Inventory", expand=True)
+            service_table.add_column("Direction", style="dim")
+            service_table.add_column("Service", style="cyan")
+            service_table.add_column("Endpoint")
+            service_table.add_column("Packets", justify="right")
+            for service in services[:10]:
+                service_table.add_row(
+                    "Serves", service["name"], f"{service['protocol']}/{service['port']}", str(service["packets"])
+                )
+            for service in consumed[:10]:
+                service_table.add_row(
+                    "Uses", service["name"], f"{service['protocol']}/{service['port']}", str(service["packets"])
+                )
+            console.print(service_table)
+
+        insights = profile.get("insights") or []
+        if insights:
+            console.print(Panel("\n".join(f"- {escape(item)}" for item in insights), title="Asset Findings", border_style="blue"))
+
+    def _render_investigation(self, investigation: dict, compact: bool = False):
+        verdict = investigation.get("verdict", "UNKNOWN")
+        color = "red" if verdict in {"CRITICAL", "HIGH RISK"} else ("yellow" if verdict == "ELEVATED" else "green")
+        headline = (
+            f"[{color}]{verdict}[/{color}] | investigation priority {investigation.get('risk_score', 0):.1f}/100 | "
+            f"assessment confidence {investigation.get('confidence', 0) * 100:.0f}%\n"
+            f"{escape(investigation.get('summary', ''))}"
+        )
+        console.print(Panel(headline, title="[bold]Evidence-backed Assessment", border_style=color))
+        if compact:
+            return
+
+        groups = investigation.get("alert_groups") or []
+        if groups:
+            alert_table = Table(title="Correlated Alert Groups", expand=True)
+            alert_table.add_column("Type", style="cyan")
+            alert_table.add_column("Severity")
+            alert_table.add_column("Count", justify="right")
+            alert_table.add_column("Evidence References")
+            for group in groups[:10]:
+                alert_table.add_row(
+                    group["type"], group["max_severity"], str(group["count"]), ", ".join(group["refs"][:5])
+                )
+            console.print(alert_table)
+
+        timeline = investigation.get("timeline") or []
+        if timeline:
+            timeline_table = Table(title="Evidence Timeline", expand=True)
+            timeline_table.add_column("Time", width=19)
+            timeline_table.add_column("Ref", style="cyan", width=14)
+            timeline_table.add_column("Observation")
+            for item in timeline[:15]:
+                timestamp = item.get("timestamp") or 0
+                when = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "unknown"
+                timeline_table.add_row(when, item.get("ref", "?"), escape(item.get("summary", "")))
+            console.print(timeline_table)
+
+        actions = investigation.get("next_actions") or []
+        if actions:
+            console.print(Panel(
+                "\n".join(f"{index}. {escape(action)}" for index, action in enumerate(actions, 1)),
+                title="Recommended Investigation Actions",
+                border_style="yellow",
+            ))
 
 
     def do_report(self, arg):
@@ -442,7 +539,54 @@ class ForensicsModule:
             self._render_stream(self._last_report, ip, port)
         else:
             # Deep dive from SQLite — works always
-            self._render_deep_dive(ip)
+            investigation = self._render_deep_dive(ip)
+            if investigation and "--export" in parts:
+                export_index = parts.index("--export")
+                case_name = None
+                if export_index + 1 < len(parts) and not parts[export_index + 1].startswith("--"):
+                    case_name = parts[export_index + 1]
+                try:
+                    from core.investigation.export import CaseExporter
+                    case_dir = CaseExporter(os.path.join(self.engine.data_dir, "cases")).export(
+                        investigation, case_name=case_name
+                    )
+                    console.print(f"[bold green]Case exported:[/bold green] {case_dir.resolve()}")
+                except FileExistsError:
+                    console.print("[bold red]Case export failed:[/bold red] that case name already exists.")
+
+    def doctor(self, json_output: bool = False):
+        """Run configuration, database, schema, storage and daemon diagnostics."""
+        import json
+        from core.operations.health import HealthService
+        from core.daemon.client import DaemonClient
+
+        report = HealthService(self.db).run()
+        daemon = DaemonClient().get_status()
+        daemon_status = "pass" if daemon.get("running") and daemon.get("healthy", True) else (
+            "warn" if daemon.get("running") else "fail"
+        )
+        report["daemon"] = {
+            "status": daemon_status,
+            "running": bool(daemon.get("running")),
+            "healthy": bool(daemon.get("healthy", False)),
+            "interfaces": daemon.get("interfaces") or [],
+        }
+        if json_output:
+            print(json.dumps(report, sort_keys=True, default=str))
+            return report
+        table = Table(title="Watchtower Operational Health", expand=True)
+        table.add_column("Check", style="cyan")
+        table.add_column("Status")
+        table.add_column("Detail")
+        colors = {"pass": "green", "warn": "yellow", "fail": "red"}
+        for check in report["checks"]:
+            color = colors.get(check["status"], "white")
+            table.add_row(check["name"], f"[{color}]{check['status'].upper()}[/{color}]", check["detail"])
+
+        color = colors[daemon_status]
+        detail = f"interfaces: {', '.join(daemon.get('interfaces') or []) or 'none'}"
+        table.add_row("daemon", f"[{color}]{daemon_status.upper()}[/{color}]", detail)
+        console.print(table)
 
     def _identify_stream_type(self, data: bytes) -> str:
         if not data: return "Empty"
@@ -574,20 +718,53 @@ class ForensicsModule:
 
     def show(self, arg, ip=None, limit=None):
         source = self.options.get("source") or "live"
+        interface = self.options.get("interface")
+        capture_session_id = self.options.get("session")
         limit = limit or 20
         if arg == "flows":
+            query_limit = limit if capture_session_id else limit * 3
             if ip:
-                flows = self.db.get_entity_flows(ip, limit=limit)
+                flows = self.db.get_entity_flows(
+                    ip, limit=query_limit, source=source, interface=interface,
+                    capture_session_id=capture_session_id,
+                )
                 title = f"Recent Flows for {ip} ({source})"
             else:
-                flows = self.db.get_flows(source=source, limit=limit)
+                flows = self.db.get_flows(
+                    source=source, limit=query_limit, interface=interface,
+                    capture_session_id=capture_session_id,
+                )
                 title = f"Recent Flow Forensics ({source})"
+
+            if not capture_session_id:
+                unique_flows = {}
+                for flow in flows:
+                    key = (
+                        flow.get("capture_interface"), flow.get("src_ip"), flow.get("src_port"),
+                        flow.get("dst_ip"), flow.get("dst_port"), flow.get("protocol"),
+                    )
+                    current = unique_flows.get(key)
+                    if current is None or float(flow.get("last_seen") or 0) > float(current.get("last_seen") or 0):
+                        unique_flows[key] = flow
+                flows = list(unique_flows.values())[:limit]
             
-            table = Table(title=title)
-            table.add_column("Flow ID")
-            table.add_column("Proto")
-            table.add_column("Identity")
-            table.add_column("Score")
+            narrow = console.width < 110
+            # The narrow IPv6 form is intentionally compact enough to remain
+            # visible inside an 80-column Rich table after borders and cell
+            # padding are accounted for.
+            endpoint_width = 22 if narrow else 34
+            # Preserve the compact IPv6 endpoint at its natural width on
+            # narrow terminals; expanding the table makes Rich squeeze it
+            # when the other columns compete for the same 80 columns.
+            table = Table(title=title, expand=not narrow, pad_edge=not narrow)
+            table.add_column("Iface" if narrow else "Interface", style="cyan", no_wrap=True, max_width=8 if narrow else 16)
+            table.add_column("Source", overflow="ellipsis", no_wrap=True, max_width=endpoint_width)
+            table.add_column("Destination", overflow="ellipsis", no_wrap=True, max_width=endpoint_width)
+            table.add_column("Proto", justify="center", no_wrap=True, min_width=5)
+            if not narrow:
+                table.add_column("Identity", overflow="ellipsis", max_width=24)
+            table.add_column("Priority", justify="right", no_wrap=True, max_width=4 if narrow else None)
+            priority_cache = {}
             
             for f in flows:
                 meta = f.get("l7_metadata", {})
@@ -595,65 +772,204 @@ class ForensicsModule:
                     import json
                     try: meta = json.loads(meta)
                     except Exception: meta = {}
-                identity = meta.get("hostname") or meta.get("sni") or meta.get("dns_query", "")
+                flow_context = meta.get("watchtower_intel_v1") or {}
+                identity = (
+                    meta.get("hostname") or meta.get("sni") or meta.get("dns_query")
+                    or flow_context.get("purpose", "")
+                )
                 if isinstance(identity, list): identity = identity[0] if identity else ""
                 
-                # Get entity for risk score
-                entity = self.db.get_entity(f.get("src_ip", ""))
-                score = entity.get("risk_score", 0.0) if entity else 0.0
-                score_color = "red" if score > 70 else ("yellow" if score > 40 else "green")
+                subject = f.get("src_ip", "")
+                score_key = (subject, source, interface, capture_session_id)
+                if score_key not in priority_cache:
+                    priority_cache[score_key] = self._priority_assessment(
+                        subject, source=source, interface=interface, session_id=capture_session_id,
+                    )["priority_score"]
+                score = priority_cache[score_key]
+                score_color = "red" if score >= 80 else ("yellow" if score >= 50 else ("cyan" if score >= 20 else "green"))
                 
-                table.add_row(
-                    f.get("flow_id", ""),
-                    f.get("protocol", "?"),
-                    str(identity),
-                    f"[{score_color}]{score:.1f}[/{score_color}]"
-                )
+                row = [
+                    f.get("capture_interface") or self._interface_from_source(f.get("source")),
+                    Text(format_endpoint(
+                        f.get("src_ip"), f.get("src_port"), compact="narrow" if narrow else True
+                    )),
+                    Text(format_endpoint(
+                        f.get("dst_ip"), f.get("dst_port"), compact="narrow" if narrow else True
+                    )),
+                    str(f.get("protocol") or "?").upper(),
+                ]
+                if not narrow:
+                    row.append(str(identity))
+                score_text = f"{score:.0f}" if narrow else f"{score:.1f}"
+                row.append(f"[{score_color}]{score_text}[/{score_color}]")
+                table.add_row(*row)
             console.print(table)
         elif arg == "alerts":
             if ip:
-                alerts = self.db.get_alerts(entity_ip=ip, source=source, limit=limit)
+                alerts = self.db.get_alerts(
+                    entity_ip=ip, source=source, limit=limit, interface=interface,
+                    capture_session_id=capture_session_id,
+                )
                 title = f"Security Alerts for {ip} ({source})"
             else:
-                alerts = self.db.get_alerts(source=source, limit=limit)
+                alerts = self.db.get_alerts(
+                    source=source, limit=limit, interface=interface,
+                    capture_session_id=capture_session_id,
+                )
                 title = f"Security Alerts ({source})"
                 
-            table = Table(title=title)
-            table.add_column("Time")
-            table.add_column("Entity")
-            table.add_column("Severity")
-            table.add_column("Explanation")
+            narrow = console.width < 110
+            table = Table(title=title, expand=narrow, pad_edge=not narrow)
+            if narrow:
+                table.add_column("Subject", no_wrap=True, overflow="ellipsis", width=28)
+                table.add_column("Finding", no_wrap=True, overflow="ellipsis")
+            else:
+                table.add_column("Time", no_wrap=True, width=8)
+                table.add_column("Entity", no_wrap=True, overflow="ellipsis", max_width=22)
+                table.add_column("Interface", no_wrap=True, overflow="ellipsis", max_width=9)
+                table.add_column("Severity", no_wrap=True, max_width=8)
+                table.add_column("Explanation", overflow="fold")
             
             for a in alerts:
-                ts = datetime.fromtimestamp(a.get("timestamp", 0)).strftime("%H:%M:%S") if a.get("timestamp") else "?"
-                table.add_row(ts, a.get("entity_ip", "?"), a.get("severity", "?"), a.get("explanation", ""))
+                time_format = "%H:%M" if narrow else "%H:%M:%S"
+                ts = datetime.fromtimestamp(a.get("timestamp", 0)).strftime(time_format) if a.get("timestamp") else "?"
+                entity = Text(format_endpoint(a.get("entity_ip"), compact="narrow" if narrow else False))
+                severity = str(a.get("severity", "?"))
+                if narrow:
+                    severity = {"CRITICAL": "CRIT", "MEDIUM": "MED"}.get(severity.upper(), severity[:4].upper())
+                    captured_on = a.get("capture_interface") or self._interface_from_source(a.get("source"))
+                    context = f" {captured_on}" if captured_on != "-" else ""
+                    row = [entity, f"{ts} {severity}{context}: {a.get('explanation', '')}"]
+                else:
+                    row = [
+                        ts, entity,
+                        a.get("capture_interface") or self._interface_from_source(a.get("source")),
+                        severity, a.get("explanation", ""),
+                    ]
+                table.add_row(*row)
             console.print(table)
         else:
             console.print("[yellow]Usage: show flows [ip] [limit] | show alerts [ip] [limit][/yellow]")
 
+    @staticmethod
+    def _interface_from_source(source):
+        source = str(source or "")
+        if not source.startswith("live_"):
+            return "-"
+        return source[5:].split("#", 1)[0]
+
+    def show_artifacts(self):
+        """List files carved from historical traffic without running Sigma."""
+        source = self.options.get("source")
+        artifacts = self.db.get_carved_files(source=source)
+        title = "Carved Evidence Artifacts" + (f" ({source})" if source else "")
+        table = Table(title=title)
+        table.add_column("Entity", style="cyan")
+        table.add_column("Type")
+        table.add_column("Size", justify="right")
+        table.add_column("SHA-256", overflow="ellipsis", max_width=18)
+        table.add_column("Path", overflow="fold")
+        for artifact in artifacts:
+            size = int(artifact.get("size") or 0)
+            table.add_row(
+                str(artifact.get("entity_ip") or "-"), str(artifact.get("extension") or "unknown"),
+                f"{size:,} B", str(artifact.get("sha256") or "-"),
+                str(artifact.get("filename") or "-"),
+            )
+        console.print(table)
+        if not artifacts:
+            console.print("[dim]No carved evidence artifacts found.[/dim]")
+
+    def show_stats(self):
+        interface = self.options.get("interface")
+        active_scope = "interfaces" in self.options
+        interfaces = self.options.get("interfaces") if active_scope else None
+        if interface:
+            stats = self.acc.get_today(source=f"live_{interface}")
+        elif active_scope:
+            interfaces = sorted({str(name) for name in (interfaces or []) if name})
+            if interfaces:
+                interface_stats = [self.acc.get_today(source=f"live_{name}") for name in interfaces]
+                stats = {
+                    "total_flows": sum(item.get("total_flows", 0) for item in interface_stats),
+                    "total_packets": sum(item.get("total_packets", 0) for item in interface_stats),
+                    "total_bytes": sum(item.get("total_bytes", 0) for item in interface_stats),
+                }
+            else:
+                # A stopped daemon has no active interface list.  Keep recent
+                # live session totals visible instead of showing a false zero.
+                active_scope = False
+                interfaces = self.db.get_today_live_interfaces()
+                interface_stats = [self.acc.get_today(source=f"live_{name}") for name in interfaces]
+                stats = {
+                    "total_flows": sum(item.get("total_flows", 0) for item in interface_stats),
+                    "total_packets": sum(item.get("total_packets", 0) for item in interface_stats),
+                    "total_bytes": sum(item.get("total_bytes", 0) for item in interface_stats),
+                }
+        else:
+            interfaces = self.db.get_today_live_interfaces()
+            interface_stats = [self.acc.get_today(source=f"live_{name}") for name in interfaces]
+            stats = {
+                "total_flows": sum(item.get("total_flows", 0) for item in interface_stats),
+                "total_packets": sum(item.get("total_packets", 0) for item in interface_stats),
+                "total_bytes": sum(item.get("total_bytes", 0) for item in interface_stats),
+            }
+        table = Table(title=f"Live Stats{f' ({interface})' if interface else ''}")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Flows", str(stats.get("total_flows", 0)))
+        table.add_row("Packets", str(stats.get("total_packets", 0)))
+        table.add_row("Bytes", f"{stats.get('total_bytes', 0)/(1024*1024):.2f} MB")
+        console.print(table)
+
+        if not interface:
+            if not active_scope:
+                interfaces = self.db.get_today_live_interfaces()
+            if interfaces:
+                breakdown = Table(title="Interface Breakdown")
+                breakdown.add_column("Interface", style="cyan")
+                breakdown.add_column("Flows", justify="right")
+                breakdown.add_column("Packets", justify="right")
+                breakdown.add_column("Bytes", justify="right")
+                for name in interfaces:
+                    item = self.acc.get_today(source=f"live_{name}")
+                    breakdown.add_row(
+                        name, str(item.get("total_flows", 0)), str(item.get("total_packets", 0)),
+                        f"{item.get('total_bytes', 0)/(1024*1024):.2f} MB",
+                    )
+                console.print(breakdown)
+
     def lookup(self, ip):
-        """Enhanced IP intelligence lookup combining external and internal data."""
+        """Render the same evidence-backed lookup used by the local API."""
+        from core.intelligence.ip_lookup import IpLookupService
+
+        source = self.options.get("source")
         with console.status(f"[cyan]Performing deep lookup for {ip}..."):
-            geo = get_geoip_info(ip)
-            rdns = get_reverse_dns(ip)
-            
-            # Check internal DB for this IP
-            entity = self.db.get_entity(ip)
-            flows = self.db.get_entity_flows(ip)
-            alerts = self.db.get_alerts(entity_ip=ip)
+            try:
+                investigation = self.investigator.investigate(ip, source=source)
+                lookup = IpLookupService(self.db).lookup(ip, source=source, persist=True)
+            except ValueError:
+                console.print(f"[bold red]Invalid IP address:[/bold red] {escape(ip)}")
+                return
+        asset_profile = lookup["asset_profile"]
+        identity = lookup["identity"]
+        enrichment = lookup["enrichment"]
+        activity = lookup["activity"]
+        alerts = int(activity.get("alert_count") or 0)
 
         # 1. External Intelligence Panel
         intel_table = Table(box=None, padding=(0, 2))
         intel_table.add_column("Source", style="dim")
         intel_table.add_column("Intelligence", style="bold white")
         
-        intel_table.add_row("Location", f"{geo.get('city')}, {geo.get('country')}")
-        intel_table.add_row("ISP / Org", f"{geo.get('isp')} [dim]({geo.get('org')})[/dim]")
-        intel_table.add_row("ASN", geo.get('asn'))
-        intel_table.add_row("Reverse DNS", rdns or "[dim]None found[/dim]")
+        intel_table.add_row("Location", lookup["location"].get("label") or "Unknown")
+        intel_table.add_row("ISP / Org", f"{enrichment.get('isp') or 'Unknown'} [dim]({enrichment.get('org') or 'Unknown'})[/dim]")
+        intel_table.add_row("ASN", enrichment.get("asn") or "Unknown ASN")
+        intel_table.add_row("Reverse DNS", identity.get("reverse_dns") or "[dim]None found[/dim]")
+        intel_table.add_row("Evidence", str(enrichment.get("evidence_source") or "capture/passive"))
         
         # Threat flags
-        is_internal = "Local Network" in geo.get('country', '')
+        is_internal = lookup.get("scope") in {"private", "link-local", "loopback"} or enrichment.get("is_local_endpoint")
         flag_style = "green" if not is_internal else "blue"
         flag_text = "Internal Asset" if is_internal else "External Host"
         
@@ -663,33 +979,112 @@ class ForensicsModule:
             border_style="cyan"
         ))
 
+        endpoint_identity = lookup.get("endpoint_identity") or {}
+        if endpoint_identity:
+            identity_table = Table(box=None, padding=(0, 2), expand=True)
+            identity_table.add_column("Endpoint Identity", style="bold magenta")
+            identity_table.add_column("Evidence-backed Value", style="white")
+            identity_table.add_row("Association", str(endpoint_identity.get("identity_label") or ip))
+            identity_table.add_row("Identity Type", str(endpoint_identity.get("identity_type") or "address_endpoint"))
+            identity_table.add_row(
+                "Confidence",
+                f"{float(endpoint_identity.get('confidence') or 0.0) * 100:.0f}% ({endpoint_identity.get('verification') or 'observed'})",
+            )
+            evidence = endpoint_identity.get("evidence") or []
+            if evidence:
+                identity_table.add_row("Basis", "; ".join(str(item.get("summary")) for item in evidence[:3]))
+            console.print(Panel(identity_table, title="Endpoint Identity", border_style="magenta"))
+
+        self._render_asset_profile(asset_profile)
+        flow_intelligence = lookup.get("flow_intelligence") or {}
+        if flow_intelligence.get("total_flows"):
+            flow_table = Table(box=None, padding=(0, 2), expand=True)
+            flow_table.add_column("Capture Evidence", style="bold cyan")
+            flow_table.add_column("Observed Context", style="white")
+            purposes = list(flow_intelligence.get("purposes") or [])
+            services = list(flow_intelligence.get("services") or [])
+            directions = flow_intelligence.get("directions") or {}
+            actions = list(flow_intelligence.get("recommended_actions") or [])
+            if purposes:
+                flow_table.add_row("Classifications", ", ".join(str(value) for value in purposes[:4]))
+            if services:
+                labels = [
+                    f"{item.get('name')} ({item.get('port')}/{item.get('protocol')}, {item.get('basis')})"
+                    for item in services[:4]
+                ]
+                flow_table.add_row("Service Context", ", ".join(labels))
+            if directions:
+                flow_table.add_row(
+                    "Direction",
+                    ", ".join(f"{name}: {count}" for name, count in sorted(directions.items())),
+                )
+            if actions:
+                flow_table.add_row("Next Step", str(actions[0]))
+            console.print(Panel(flow_table, title="Capture Evidence Summary", border_style="blue"))
+
+        assessment = self._priority_assessment(ip)
+        self._render_investigation(
+            self._with_v2_assessment(investigation.to_dict(), assessment), compact=True,
+        )
+
         # 2. Watchtower Internal Context
-        if entity or flows or alerts:
+        if activity.get("flow_count") or alerts or identity.get("hostname"):
             context_table = Table(box=None, padding=(0, 2), expand=True)
             context_table.add_column("Watchtower Context", style="bold yellow")
             context_table.add_column("Details", style="white")
 
-            if entity:
-                id_text = f"{entity.get('hostname') or 'Unknown Host'} ({entity.get('username') or 'No User'})"
-                context_table.add_row("Identity", id_text)
-                score = entity.get('risk_score', 0)
-                score_color = "red" if score > 50 else ("yellow" if score > 20 else "green")
-                context_table.add_row("Risk Score", f"[{score_color}]{score:.1f}[/{score_color}]")
+            if identity:
+                id_text = f"{identity.get('hostname') or 'Unknown Host'} ({identity.get('username') or 'No User'})"
+                context_table.add_row("Host Attributes", id_text)
+                score = assessment["priority_score"]
+                score_color = "red" if score >= 80 else ("yellow" if score >= 50 else ("cyan" if score >= 20 else "green"))
+                context_table.add_row(
+                    "Investigation Priority",
+                    f"[{score_color}]{score:.1f}/100 {assessment['risk_level']}[/{score_color}]",
+                )
+                context_table.add_row("Asset Role", asset_profile.get("role", "Unclassified"))
             
-            if flows:
-                total_bytes = sum(f.get('byte_count', 0) for f in flows)
-                total_pkts = sum(f.get('packet_count', 0) for f in flows)
+            if activity.get("flow_count"):
+                total_bytes = int(activity.get("total_bytes") or 0)
+                total_pkts = int(activity.get("total_packets") or 0)
                 context_table.add_row("Session Traffic", f"{total_pkts} packets / {total_bytes/1024:.1f} KB")
             
             if alerts:
-                context_table.add_row("Security Alerts", f"[bold red]{len(alerts)} alerts triggered[/bold red]")
+                context_table.add_row("Security Alerts", f"[bold red]{alerts} alerts triggered[/bold red]")
 
             console.print(Panel(context_table, title="Watchtower Forensic History", border_style="yellow"))
         else:
             console.print("[dim]No prior session history found for this IP in Watchtower database.[/dim]")
 
         # 3. Quick Action Recommendations
-        if alerts or (entity and entity.get('risk_score', 0) > 40):
+        if alerts or (activity.get("flow_count") and assessment["priority_score"] >= 50):
              console.print("\n[bold red]RECOMMENDED ACTION:[/bold red] Run [cyan]dive {ip}[/cyan] to inspect reassembled streams and behavior.")
         elif is_internal:
              console.print("\n[dim]Tip: Use [cyan]graph[/cyan] to see how this internal host is connected to the rest of the network.[/dim]")
+
+    def _priority_assessment(self, ip, source=None, interface=None, session_id=None):
+        source = source if source is not None else (self.options.get("source") or "live")
+        interface = interface if interface is not None else self.options.get("interface")
+        session_id = session_id if session_id is not None else self.options.get("session")
+        try:
+            return self.scoring.explain(
+                ip, source=source, interface=interface, session_id=session_id, persist=False,
+            )
+        except Exception:
+            return {
+                "priority_score": 0.0, "risk_level": "LOW", "assessment_confidence": 0.0,
+                "contributors": [],
+            }
+
+    @staticmethod
+    def _with_v2_assessment(investigation, assessment):
+        result = dict(investigation)
+        level = assessment.get("risk_level", "LOW")
+        result["risk_score"] = float(assessment.get("priority_score") or 0.0)
+        result["confidence"] = float(assessment.get("assessment_confidence") or 0.0)
+        result["verdict"] = "HIGH RISK" if level == "HIGH" else level
+        result["summary"] = (
+            f"V2 scoring identified {len(assessment.get('contributors') or [])} active contributor(s). "
+            "Priority is an investigation index, not a threat probability."
+        )
+        return result

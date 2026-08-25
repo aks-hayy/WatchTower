@@ -9,6 +9,7 @@ logger = logging.getLogger("KerberosParser")
 
 class KerberosParser(BaseParser):
     name = "Kerberos Parser"
+    watched_ports = (88,)
 
     def parse(self, packet, context: Dict[str, Any] = None) -> Dict[str, Any]:
         result = {}

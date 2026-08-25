@@ -1,0 +1,41 @@
+services:
+  controller:
+    environment:
+      WATCHTOWER_NEO4J_ENABLED: "true"
+      WATCHTOWER_NEO4J_URI: bolt://neo4j:7687
+      WATCHTOWER_NEO4J_USERNAME: neo4j
+      WATCHTOWER_NEO4J_PASSWORD_FILE: /run/secrets/watchtower_neo4j_password
+    secrets:
+      - watchtower_master_key
+      - watchtower_neo4j_password
+
+  neo4j:
+    image: ${WATCHTOWER_NEO4J_IMAGE:-watchtower/neo4j:local}
+    build:
+      context: .
+      dockerfile: deploy/container/neo4j.Dockerfile
+    profiles: ["graph"]
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_NEO4J_PASSWORD_FILE: /run/secrets/watchtower_neo4j_password
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    volumes:
+      - watchtower-neo4j-data:/data
+      - watchtower-neo4j-logs:/logs
+    secrets:
+      - watchtower_neo4j_password
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+secrets:
+  watchtower_neo4j_password:
+    file: ${WATCHTOWER_NEO4J_PASSWORD_FILE:?Create a Neo4j password secret before enabling the graph profile}
+
+volumes:
+  watchtower-neo4j-data:
+  watchtower-neo4j-logs:

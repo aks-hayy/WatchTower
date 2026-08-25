@@ -10,7 +10,7 @@ from core.storage.database import WatchtowerDB
 
 logger = logging.getLogger("evidence_worker")
 
-def evidence_worker(evidence_queue, config):
+def evidence_worker(evidence_queue, config, acknowledgement_queue=None):
     """
     Background process that consumes flow data and raw packets to:
     1. Write evidence PCAPs to disk.
@@ -24,23 +24,34 @@ def evidence_worker(evidence_queue, config):
     
     logger.info("[evidence] Worker started.")
     
-    while True:
-        try:
-            # Block until an evidence request arrives
-            item = evidence_queue.get()
-            if item is None: # Termination signal
-                break
-                
-            task_type = item.get("type")
-            
-            if task_type == "WRITE_PCAP":
-                _handle_write_pcap(item)
-            elif task_type == "CARVE_FLOW":
-                _handle_carve_flow(forensics, item)
-                
-        except Exception as e:
-            logger.error(f"[evidence] Error: {e}")
-            time.sleep(1)
+    processed = 0
+    failures = 0
+    try:
+        while True:
+            try:
+                item = evidence_queue.get()
+                if item is None:
+                    break
+
+                task_type = item.get("type")
+                if task_type == "WRITE_PCAP":
+                    _handle_write_pcap(item)
+                elif task_type == "CARVE_FLOW":
+                    _handle_carve_flow(forensics, item)
+                processed += 1
+            except Exception as e:
+                failures += 1
+                logger.error(f"[evidence] Error: {e}")
+                time.sleep(1)
+    finally:
+        if acknowledgement_queue is not None:
+            acknowledgement_queue.put({
+                "stage": "evidence",
+                "processed_tasks": processed,
+                "failed_tasks": failures,
+                "acknowledged_at": time.time(),
+            })
+        db.close()
 
 def _handle_write_pcap(item):
     """Writes a list of raw packets to a PCAP file."""

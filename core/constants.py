@@ -30,9 +30,15 @@ EXFIL_BYTE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
 # --- File Carving ---
 MIN_CARVED_FILE_SIZE = 100    # Minimum bytes for a carved file to be kept
 MAX_CARVED_FILE_STORE = 1024 * 1024  # 1 MB — only store in DB if smaller
+MAX_STREAM_BYTES = 16 * 1024 * 1024  # Per direction, per flow
+MAX_STREAM_SEGMENTS = 10000
+MAX_REASSEMBLY_GAP = 64 * 1024
 
 # --- Forensic Ports (high-value for topology graph) ---
 FORENSIC_PORTS = {88, 135, 139, 389, 443, 445, 636, 3389, 5985, 5986, 8080}
+FORENSIC_TERMINAL_STATES = frozenset(
+    {"complete", "partial", "cancelled", "failed"}
+)
 
 # --- C2 & Suspect Traffic ---
 def _load_intel_config():

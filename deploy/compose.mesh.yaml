@@ -1,0 +1,5 @@
+services:
+  controller:
+    ports:
+      - "${WATCHTOWER_MESH_BIND_ADDRESS:?Set an intentional VPN or public bind address}:9443:9443"
+      - "${WATCHTOWER_MESH_BIND_ADDRESS:?Set an intentional VPN or public bind address}:9444:9444"

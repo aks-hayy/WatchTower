@@ -1,0 +1,68 @@
+schema_version: 1
+exception_id: builtins-v2.0
+description: >-
+  One-time WatchTower 2.0 release bootstrap. These exact built-in targets may
+  replace the 30 benign host-day gate with the stricter bootstrap corpus gate.
+  All normal production-path, parity, determinism, redaction, bounded-state,
+  attestation, and reviewer promotion gates still apply.
+targets:
+  - detector_id: watchtower.application.abuse
+    detector_version: 2.1.0
+    finding_type: credential.cleartext.generic
+  - detector_id: watchtower.application.abuse
+    detector_version: 2.1.0
+    finding_type: auth.failure_burst
+  - detector_id: watchtower.application.abuse
+    detector_version: 2.1.0
+    finding_type: icmp.tunnel.suspected
+  - detector_id: watchtower.application.abuse
+    detector_version: 2.1.0
+    finding_type: tls.protocol_mismatch
+  - detector_id: watchtower.application.abuse
+    detector_version: 2.1.0
+    finding_type: protocol.nonstandard_service
+  - detector_id: watchtower.iot-ot.safety
+    detector_version: 2.0.0
+    finding_type: ot.modbus.unauthorized_write
+  - detector_id: watchtower.iot-ot.safety
+    detector_version: 2.0.0
+    finding_type: credential.cleartext.mqtt
+  - detector_id: watchtower.lan.trust
+    detector_version: 2.0.0
+    finding_type: network.arp.binding_conflict
+  - detector_id: watchtower.lan.trust
+    detector_version: 2.0.0
+    finding_type: network.ndp.binding_conflict
+  - detector_id: watchtower.lan.trust
+    detector_version: 2.0.0
+    finding_type: network.dhcp.untrusted_server
+  - detector_id: watchtower.lan.trust
+    detector_version: 2.0.0
+    finding_type: network.ipv6.untrusted_router
+  - detector_id: watchtower.dns.tunnel
+    detector_version: 2.0.0
+    finding_type: dns.tunnel.suspected
+  - detector_id: watchtower.file.transfer
+    detector_version: 2.1.0
+    finding_type: file.executable_transfer
+  - detector_id: watchtower.credential.ftp
+    detector_version: 2.0.0
+    finding_type: credential.cleartext.ftp
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: recon.port_scan
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: recon.host_scan
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: recon.syn_flood
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: lateral.admin_fanout
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: exfil.volume_anomaly
+  - detector_id: watchtower.stateful.host
+    detector_version: 2.1.0
+    finding_type: behavior.beacon.suspected

@@ -1,5 +1,5 @@
 title: Suspicious FTP Data Transfer (Sample)
-id: ftp-cleartext-sample
+id: c92ab6e7-9d55-4f33-80f1-4ce91010f998
 status: test
 description: Detects FTP traffic which often indicates cleartext transfer or potential credentials exposure.
 logsource:

@@ -18,7 +18,9 @@ def setup_logger(name, log_file=None, level=logging.INFO):
         return logger
 
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Keep stdout available for machine-readable CLI commands such as
+    # ``tower doctor --json``; operational logs belong on stderr.
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 

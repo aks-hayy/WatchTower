@@ -1,44 +1,51 @@
-.PHONY: install dev build test clean help
+.PHONY: help install dev test lint build ui clean release-check container-init container-up container-down container-status
 
-help: ## Show this help message
-	@echo "Watchtower - Network Forensics Platform"
-	@echo ""
-	@echo "Usage: make [target]"
-	@echo ""
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
+help:
+	@echo "WatchTower 2.0"
+	@echo "  make install       Install backend, Rust sensor, and UI"
+	@echo "  make dev           Install development dependencies"
+	@echo "  make test          Run the Python test suite"
+	@echo "  make lint          Run Python and UI static checks"
+	@echo "  make build         Build Rust and the production UI"
+	@echo "  make ui            Launch the local UI"
+	@echo "  make release-check Validate the source tree"
+	@echo "  make container-up  Start the loopback Docker Compose deployment"
 
-install: ## Install backend + frontend dependencies
-	pip install -e .
-	cd flow-insights && npm install
+install:
+	./scripts/setup.sh
 
-dev: ## Install with development dependencies
-	pip install -e ".[dev,tls]"
-	cd flow-insights && npm install
+dev:
+	./scripts/setup.sh --development
 
-build: ## Build the frontend for production
-	cd flow-insights && npm run build
+test:
+	.venv/bin/python -m pytest -q
 
-test: ## Run all tests
-	python -m pytest tests/ -v
+lint:
+	.venv/bin/ruff check core tests tools scripts
+	cd ui && npm run lint && npm run typecheck
 
-lint: ## Lint Python code with ruff
-	ruff check core/
-	ruff format --check core/
+build:
+	cargo build --locked --release --manifest-path rust/watchtower-sensor/Cargo.toml
+	cd ui && npm ci && npm run build
 
-format: ## Auto-format Python code
-	ruff format core/
+ui:
+	.venv/bin/tower ui
 
-clean: ## Remove runtime data and build artifacts
-	rm -rf data/watchtower.db data/engine.log data/engine.pid
-	rm -rf __pycache__ core/__pycache__
-	rm -rf dist/ build/ *.egg-info
-	rm -rf flow-insights/dist
+release-check:
+	.venv/bin/python tools/check_release_tree.py
+	.venv/bin/tower plugins calibration verify
 
-start: ## Start the capture engine (requires admin/root)
-	tower start
+clean:
+	.venv/bin/python tools/release.py workspace scan
 
-stop: ## Stop the capture engine
-	tower stop
+container-init:
+	bash ./scripts/container.sh init
 
-ui: ## Launch the web dashboard
-	tower ui
+container-up:
+	bash ./scripts/container.sh up
+
+container-down:
+	bash ./scripts/container.sh down
+
+container-status:
+	bash ./scripts/container.sh status

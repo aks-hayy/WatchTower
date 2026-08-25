@@ -1,0 +1,25 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.file.transfer
+  finding_type: file.executable_transfer
+  input_kind: stream
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: file.pe.positive
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &pe_positive
+      src: 10.250.12.10
+      dst: 10.250.12.20
+      sport: 53000
+      dport: 80
+      parts: ["HTTP/1.1 200 OK\r\n\r\nMZ", "This program cannot be run in DOS mode", "PE-section-bytes"]
+  - id: file.pe.benign.bulk
+    repeat: 30
+    label: benign
+    variant: benign
+    recipe:
+      <<: *pe_positive
+      parts: ["HTTP/1.1 200 OK\r\n\r\n", "text/plain document transfer"]

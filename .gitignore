@@ -1,85 +1,83 @@
-# ============================================================
-# Watchtower .gitignore
-# ============================================================
-
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-dist/
-build/
-*.egg
 .eggs/
-*.so
-*.pyd
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# --- Virtual Environments ---
-WT/
-venv/
+# Virtual environments and local dependency caches
 .venv/
+venv/
 env/
+WT/
+.deps/
 
-# ─── Secrets & Keys (NEVER commit these) ─────────────────────────────────────
-.env
-*.key
-*.enc
-*.pem
-*.p12
-*.pfx
+# JavaScript and UI output
+node_modules/
+.npm-cache/
+.vite/
+.vinxi/
+.nitro/
+.tanstack/
+.wrangler/
+.output/
+dist-ssr/
 
-# ─── Runtime Auth State ───────────────────────────────────────────────────────
-data/auth.key
-data/auth_creds.enc
-data/auth_biometric.json
-data/auth_challenge.tmp
-data/daemon.key
-data/ipc.key
-data/secret.key
-data/session.enc
+# Rust output
+rust/**/target/
 
-# ─── Database (contains captured network traffic — personal data) ─────────────
-data/watchtower.db
-data/watchtower.db-shm
-data/watchtower.db-wal
-data/logs/watchtower.db
-data/logs/watchtower.db-shm
-data/logs/watchtower.db-wal
+# WatchTower runtime state and release runs
+data/
+scratch/
+.test-runtime/
+.plugin-runtime/
+.install-runtime/
+.release-state/
+.release-state-*/
+.release-*/
+.acceptance-*/
+.calibration-*/
+traffic_testing/results/
+calibration/reports/
+calibration/field-bundles/
 
-# ─── Logs ────────────────────────────────────────────────────────────────────
-data/engine.log
-data/engine.pid
-data/*.log
-data/logs/*.log
-data/queue_debug.log
-
-# ─── Runtime State ───────────────────────────────────────────────────────────
-data/interface_override.txt
-data/topology.html
-data/topology1.html
-data/today.json
-data/archives/
-data/forensics/
-data/reports/
-data/dive_*.txt
-
-# ─── Encrypted Daily Archives (personal network data) ─────────────────────────
-data/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.enc
-data/logs/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.enc
-
-# ─── Packet Captures (highly sensitive — never commit) ───────────────────────
+# Captures, databases, evidence, logs, and generated reports
 *.pcap
 *.pcapng
 *.cap
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.enc
+*.tmp
+*.bak
+*.orig
+my_network_forensics.html
 
-# ─── Frontend Build ───────────────────────────────────────────────────────────
-flow-insights/node_modules/
-flow-insights/dist/
-flow-insights/bun.lockb
-flow-insights/.env
-flow-insights/.env.local
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+!deploy/container/.env.container.example
+deploy/container/.env.container
+deploy/container/secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
 
-# ─── IDE & OS ─────────────────────────────────────────────────────────────────
+# Editors and operating systems
 .vscode/
 .idea/
 *.suo
@@ -90,9 +88,3 @@ flow-insights/.env.local
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ─── Temp / Scratch ───────────────────────────────────────────────────────────
-*.tmp
-*.bak
-*.orig
-my_network_forensics.html

@@ -1,6 +1,8 @@
 import os
 import json
 import socket
+import time
+from core.backend_policy import backend_policy
 from core.context import context
 
 
@@ -43,14 +45,14 @@ class DaemonClient:
                 break
         return buf.decode("utf-8", errors="replace").strip()
 
-    def _send_command(self, command_dict):
+    def _send_command(self, command_dict, timeout=None):
         auth_key = self._get_key()
         if not auth_key:
             return {"status": "error", "message": "Daemon key missing. Is the daemon running?"}
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self._timeout)
+                s.settimeout(float(timeout or self._timeout))
                 s.connect((self.host, self.port))
 
                 # Step 1: Authenticate
@@ -88,11 +90,37 @@ class DaemonClient:
     def shutdown(self):
         return self._send_command({"action": "shutdown"})
 
-    def start_engine(self, interface):
-        return self._send_command({"action": "start", "interface": interface})
+    def start_engine(self, interface, backend=None, source_type="network"):
+        backend = backend_policy.capture_backend(
+            source_type=source_type,
+            requested_backend=backend,
+        )
+        result = self._send_command({
+            "action": "start", "interface": interface,
+            "backend": backend, "source_type": source_type,
+        })
+        message = str(result.get("message") or "")
+        if result.get("status") == "error" and (
+            message.startswith("Empty command response") or message.startswith("Daemon timed out")
+        ):
+            time.sleep(0.15)
+            status = self.get_status()
+            engine = (status.get("engines") or {}).get(interface) or {}
+            if (
+                status.get("running")
+                and engine.get("capture_alive")
+                and str(engine.get("backend") or "") == str(backend)
+            ):
+                return {
+                    "status": "started", "interface": interface, "backend": backend,
+                    "session_id": engine.get("session_id"), "response_recovered": True,
+                }
+        return result
 
     def stop_engine(self, interface):
-        return self._send_command({"action": "stop", "interface": interface})
+        # Stopping is an ordered capture -> worker -> evidence drain and can
+        # legitimately exceed the short status-command timeout.
+        return self._send_command({"action": "stop", "interface": interface}, timeout=90.0)
 
     def get_status(self):
         resp = self._send_command({"action": "status"})

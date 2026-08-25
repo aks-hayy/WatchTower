@@ -1,0 +1,106 @@
+name: watchtower
+
+services:
+  controller:
+    image: ${WATCHTOWER_CONTROLLER_IMAGE:-watchtower/controller:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_HOME: /var/lib/watchtower
+      WATCHTOWER_CREDENTIAL_BACKEND: encrypted_file
+      WATCHTOWER_MASTER_KEY_FILE: /run/secrets/watchtower_master_key
+      WATCHTOWER_CAPTURE_BACKEND: rust
+      WATCHTOWER_RUST_SENSOR: /opt/watchtower/bin/watchtower-sensor
+      WATCHTOWER_HYBRID_BRIDGE: ${WATCHTOWER_HYBRID_BRIDGE:-0}
+      WATCHTOWER_OLLAMA_BASE_URL: ${WATCHTOWER_OLLAMA_BASE_URL:-http://ollama:11434}
+    volumes:
+      - watchtower-state:/var/lib/watchtower
+    secrets:
+      - watchtower_master_key
+    tmpfs:
+      - /tmp:mode=1777,size=512m
+    read_only: true
+    healthcheck:
+      test: ["CMD", "python", "/opt/watchtower-healthcheck.py"]
+      interval: 15s
+      timeout: 4s
+      retries: 6
+      start_period: 20s
+
+  ui:
+    image: ${WATCHTOWER_UI_IMAGE:-watchtower/ui:local}
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      controller:
+        condition: service_healthy
+    environment:
+      WATCHTOWER_API_ORIGIN: http://controller:8000
+      WATCHTOWER_API_URL: http://controller:8000/api/v1
+      VITE_WATCHTOWER_API_URL: /api/v1
+      NITRO_HOST: 0.0.0.0
+      NITRO_PORT: 4173
+    ports:
+      - "127.0.0.1:${WATCHTOWER_UI_PORT:-4173}:4173"
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+    read_only: true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4173/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 4s
+      retries: 6
+      start_period: 15s
+
+  ollama:
+    image: ollama/ollama:0.12.6
+    profiles: ["ai-local"]
+    restart: unless-stopped
+    volumes:
+      - watchtower-ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 5s
+      retries: 12
+
+  sensor-linux:
+    image: ${WATCHTOWER_CONTROLLER_IMAGE:-watchtower/controller:local}
+    profiles: ["linux-sensor"]
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      WATCHTOWER_HOME: /var/lib/watchtower
+      WATCHTOWER_CREDENTIAL_BACKEND: encrypted_file
+      WATCHTOWER_MASTER_KEY_FILE: /run/secrets/watchtower_master_key
+      WATCHTOWER_CAPTURE_BACKEND: rust
+      WATCHTOWER_RUST_SENSOR: /opt/watchtower/bin/watchtower-sensor
+      WATCHTOWER_SENSOR_INTERFACE: ${WATCHTOWER_SENSOR_INTERFACE:-}
+      WATCHTOWER_SENSOR_AGENT: ${WATCHTOWER_SENSOR_AGENT:-0}
+      WATCHTOWER_SENSOR_SYNC_INTERVAL: ${WATCHTOWER_SENSOR_SYNC_INTERVAL:-10}
+      WATCHTOWER_SENSOR_SYNC_LIMIT: ${WATCHTOWER_SENSOR_SYNC_LIMIT:-250}
+      WATCHTOWER_RUNTIME_ROLE: sensor
+    volumes:
+      - watchtower-sensor-state:/var/lib/watchtower
+    secrets:
+      - watchtower_master_key
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    entrypoint: ["/bin/sh", "/opt/watchtower-sensor-entrypoint.sh"]
+
+secrets:
+  watchtower_master_key:
+    file: ${WATCHTOWER_MASTER_KEY_FILE:?Run scripts/container.ps1 init or scripts/container.sh init first}
+
+volumes:
+  watchtower-state:
+  watchtower-sensor-state:
+  watchtower-ollama:

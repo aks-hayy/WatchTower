@@ -1,0 +1,15 @@
+[package]
+name = "watchtower-sensor"
+version = "2.0.0-rc.1"
+edition = "2021"
+license = "MIT"
+description = "Portable Rust capture and L2-L4 processing core for WatchTower"
+
+[dependencies]
+pcap = "2.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,211 +1,152 @@
-<p align="center">
-  <h1 align="center">🏰 Watchtower</h1>
-  <p align="center">
-    <strong>Network Forensics & Traffic Analysis Platform</strong>
-  </p>
-  <p align="center">
-    <a href="#-features">Features</a> ·
-    <a href="#-quick-start">Quick Start</a> ·
-    <a href="USAGE.md">User Guide</a> ·
-    <a href="#-architecture">Architecture</a> ·
-    <a href="PRODUCTION_READINESS.md">Production Readiness</a> ·
-    <a href="#-contributing">Contributing</a>
-  </p>
-  <p align="center">
-    <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
-    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
-    <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-    <img src="https://img.shields.io/badge/status-beta-yellow.svg" alt="Beta">
-  </p>
-</p>
+# WatchTower V2
 
----
+WatchTower is a local-first network detection and forensic investigation platform. It combines a Rust packet engine, conversation-aware detection, evidence-backed endpoint identity, offline PCAP investigation, sensor mesh support, and an optional AI analyst behind one CLI and web UI.
 
-**Watchtower** is a modular network forensics platform that combines **live traffic capture** with **deep offline PCAP analysis**. It provides a rich interactive CLI for forensic investigation, backed by a high-performance SQLite database.
+WatchTower is intended for networks and captures you own or are authorized to investigate. The V2 rewrite is currently published as release candidate software; the older V1 product remains on the `v1-maintenance` branch.
 
-Built for security researchers, SOC analysts, and network engineers who need to understand *what's happening on the wire* — and *who's doing it*.
+## What ships
 
----
+- Rust-first live capture and offline replay, with Python available as a secondary backend.
+- Session-, interface-, source-, and sensor-scoped flows and findings.
+- Protocol parsers, stateful detectors, Behavioral Scoring V2, and historical Sigma hunting.
+- Offline forensic cases with immutable analysis IDs, SHA-256 identity, conversations, findings, entities, topology, timeline, streams, artifacts, and evidence references.
+- Internal and external endpoint identity with provenance and confidence.
+- Windows Sysmon process and service attribution.
+- Local and remote sensor fleet management with encrypted enrollment and telemetry spooling.
+- Optional Neo4j evidence projection while SQLite remains the source of truth.
+- A local-first AI analyst with Ollama support and explicit OpenAI opt-in.
+- A React/TypeScript UI and Rich terminal interface over the same local services.
 
-## 🏰 The Identity-Aware Forensic Engine
+## Supported hosts
 
-Watchtower is an **Identity-First** forensic platform. It doesn't just see packets; it understands the **who** and the **what** behind every bit of data.
+- Windows 11 with Npcap.
+- Ubuntu 22.04 or 24.04 with libpcap.
 
-### Key Advanced Capabilities:
-- **Deep Asset Profiling** — Automatic hardware vendor resolution (OUI) and device role discovery (e.g., IoT, Server, Workstation) via mDNS, SSDP, and NetBIOS.
-- **Behavioral Peer Matrix** — Persistent historical baselines that distinguish routine communications from anomalous first-time peer connections.
-- **Subnet-Aware Triage** — Dynamic risk scoring based on network zones, with automatic sensitivity multipliers for trusted discovery segments.
+Other platforms may run parts of the Python analysis stack but are not release-tested capture targets.
 
-| Capability | Watchtower | Traditional SIEM |
-|---|:---:|:---:|
-| Identity Attribution | ✅ Native | ⚠️ Rule-based |
-| Hardware Fingerprinting | ✅ Native | ❌ External |
-| Behavioral Baselines | ✅ Native | ❌ Database-linked |
+## Install from a clone
 
----
+### Windows
 
-## ✨ Features
+Open PowerShell. The prerequisite option installs missing Python, Node.js, Rust, and Visual C++ build tools through `winget`, downloads the pinned Npcap SDK, and opens the official Npcap installer for the required interactive license step.
 
-### 🔬 Deep Packet Forensics
-- **Identity Attribution** — Extracts usernames, hostnames, and full names from NTLM, Kerberos, NBNS, DHCP, and LDAP traffic
-- **TLS Fingerprinting** — JA3/JA4 hash extraction with known malware client library identification (Cobalt Strike, Metasploit, Empire)
-- **File Carving** — Automatic extraction of PE, ELF, ZIP, and PNG files from reassembled TCP streams
-- **VirusTotal Integration** — SHA-256 hash lookups for carved files against 70+ AV engines
-- **Stream Reassembly** — Full bidirectional TCP stream reconstruction with protocol identification
-
-### 🚨 Threat Detection
-- **Beaconing Detection** — Statistical analysis of connection timing regularity (C2 callback patterns)
-- **DNS Anomaly Detection** — Shannon entropy scoring of domain names (DGA/tunneling detection)
-- **Lateral Movement Alerts** — Internal network scanning and enumeration detection
-- **Suspicious File Transfer** — Detection of PE/executable transfers over non-standard ports
-- **Data Exfiltration** — High-volume outbound transfer alerting
-
-### 🖥️ Secure Architecture
-- **Admin Daemon** — Privileged background daemon handling all capture logic to keep user-facing tools safe
-- **Strict Data Isolation** — Offline PCAP analysis streams are isolated from live telemetry
-
-A UI AND AI LAYER WILL BE ADDED SOON.
----
-
-## 🔌 Modular Plugin Architecture
-
-Watchtower is built on a highly extensible plugin-based architecture. Every protocol parser and threat detector is a hot-swappable module, allowing the engine to adapt to new network environments and evolving threats.
-
-### 🔬 Active Forensic Modules:
-- **Protocol Parsers**: Deep-packet inspection for **SMB, Kerberos, NTLM, TLS (JA3/JA4), HTTP, FTP, DHCP, and DNS**.
-- **Identity Scrapers**: Passive and active discovery of hostnames, user accounts, and full names via **NBNS, SSDP, mDNS, and Kerberos**.
-- **Threat Detectors**: Automated anomaly detection for **C2 Beaconing, DNS Tunneling (DGA), Data Exfiltration, and Lateral Movement**.
-
-To audit your active forensic modules, use the `plugins` command in the Watchtower shell.
-
----
-
-### 🛡️ Sigma Rules Integration
-
-Watchtower natively supports the **Sigma Rules** standard for network-centric threat hunting. This allows you to leverage industry-standard YAML signatures to detect complex behavioral patterns, known malicious TLS fingerprints, and suspicious protocol usage across your forensic data.
-
-- **Standardized Detection**: Use any standard Sigma rule targeting `network_identity` or `flow` categories.
-- **Historical Hunting**: Run the `hunt` command to scan your entire historical database for Sigma matches.
-- **Risk Score Correlation**: Sigma matches are automatically linked to entity profiles, contributing to their global risk score.
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- **Python 3.9+**
-- **Npcap** (Windows) — [Download](https://npcap.com/) with "WinPcap API-compatible Mode"
-- **Admin/Root privileges** for packet capture
-
-### Install & Run
-
-```bash
-# Clone the repository
-git clone https://github.com/aks-hayy/WatchTower.git
-cd WatchTower
-
-# Install in development mode (registers the 'tower' command)
-pip install -e .
+```powershell
+git clone -b v2-rewrite https://github.com/aks-hayy/WatchTower---Network-Monitoring-and-Forensics.git
+cd WatchTower---Network-Monitoring-and-Forensics
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
 ```
 
-> **Note:** If the `tower` command is not recognized after installation, ensure your Python `Scripts` directory is in your system `PATH`, or run the command within an activated virtual environment.
+If the prerequisites already exist:
 
-### First Steps
-
-1. Start the background engine securely:
-
-```bash
-# In the terminal:
-tower start          # Begin capturing packets on primary interface
-tower status         # Check engine status
-tower shell          # Enter the interactive forensic shell (requires login)
+```powershell
+.\scripts\setup.ps1 -NpcapSdk C:\path\to\npcap-sdk-1.16
 ```
 
-### Forensic Workflow
+### Debian or Ubuntu
 
 ```bash
-# Inside the secure 'tower shell':
-tower > analyze suspicious_traffic.pcap     # Full PCAP analysis
-tower > dive 192.168.1.50                   # Investigate a suspect IP
-tower > dive 192.168.1.50 --stream          # Follow TCP streams
-tower > graph                               # Visualize network topology
-tower > clean                               # Wipe the database
+git clone -b v2-rewrite https://github.com/aks-hayy/WatchTower---Network-Monitoring-and-Forensics.git
+cd WatchTower---Network-Monitoring-and-Forensics
+chmod +x scripts/setup.sh
+./scripts/setup.sh --install-prerequisites --grant-capture
+./watchtower.sh start
 ```
 
-For the complete command reference, see the **[User Guide](USAGE.md)**.
+The installer creates `.venv`, builds the Rust sensor and production UI, configures local operator access, and runs `tower doctor`.
 
----
+## Run with Docker Compose
 
-## 🏗️ Architecture
+The hybrid Compose deployment packages the controller and UI for reproducible
+offline analysis and fleet control. It publishes only the loopback UI, while
+Windows capture and Sysmon remain native-host features.
+
+```powershell
+.\scripts\container.ps1 init
+.\scripts\container.ps1 up
+```
+
+Open `http://127.0.0.1:4173`. See [container deployment](docs/containers.md)
+for persistent data, encrypted credentials, optional Ollama/Neo4j, mesh, and
+the Linux sensor profile.
+
+## Easiest Windows setup: hybrid runtime
+
+For a Windows workstation, the supported one-command path keeps the Rust
+packet sensor on the host and runs the controller and UI in Docker. The first
+command installs or builds the native sensor, creates the local controller
+configuration, and builds the container images. Npcap still requires accepting
+its official installer once when it is not already present.
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install.ps1
+.\watchtower.ps1 start
+```
+
+The runtime enrolls the host sensor with the local controller over loopback
+mTLS, opens the UI and a companion `tower` command window, and forwards flows,
+findings, endpoint attribution, and health telemetry to
+`http://127.0.0.1:4173`. It does not capture until the user selects an
+interface and presses Start in either surface. Raw captures and local evidence
+remain on the host by default.
+
+```powershell
+.\watchtower.ps1 status
+.\watchtower.ps1 stop
+.\watchtower.ps1 repair  # re-enroll only the local sensor bridge
+```
+
+The sensor's private runtime is stored under
+`%LOCALAPPDATA%\WatchTower\hybrid-sensor`; the controller state remains in the
+Docker volume. The controller UI and companion CLI share one eight-hour
+controller session: unlocking either one unlocks the other, and locking either
+one locks both. See [hybrid containers](docs/containers.md#windows-hybrid-runtime)
+for scope and recovery details.
+
+## Start using WatchTower
+
+Windows:
+
+```powershell
+.\.venv\Scripts\tower.exe sources
+.\.venv\Scripts\tower.exe start -i "Ethernet"
+.\.venv\Scripts\tower.exe ui
+```
+
+Linux:
+
+```bash
+.venv/bin/tower sources
+.venv/bin/tower start -i eth0
+.venv/bin/tower ui
+```
+
+Offline PCAP analysis does not require a live capture session:
 
 ```text
-                     ┌──────────────────────────────────────────────┐
-                     │                 Watchtower                   │
-                     └──────────────────────────────────────────────┘
-                                          │
-         ┌───────────────────────────────┼───────────────────────────────┐
-         │                               │                               │
-    ┌────▼─────┐                  ┌──────▼──────┐                 ┌──────▼──────┐
-    │  CLI     │    IPC Sockets   │  Admin      │   IPC Sockets   │  Analytics  │
-    │  Shell   ├─────────────────►│  Daemon     │◄────────────────┤  Worker     │
-    │  (Rich)  │                  │  (server.py)│                 │             │
-    └────┬─────┘                  └──────┬──────┘                 └──────┬──────┘
-         │                               │                               │
-         │                        ┌──────▼───────┐                       │
-         │                        │  Capture     │                       │
-         │                        │  Process     │                       │
-         │                        └──────┬───────┘                       │
-         │                               │ Packet Queue                  │
-         │                        ┌──────▼───────┐                       │
-         │                        │  Flow Worker │                       │
-         │                        │  (Forensics) │                       │
-         │                        └──────┬───────┘                       │
-         │                               │                               │
-         │                        ┌──────▼──────┐                        │
-         └────────────────────────┤   SQLite    ├────────────────────────┘
-                                  │  (WAL mode) │
-                                  └─────────────┘
+tower analyze evidence.pcap --mode auto --backend rust
 ```
 
-**Key design decisions:**
-- **Daemon IPC** — The privileged Daemon handles process execution; CLI acts as an unprivileged client
-- **Multiprocessing** — Capture (`scapy.sniff`) and flow analysis run in separate processes to bypass the GIL
-- **Graceful Termination** — IPC uses robust event signaling for clean network socket release and database flushing
-- **SQLite with WAL** — Enables concurrent reads while the engine writes
+## Documentation
 
----
+Start at [docs/README.md](docs/README.md). The documentation covers installation, live monitoring, forensic cases, identity, AI, mesh operation, plugins, architecture, development, testing, security, and troubleshooting.
 
-## 🛡️ Security
+Useful entry points:
 
-- All credentials are hashed using `bcrypt` and encrypted at rest using Fernet symmetric encryption.
-- The `tower shell` requires successful Master Password authentication before granting interactive control.
-- JWT-based session tokens maintain terminal session persistence with 6-hour expiries.
+- [Getting started](docs/getting-started.md)
+- [Container deployment](docs/containers.md)
+- [User guide](USAGE.md)
+- [Offline forensics](docs/forensics.md)
+- [Architecture](docs/architecture.md)
+- [Developer guide](docs/development.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
----
+## Data and privacy
 
-## 📚 Documentation
+Runtime state is stored outside the repository by default: `%LOCALAPPDATA%\WatchTower` on Windows and XDG state/config directories on Linux. Captures, databases, credentials, logs, and case exports are ignored by Git. AI provider credentials use the operating-system credential store and are not written to YAML, SQLite, logs, or browser storage.
 
-| Document | Description |
-|---|---|
-| [**User Guide**](USAGE.md) | Complete CLI reference |
-| [**Contributing**](CONTRIBUTING.md) | Development setup and contribution guidelines |
-| [**Security Policy**](SECURITY.md) | Vulnerability reporting process |
+## License
 
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  <sub>Built with ❤️ for the security community</sub>
-</p>
+WatchTower source code is licensed under the [MIT License](LICENSE). Third-party components and synchronized rule content retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

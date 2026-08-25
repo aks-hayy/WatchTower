@@ -3,6 +3,7 @@
 import sys
 import os
 import logging
+import queue as queue_module
 
 # Ensure local imports work when spawned in a new process on Windows
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -11,22 +12,118 @@ if current_dir not in sys.path:
 
 import time
 from collections import defaultdict
-from core.packet_engine.schemas import FlowAggregate, WindowSnapshot, AlertRecord
+from core.packet_engine.schemas import FlowAggregate, WindowSnapshot, AlertRecord, HardwareObservation
+from core.packet_engine.conversations import ConversationTracker
+from core.detection.streams import LiveTCPStreamTracker
 from core.packet_engine.persistence import DailyAccumulator
 from core.packet_engine.analytics import AnalyticsEngine
 from core.forensics.engine import ForensicsEngine
 from core.storage.database import WatchtowerDB
-from core.constants import (
-    FLOW_TIMEOUT, ALERT_THRESHOLD, EVIDENCE_TRIGGER,
-    C2_PORTS, INTERNAL_IP_PREFIXES, ALERT_COOLDOWN, SCAN_HIGH_SYN_COUNT
-)
+from core.constants import FLOW_TIMEOUT, EVIDENCE_TRIGGER
 import math
 import psutil
 from scapy.all import wrpcap, Ether, IP, TCP, UDP
-from core.packet_engine.utils import get_geoip_info, get_process_info
+from core.packet_engine.utils import get_geoip_info
+from core.endpoint.attribution import EndpointAttributor, legacy_process_label
 from core.packet_engine.processors import StatAggregator, SecurityScorer, AlertManager
 
 logger = logging.getLogger("flow_worker")
+
+
+def _record_baseline_event(windows, event):
+    bucket = int(float(event.timestamp) // 300) * 300
+    key = (event.interface, bucket, event.src_ip)
+    values = windows.setdefault(key, {
+        "outbound_bytes": 0.0, "packet_count": 0.0, "flow_keys": set(),
+        "peers": set(), "ports": set(), "syn_count": 0.0, "syn_ack_count": 0.0,
+        "dns_queries": 0.0, "interval_count": 0, "interval_mean": 0.0,
+        "interval_m2": 0.0, "last_timestamp": None, "generated_probe": False,
+    })
+    values["outbound_bytes"] += float(event.size or 0)
+    values["packet_count"] += 1.0
+    if len(values["flow_keys"]) < 4096:
+        values["flow_keys"].add((event.dst_ip, event.dst_port, event.protocol))
+    if len(values["peers"]) < 4096:
+        values["peers"].add(event.dst_ip)
+    if len(values["ports"]) < 4096:
+        values["ports"].add(int(event.dst_port or 0))
+    flags = str(event.flags or "")
+    if "S" in flags and "A" not in flags:
+        values["syn_count"] += 1.0
+    if "S" in flags and "A" in flags:
+        values["syn_ack_count"] += 1.0
+    if int(event.dst_port or 0) == 53:
+        values["dns_queries"] += 1.0
+    previous = values["last_timestamp"]
+    if previous is not None:
+        interval = max(0.0, float(event.timestamp) - previous)
+        values["interval_count"] += 1
+        delta = interval - values["interval_mean"]
+        values["interval_mean"] += delta / values["interval_count"]
+        values["interval_m2"] += delta * (interval - values["interval_mean"])
+    values["last_timestamp"] = float(event.timestamp)
+    values["generated_probe"] = values["generated_probe"] or (event.l7_info or {}).get("generated_by") == "WatchTower"
+
+
+def _flush_baseline_windows(db, windows, current_time, source_for_interface):
+    from core.detection.baseline import learning_allowed
+
+    current_bucket = int(float(current_time) // 300) * 300
+    completed = [key for key in windows if key[1] < current_bucket]
+    for interface, bucket, subject in completed:
+        values = windows.pop((interface, bucket, subject))
+        findings = db.get_detection_findings(subject=subject, source=source_for_interface(interface), limit=100)
+        confirmed_threat = any(
+            item.get("category") == "THREAT" and bucket <= float(item.get("last_seen") or 0) < bucket + 300
+            for item in findings
+        )
+        if not learning_allowed(generated_probe=values["generated_probe"], confirmed_threat=confirmed_threat):
+            continue
+        variance = values["interval_m2"] / max(1, values["interval_count"] - 1)
+        mean = values["interval_mean"]
+        features = {
+            "outbound_bytes": values["outbound_bytes"],
+            "packet_count": values["packet_count"],
+            "flow_count": float(len(values["flow_keys"])),
+            "peer_cardinality": float(len(values["peers"])),
+            "port_cardinality": float(len(values["ports"])),
+            "syn_response_ratio": values["syn_ack_count"] / max(1.0, values["syn_count"]),
+            "dns_queries": values["dns_queries"],
+            "request_periodicity": 0.0 if mean <= 0 else 1.0 - min(1.0, math.sqrt(max(0.0, variance)) / mean),
+        }
+        source = source_for_interface(interface)
+        for feature, value in features.items():
+            db.update_feature_baseline(subject, feature, value, bucket + 300, source=source, interface=interface)
+
+
+def _record_pending_stats(pending, event):
+    stats = pending.setdefault(event.interface, {
+        "packets": 0, "bytes": 0, "protocols": defaultdict(int),
+        "ports": defaultdict(int), "talkers": defaultdict(int), "timeline": {},
+    })
+    stats["packets"] += 1
+    stats["bytes"] += int(event.size)
+    stats["protocols"][event.protocol] += 1
+    if event.dst_port:
+        stats["ports"][int(event.dst_port)] += 1
+    stats["talkers"][event.src_ip] += int(event.size)
+    bucket = int(float(event.timestamp) // 60) * 60
+    timeline = stats["timeline"].setdefault(bucket, {"packets": 0, "bytes": 0})
+    timeline["packets"] += 1
+    timeline["bytes"] += int(event.size)
+
+
+def _pending_stats_snapshot(pending, interface, window_start, window_end, total_flows):
+    stats = pending.get(interface) or {
+        "packets": 0, "bytes": 0, "protocols": {}, "ports": {}, "talkers": {}, "timeline": {},
+    }
+    return WindowSnapshot(
+        window_start=window_start, window_end=window_end, total_flows=total_flows,
+        total_packets=stats["packets"], total_bytes=stats["bytes"],
+        protocol_distribution=dict(stats["protocols"]), protocol_entropy=0.0,
+        port_distribution=dict(stats["ports"]), top_talkers=dict(stats["talkers"]),
+        traffic_timeline=dict(stats["timeline"]), interface=interface,
+    )
 
 
 def cleanup_expired_flows(flow_table, current_time):
@@ -51,7 +148,9 @@ def enforce_memory_limit(flow_table, max_size):
         del flow_table[sorted_items[i][0]]
 
 
-def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, forensics_engine=None, behavioral_engine=None):
+def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, forensics_engine=None,
+                   behavioral_engine=None, source=None, capture_interface=None,
+                   capture_session_id=None, capture_backend=None, detection_flow_ids=None):
     stats = StatAggregator()
     scorer = SecurityScorer(analytics_engine, forensics_engine, behavioral_engine)
     alert_mgr = AlertManager()
@@ -64,6 +163,7 @@ def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, 
     total_bytes = 0
     max_behavior_score = 0.0
 
+    dirty_ids = set(detection_flow_ids) if detection_flow_ids is not None else None
     for f in active_flows:
         total_packets += f.packet_count
         total_bytes += f.byte_count
@@ -71,13 +171,40 @@ def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, 
         # 1. Aggregate Stats
         stats.aggregate(f, window_start)
         
+        # Attach context, never direct risk bonuses, before detector evaluation.
+        should_detect = dirty_ids is None or f.flow_id in dirty_ids
+        if should_detect and behavioral_engine is not None:
+            f.l7_metadata["peer_novelty"] = bool(f.l7_metadata.get("peer_novelty")) or (
+                behavioral_engine.check_peer_anomaly(f.flow_id[0], f.flow_id[1]) > 0
+            )
+        if should_detect and forensics_engine is not None and hasattr(forensics_engine.db, "get_feature_baselines"):
+            baselines = forensics_engine.db.get_feature_baselines(
+                subject=f.flow_id[0], feature="outbound_bytes",
+            )
+            mature = next((item for item in baselines if item["maturity"]["mature"]), None)
+            if mature:
+                f.l7_metadata["outbound_bytes_p99"] = float(mature.get("p99") or 0.0)
+
         # 2. Compute Scores
-        b_score, t_score, forensic_alerts = scorer.score_flow(f)
+        if should_detect and forensics_engine is not None and source:
+            forensic_alerts = forensics_engine.process_live_flow(
+                f, source=source, capture_interface=capture_interface,
+                capture_session_id=capture_session_id, capture_backend=capture_backend,
+            )
+            b_score = analytics_engine.compute_behavior_score(f) if analytics_engine else 0.0
+            t_score = sum(alert.score for alert in forensic_alerts)
+        elif should_detect:
+            b_score, t_score, forensic_alerts = scorer.score_flow(f)
+        else:
+            b_score, t_score, forensic_alerts = 0.0, 0.0, []
         final_score = b_score + t_score
         max_behavior_score = max(max_behavior_score, final_score)
         
         # 3. Handle Alerts
-        alert_mgr.process_alerts(f, b_score, t_score, forensic_alerts)
+        # Detector findings are already persisted by process_live_flow. Snapshot
+        # persistence must not emit a second aggregate or forensic alert.
+        if not source:
+            alert_mgr.process_alerts(f, b_score, t_score, forensic_alerts)
         
         # 4. Evidence Triggers (Asynchronous)
         if final_score > EVIDENCE_TRIGGER and hasattr(f, "raw_packets") and f.raw_packets:
@@ -99,7 +226,7 @@ def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, 
         port_distribution=dict(stats.port_distribution),
         top_talkers=dict(stats.top_talkers),
         traffic_timeline=dict(sorted(stats.timeline_buckets.items())),
-        alerts=alert_mgr.alerts[:10]
+        alerts=[] if source else alert_mgr.alerts[:10]
     ), evidence_tasks
 
 
@@ -115,7 +242,41 @@ def compute_entropy(distribution):
     return entropy
 
 
-def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, evidence_queue=None):
+def _increment_metric(metrics, key, amount=1):
+    if metrics is None or key not in metrics:
+        return
+    value = metrics[key]
+    with value.get_lock():
+        value.value += amount
+
+
+def _record_queue_health(metrics, packet_queue, event):
+    if metrics is None:
+        return
+    lag_ms = max(0.0, (time.time() - float(event.timestamp or time.time())) * 1000.0)
+    _increment_metric(metrics, "queue_lag_total_ms", lag_ms)
+    _increment_metric(metrics, "queue_lag_samples", 1)
+    if "queue_lag_current_ms" in metrics:
+        metrics["queue_lag_current_ms"].value = lag_ms
+    if "queue_lag_max_ms" in metrics:
+        with metrics["queue_lag_max_ms"].get_lock():
+            metrics["queue_lag_max_ms"].value = max(metrics["queue_lag_max_ms"].value, lag_ms)
+    try:
+        depth = max(0, int(packet_queue.qsize()))
+    except (NotImplementedError, OSError):
+        depth = 0
+    if "queue_depth" in metrics:
+        metrics["queue_depth"].value = depth
+    if "queue_depth_high_watermark" in metrics:
+        with metrics["queue_depth_high_watermark"].get_lock():
+            metrics["queue_depth_high_watermark"].value = max(
+                metrics["queue_depth_high_watermark"].value, depth
+            )
+
+
+def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, evidence_queue=None,
+                capture_origin=None, metrics=None, worker_done_event=None,
+                acknowledgement_queue=None):
     if config.silent:
         log_path = os.path.join(config.data_dir, "engine.log")
         log_file = open(log_path, "a", buffering=1)
@@ -124,9 +285,18 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
 
     interface_flow_tables = defaultdict(dict)
     device_flow_tables = {}
+    pending_stats = {}
+    baseline_windows = {}
+    dirty_flow_ids = defaultdict(set)
+    conversations = ConversationTracker(maximum=config.max_flow_table_size)
+    streams = LiveTCPStreamTracker(maximum_streams=min(config.max_flow_table_size, 16_384))
+    draining = False
+    drain_reason = "operator_stop"
+    persisted_generation = 0
 
     # Shared SQLite database
     db = WatchtowerDB(data_dir=config.data_dir)
+    endpoint_attributor = EndpointAttributor(db)
     
     # Initialise the daily stats accumulator (now wraps SQLite)
     accumulator = DailyAccumulator(data_dir=config.data_dir)
@@ -137,32 +307,74 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
     
     from core.packet_engine.analytics import BehavioralEngine
     behavioral = BehavioralEngine(db=db)
+    db.purge_inactive_feature_baselines()
+    last_baseline_purge = time.time()
 
     last_snapshot_time = time.time()
 
     last_snapshot_time = time.time()
+
+    def flush_final_state():
+        nonlocal persisted_generation
+        now = time.time()
+        for conversation_delta in conversations.finalize():
+            forensics.process_live_conversation(
+                conversation_delta,
+                source=conversation_delta.key.source,
+                capture_interface=conversation_delta.key.interface,
+                capture_session_id=conversation_delta.key.session_id,
+                capture_backend=conversation_delta.backend,
+            )
+        for iface, flow_table in interface_flow_tables.items():
+            if not flow_table and not pending_stats.get(iface):
+                continue
+            group_source = f"live_{iface}"
+            session_id = (capture_origin or {}).get("session_id")
+            record_source = f"{group_source}#{session_id[:12]}" if session_id else group_source
+            changed_ids = set(dirty_flow_ids.get(iface) or ())
+            changed_flows = {flow_id: flow_table[flow_id] for flow_id in changed_ids if flow_id in flow_table}
+            snapshot, tasks = build_snapshot(
+                flow_table, now - config.window_size, now,
+                analytics_engine=analytics, forensics_engine=forensics,
+                behavioral_engine=behavioral, source=record_source,
+                capture_interface=iface, capture_session_id=session_id,
+                capture_backend=(capture_origin or {}).get("backend"),
+                detection_flow_ids=changed_ids,
+            )
+            snapshot.interface = iface
+            accumulator.merge(
+                snapshot, flow_table=changed_flows, source=record_source,
+                stats_source=group_source, capture_origin=capture_origin,
+                stats_snapshot=_pending_stats_snapshot(
+                    pending_stats, iface, now - config.window_size, now, len(flow_table)
+                ),
+            )
+            for task in tasks:
+                if evidence_queue is None:
+                    break
+                try:
+                    evidence_queue.put(task, timeout=0.05)
+                except queue_module.Full:
+                    _increment_metric(metrics, "evidence_dropped")
+            dirty_flow_ids[iface].clear()
+            pending_stats.pop(iface, None)
+            persisted_generation += 1
 
     try:
         while True:
             current_time = time.time()
+            if current_time - last_baseline_purge >= 86400:
+                db.purge_inactive_feature_baselines(as_of=current_time)
+                last_baseline_purge = current_time
 
             # Check for control messages
-            if control_queue and not control_queue.empty():
+            if control_queue:
                 try:
                     msg = control_queue.get_nowait()
                     if msg.get("type") == "STOP":
-                        logger.info("[worker] Received STOP signal. Flushing and exiting.")
-                        # Final flush to DB before exit
-                        try:
-                            final_acc = DailyAccumulator(data_dir=db._data_dir if hasattr(db, '_data_dir') else "data")
-                            for iface, flow_table in interface_flow_tables.items():
-                                if flow_table:
-                                    snapshot, _ = build_snapshot(flow_table, time.time() - 10, time.time())
-                                    snapshot.interface = iface
-                                    accumulator.merge(snapshot, flow_table=flow_table, source=f"live_{iface}")
-                        except Exception as flush_e:
-                            logger.error(f"[worker] Final flush error: {flush_e}")
-                        return  # Clean exit
+                        draining = True
+                        drain_reason = str(msg.get("reason") or "operator_stop")
+                        logger.info("[worker] Received STOP signal. Draining packet queue.")
                     elif msg.get("type") == "DUMP":
                         filename = msg.get("filename", "dump.pcap")
                         logger.info(f"[worker] dumping all captured packets to {filename}")
@@ -176,12 +388,35 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                             logger.info(f"[worker] dump complete: {len(all_raw)} packets written to {filename}")
                         else:
                             logger.info("[worker] nothing to dump — no packets captured yet")
+                except queue_module.Empty:
+                    pass
                 except Exception as e:
                     logger.error(f"[worker] control message error: {e}")
 
             # Consume packets
-            while not packet_queue.empty():
-                event = packet_queue.get()
+            consumed = 0
+            for batch_index in range(config.packet_batch_size):
+                try:
+                    event = packet_queue.get(timeout=0.05) if batch_index == 0 else packet_queue.get_nowait()
+                except queue_module.Empty:
+                    break
+                consumed += 1
+                _record_queue_health(metrics, packet_queue, event)
+
+                if isinstance(event, HardwareObservation):
+                    db.insert_hardware_observation({
+                        "capture_session_id": event.origin.session_id,
+                        "timestamp": event.timestamp, "source_type": event.origin.source_type,
+                        "device_id": event.origin.device_id, "observation_type": event.observation_type,
+                        "subject": event.subject, "peer": event.peer, "metadata": event.metadata,
+                    })
+                    _increment_metric(metrics, "processed_packets")
+                    continue
+
+                conversation_metadata, conversation_delta = conversations.update_with_delta(event)
+                event.l7_info = {**(event.l7_info or {}), **conversation_metadata}
+                _record_pending_stats(pending_stats, event)
+                _record_baseline_event(baseline_windows, event)
 
                 flow_id = (
                     event.src_ip,
@@ -194,6 +429,7 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                 # GLOBAL MODE
                 if config.monitoring_mode in ["GLOBAL", "HYBRID"]:
                     iface_table = interface_flow_tables[event.interface]
+                    created_flow = flow_id not in iface_table
                     if flow_id not in iface_table:
                         iface_table[flow_id] = FlowAggregate(
                             flow_id=flow_id, start_time=event.timestamp, last_seen=event.timestamp
@@ -201,24 +437,110 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
 
                     flow = iface_table[flow_id]
                     flow.update(event.size, event.timestamp, event.flags, l7_info=event.l7_info, raw=event.raw)
+                    if created_flow:
+                        attribution = endpoint_attributor.attribute(
+                            src_ip=event.src_ip, src_port=event.src_port,
+                            dst_ip=event.dst_ip, dst_port=event.dst_port,
+                            protocol=event.protocol, observed_at=event.timestamp,
+                        )
+                        flow.l7_metadata["process_attribution"] = attribution
+                        # Existing consumers still show process_info; its source is now explicit.
+                        flow.l7_metadata["process_info"] = legacy_process_label(attribution)
+                    dirty_flow_ids[event.interface].add(flow_id)
+                    reverse_flow_id = (
+                        event.dst_ip, event.src_ip, event.dst_port, event.src_port, event.protocol,
+                    )
+                    reverse_flow = iface_table.get(reverse_flow_id)
+                    if reverse_flow is not None:
+                        reverse_direction = (
+                            "to_initiator" if conversation_metadata["conversation_direction"] == "to_responder"
+                            else "to_responder"
+                        )
+                        reverse_flow.l7_metadata.update({
+                            "conversation_direction": reverse_direction,
+                            "initiator_ip": conversation_metadata["initiator_ip"],
+                            "initiator_port": conversation_metadata["initiator_port"],
+                            "responder_ip": conversation_metadata["responder_ip"],
+                            "responder_port": conversation_metadata["responder_port"],
+                            "conversation_established": conversation_metadata["conversation_established"],
+                            "conversation_syn_count": conversation_metadata["conversation_syn_count"],
+                            "conversation_syn_ack_count": conversation_metadata["conversation_syn_ack_count"],
+                            "conversation_rst_count": conversation_metadata["conversation_rst_count"],
+                            "reverse_byte_count": (
+                                conversation_metadata["conversation_to_responder_bytes"]
+                                if reverse_direction == "to_initiator"
+                                else conversation_metadata["conversation_to_initiator_bytes"]
+                            ),
+                            "reverse_packet_count": (
+                                conversation_metadata["conversation_to_responder_packets"]
+                                if reverse_direction == "to_initiator"
+                                else conversation_metadata["conversation_to_initiator_packets"]
+                            ),
+                        })
+                        dirty_flow_ids[event.interface].add(reverse_flow_id)
                     
                     # Live forensic processing: extract identities and write to SQLite
                     if event.raw:
                         try:
                             from scapy.all import Ether as EtherParse
                             raw_packet = EtherParse(event.raw)
-                            identities, live_alerts = forensics.process_live_packet(raw_packet, flow)
+                            stream_alerts = []
+                            stream_snapshot = streams.update(raw_packet, event)
+                            if stream_snapshot is not None:
+                                stream_alerts = forensics.process_live_stream(
+                                    flow, stream_snapshot.payload, stream_snapshot.direction,
+                                    stream_snapshot.timestamp, capture_interface=event.interface,
+                                    capture_session_id=event.session_id,
+                                    capture_backend=event.backend,
+                                    truncated=stream_snapshot.truncated,
+                                )
+                            suppressed_types = {
+                                alert.type for alert in stream_alerts
+                                if alert.type in {"CLEARTEXT_CREDENTIALS", "CLEARTEXT_SECRET"}
+                            }
+                            identities, live_alerts = forensics.process_live_packet(
+                                raw_packet, flow, capture_interface=event.interface,
+                                capture_session_id=event.session_id,
+                                capture_backend=event.backend,
+                                persist_identity=False,
+                                suppressed_alert_types=suppressed_types,
+                            )
                             # Merge identities into flow metadata
                             if identities:
                                 flow.l7_metadata.update({k: v for k, v in identities.items() if v})
+                            if any(alert.type == "AUTHENTICATION_ABUSE" for alert in live_alerts):
+                                for alert in live_alerts:
+                                    if alert.type == "AUTHENTICATION_ABUSE":
+                                        forensics.note_live_behavior_signal(
+                                            str((alert.evidence or {}).get("source") or event.src_ip),
+                                            "auth_failure",
+                                            event.timestamp,
+                                        )
                         except Exception:
-                            pass
+                            _increment_metric(metrics, "detector_errors")
                     
                     # Enrich new flows
-                    if "process_info" not in flow.l7_metadata:
-                        flow.l7_metadata["process_info"] = get_process_info(event.src_port)
                     if "geoip" not in flow.l7_metadata:
                         flow.l7_metadata["geoip"] = get_geoip_info(event.dst_ip)
+
+                conversation_metadata_for_detection = dict(event.l7_info or {})
+                if config.monitoring_mode in ["GLOBAL", "HYBRID"]:
+                    conversation_metadata_for_detection.update(
+                        interface_flow_tables[event.interface][flow_id].l7_metadata
+                    )
+                conversation_delta = conversations.enrich_delta(
+                    conversation_delta, conversation_metadata_for_detection
+                )
+                forensics.process_live_conversation(
+                    conversation_delta,
+                    source=(capture_origin or {}).get("source") or (
+                        f"live_{event.interface}#{event.session_id[:12]}"
+                        if event.session_id else f"live_{event.interface}"
+                    ),
+                    capture_interface=event.interface,
+                    capture_session_id=event.session_id,
+                    capture_backend=event.backend,
+                )
 
                 # PER_DEVICE MODE
                 if config.monitoring_mode in ["PER_DEVICE", "HYBRID"]:
@@ -236,11 +558,50 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                     flow = table[flow_id]
                     flow.update(event.size, event.timestamp, event.flags)
 
+                _increment_metric(metrics, "processed_packets")
+
+            if consumed == 0 and metrics is not None:
+                if "queue_depth" in metrics:
+                    metrics["queue_depth"].value = 0
+                if "queue_lag_current_ms" in metrics:
+                    metrics["queue_lag_current_ms"].value = 0.0
+
+            if draining and consumed == 0:
+                try:
+                    flush_final_state()
+                    if metrics is not None and "pending_packets" in metrics:
+                        metrics["pending_packets"].value = 0
+                    logger.info("[worker] Queue drained and final state persisted (%s).", drain_reason)
+                    if acknowledgement_queue is not None:
+                        acknowledgement_queue.put({
+                            "stage": "worker",
+                            "persisted_generation": persisted_generation,
+                            "processed_packets": (
+                                int(metrics["processed_packets"].value)
+                                if metrics and "processed_packets" in metrics else 0
+                            ),
+                            "acknowledged_at": time.time(),
+                        })
+                except Exception as flush_e:
+                    _increment_metric(metrics, "detector_errors")
+                    logger.error(f"[worker] Final flush error: {flush_e}")
+                    raise
+                return
+
+            # Cleanup expired flows
+            session_id = (capture_origin or {}).get("session_id")
+            _flush_baseline_windows(
+                db, baseline_windows, current_time,
+                lambda iface: f"live_{iface}#{session_id[:12]}" if session_id else f"live_{iface}",
+            )
+
             # Cleanup expired flows
             for table in interface_flow_tables.values():
                 cleanup_expired_flows(table, current_time)
             for table in device_flow_tables.values():
                 cleanup_expired_flows(table, current_time)
+            conversations.expire(current_time - FLOW_TIMEOUT)
+            streams.expire(current_time - FLOW_TIMEOUT)
 
             # Enforce memory limits
             for table in interface_flow_tables.values():
@@ -260,45 +621,63 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                 
                 if config.monitoring_mode in ["GLOBAL", "HYBRID"]:
                     for iface, flow_table in interface_flow_tables.items():
+                        group_source = f"live_{iface}"
+                        session_id = (capture_origin or {}).get("session_id")
+                        record_source = f"{group_source}#{session_id[:12]}" if session_id else group_source
+                        changed_ids = set(dirty_flow_ids.get(iface) or ())
+                        changed_flows = {
+                            flow_id: flow_table[flow_id]
+                            for flow_id in changed_ids if flow_id in flow_table
+                        }
                         snapshot, tasks = build_snapshot(
                             flow_table, 
                             window_start, 
                             window_end, 
                             analytics_engine=analytics,
                             forensics_engine=forensics,
-                            behavioral_engine=behavioral
+                            behavioral_engine=behavioral, source=record_source,
+                            capture_interface=iface, capture_session_id=session_id,
+                            capture_backend=(capture_origin or {}).get("backend"),
+                            detection_flow_ids=changed_ids,
                         )
                         snapshot.interface = iface
                         analytics.update_baselines(snapshot)
-                        snapshot_queue.put(("GLOBAL", snapshot))
+                        try:
+                            snapshot_queue.put(("GLOBAL", snapshot), timeout=0.05)
+                        except queue_module.Full:
+                            _increment_metric(metrics, "snapshot_dropped")
                         
                         # Dispatch asynchronous evidence tasks
                         if evidence_queue:
                             for t in tasks:
-                                evidence_queue.put(t)
+                                try:
+                                    evidence_queue.put(t, timeout=0.05)
+                                except queue_module.Full:
+                                    _increment_metric(metrics, "evidence_dropped")
                                 
                         # Persist snapshot into SQLite via accumulator
-                        accumulator.merge(snapshot, flow_table=flow_table, source=f"live_{iface}")
+                        accumulator.merge(
+                            snapshot, flow_table=changed_flows, source=record_source,
+                            stats_source=group_source, capture_origin=capture_origin,
+                            stats_snapshot=_pending_stats_snapshot(
+                                pending_stats, iface, window_start, window_end, len(flow_table)
+                            ),
+                        )
+                        pending_stats.pop(iface, None)
                         
-                        # Populate Peer Matrix for new flows
-                        session = db._get_session()
-                        from core.storage.models import BehavioralBaseline
-                        for f in flow_table.values():
+                        # Populate the peer matrix through the storage repository.
+                        unseen_pairs = []
+                        for f in changed_flows.values():
                             if f.last_seen >= window_start:
+                                if f.l7_metadata.get("generated_by") == "WatchTower":
+                                    continue
                                 pair = (f.flow_id[0], f.flow_id[1])
                                 if pair not in behavioral._peer_cache:
-                                    # Double check DB and insert
-                                    exists = session.query(BehavioralBaseline).filter_by(
-                                        entity_ip=pair[0], pattern_key="comm_pair", pattern_data=pair[1]
-                                    ).first()
-                                    if not exists:
-                                        baseline = BehavioralBaseline(
-                                            entity_ip=pair[0], pattern_key="comm_pair", 
-                                            pattern_data=pair[1], last_updated=time.time()
-                                        )
-                                        session.add(baseline)
-                                        behavioral._peer_cache.add(pair)
-                        session.commit()
+                                    unseen_pairs.append(pair)
+                        if unseen_pairs:
+                            db.remember_behavioral_peers(unseen_pairs)
+                            behavioral._peer_cache.update(unseen_pairs)
+                        dirty_flow_ids[iface].clear()
 
                 if config.monitoring_mode in ["PER_DEVICE", "HYBRID"]:
                     for device_id, table in device_flow_tables.items():
@@ -309,13 +688,28 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                             analytics_engine=analytics,
                             forensics_engine=forensics
                         )
-                        snapshot_queue.put((f"DEVICE:{device_id}", snapshot))
+                        try:
+                            snapshot_queue.put((f"DEVICE:{device_id}", snapshot), timeout=0.05)
+                        except queue_module.Full:
+                            _increment_metric(metrics, "snapshot_dropped")
 
                 last_snapshot_time = current_time
 
             time.sleep(0.1)
     except Exception as e:
         import traceback
+        _increment_metric(metrics, "detector_errors")
         logger.critical(f"[worker] CRITICAL ERROR: {e}\n{traceback.format_exc()}")
         # Do not sys.exit here — let the daemon's process tracking detect the failure
         # and the daemon will log it without crashing itself
+    finally:
+        if worker_done_event is not None:
+            worker_done_event.set()
+        try:
+            accumulator.db.close()
+        except Exception:
+            pass
+        try:
+            db.close()
+        except Exception:
+            pass

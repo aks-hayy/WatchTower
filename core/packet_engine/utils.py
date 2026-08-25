@@ -76,6 +76,11 @@ def normalize_packet(packet):
     Shared by capture engine, forensic engine, and parser plugins.
     """
     import scapy.all as scapy
+    preserved = {
+        name: getattr(packet, name)
+        for name in ("time", "watchtower_origin")
+        if hasattr(packet, name)
+    }
     current = packet
     while True:
         if current.haslayer(scapy.Dot1Q):
@@ -88,4 +93,7 @@ def normalize_packet(packet):
                 current = current[scapy.IP].payload
             else:
                 break
+    if current is not packet:
+        for name, value in preserved.items():
+            setattr(current, name, value)
     return current

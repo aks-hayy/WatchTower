@@ -16,6 +16,24 @@ subnets:
 
 # Watchtower Threat Intelligence & Whitelists
 
+dedup_window_seconds: 300
+
+# Local policy. Populate these with organization-approved assets and ranges.
+allowlists:
+  ips: []
+  subnets: []
+  domains: []
+
+# Auditable alert suppressions. Rules may specify alert_type, entity_ip,
+# destination_ip, and a human-readable reason.
+suppressions: []
+
+# IOC collections. Feed synchronization can replace or extend these lists.
+iocs:
+  ips: []
+  domains: []
+  hashes: []
+
 # DNS Entropy Whitelist
 # These domains frequently trigger high entropy alerts but are known safe.
 dns_whitelist:

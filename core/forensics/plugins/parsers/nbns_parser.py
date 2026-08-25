@@ -5,6 +5,7 @@ from core.forensics.base import BaseParser
 
 class NBNSParser(BaseParser):
     name = "NBNS Parser"
+    watched_ports = (137,)
 
     def parse(self, packet, context: Dict[str, Any] = None) -> Dict[str, Any]:
         result = {}

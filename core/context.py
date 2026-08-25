@@ -2,6 +2,8 @@ import os
 import sys
 import ctypes
 
+from core.runtime_paths import RuntimePaths
+
 class WatchtowerContext:
     """
     Centralized singleton for environment configuration and absolute path resolution.
@@ -20,14 +22,14 @@ class WatchtowerContext:
         self.root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         
         # 2. Standardize Key Directories
-        self.data_dir = os.path.join(self.root_dir, "data")
-        self.logs_dir = os.path.join(self.data_dir, "logs")
-        self.temp_dir = os.path.join(self.data_dir, "temp")
-        
-        # 3. Create directories if missing (non-destructive)
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.logs_dir, exist_ok=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
+        self.runtime_paths = RuntimePaths.from_environment(repository_root=self.root_dir)
+        self.runtime_paths.ensure()
+        self.data_dir = str(self.runtime_paths.data)
+        self.config_dir = str(self.runtime_paths.config)
+        self.cache_dir = str(self.runtime_paths.cache)
+        self.logs_dir = str(self.runtime_paths.logs)
+        self.temp_dir = str(self.runtime_paths.temp)
+        self.legacy_data_source = self.runtime_paths.legacy_data_source
         
         # 4. Critical Files
         self.daemon_key_file = os.path.join(self.data_dir, "daemon.key")

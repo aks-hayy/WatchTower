@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 class SMBParser(BaseParser):
     name = "SMB Stateful Parser"
+    watched_ports = (445,)
 
     def __init__(self):
         super().__init__()
@@ -24,7 +25,7 @@ class SMBParser(BaseParser):
         # We also maintain the legacy string carving for NetBIOS
         if packet.haslayer(TCP) and (packet.sport == 445 or packet.dport == 445):
             try:
-                payload = bytes(packet[TCP].payload)
+                payload = self.application_payload(packet, context)
                 if not payload:
                     return result
                 

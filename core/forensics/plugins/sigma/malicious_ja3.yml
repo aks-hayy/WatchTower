@@ -1,5 +1,5 @@
 title: Malicious Trickbot JA3 Fingerprint
-id: trickbot-ja3-sample
+id: 8d4f40fb-f6f1-44be-8d03-81bda2bb8df0
 status: test
 description: Detects a known malicious TLS fingerprint associated with Trickbot malware.
 logsource:

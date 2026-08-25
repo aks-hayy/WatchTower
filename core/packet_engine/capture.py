@@ -2,13 +2,14 @@ import sys
 import os
 import multiprocessing
 import logging
+import queue as queue_module
 
 # Ensure local imports work when spawned in a new process on Windows
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from scapy.all import sniff, IP, TCP, UDP
+from scapy.all import sniff, ARP, IP, IPv6, TCP, UDP
 import time
 from core.packet_engine.schemas import PacketEvent
 import scapy.all as scapy
@@ -23,17 +24,26 @@ def packet_to_event(packet):
     # Automated Decapsulation (Peel the Onion)
     packet = normalize_packet(packet)
 
-    if scapy.IP not in packet:
+    if scapy.IP not in packet and scapy.IPv6 not in packet and scapy.ARP not in packet:
         return None
 
-    ip_layer = packet[IP]
+    if ARP in packet:
+        ip_layer = packet[ARP]
+        source_address = ip_layer.psrc
+        destination_address = ip_layer.pdst
+    else:
+        ip_layer = packet[IP] if IP in packet else packet[IPv6]
+        source_address = ip_layer.src
+        destination_address = ip_layer.dst
     protocol = "OTHER"
     src_port = 0
     dst_port = 0
     flags = ""
     l7_info = {}
 
-    if TCP in packet:
+    if ARP in packet:
+        protocol = "ARP"
+    elif TCP in packet:
         protocol = "TCP"
         src_port = packet[TCP].sport
         dst_port = packet[TCP].dport
@@ -54,8 +64,8 @@ def packet_to_event(packet):
 
     return PacketEvent(
         timestamp=float(packet.time),
-        src_ip=ip_layer.src,
-        dst_ip=ip_layer.dst,
+        src_ip=source_address,
+        dst_ip=destination_address,
         src_port=src_port,
         dst_port=dst_port,
         protocol=protocol,
@@ -66,7 +76,7 @@ def packet_to_event(packet):
     )
 
 
-def start_capture(interface, queue, silent=False, stop_event=None):
+def start_capture(interface, queue, silent=False, stop_event=None, origin=None, metrics=None):
     """Start sniffing packets on the specified interface and push events.
     
     Args:
@@ -86,10 +96,31 @@ def start_capture(interface, queue, silent=False, stop_event=None):
         sys.stderr = log_file
 
     def process_packet(packet):
+        if metrics is not None:
+            with metrics["received_packets"].get_lock():
+                metrics["received_packets"].value += 1
         event = packet_to_event(packet)
         if event:
             event.interface = str(interface)
-            queue.put(event)
+            if origin:
+                event.session_id = origin.get("session_id")
+                event.source_type = origin.get("source_type", "network")
+                event.backend = origin.get("backend", "python")
+                event.link_type = origin.get("link_type", "ethernet")
+                event.sensor_node_id = origin.get("sensor_node_id")
+                event.source = origin.get("source")
+            try:
+                queue.put(event, timeout=0.05)
+                if metrics is not None:
+                    with metrics["emitted_packets"].get_lock():
+                        metrics["emitted_packets"].value += 1
+                    metrics["last_packet_at"].value = event.timestamp
+            except queue_module.Full:
+                if metrics is not None:
+                    with metrics["dropped_packets"].get_lock():
+                        metrics["dropped_packets"].value += 1
+                    with metrics["queue_full_events"].get_lock():
+                        metrics["queue_full_events"].value += 1
 
     def should_stop(packet):
         """stop_filter for sniff() — returns True to stop sniffing."""
@@ -97,36 +128,32 @@ def start_capture(interface, queue, silent=False, stop_event=None):
             return True
         return False
 
-    # Resolve the actual iface value for scapy.sniff
-    iface_arg = interface
-    if interface == "auto":
-        from core.packet_engine.config import auto_detect_interface
-        iface_arg = auto_detect_interface()
-    else:
-        try:
-            # if interface is numeric, convert to name
-            idx = int(interface)
-            iface_arg = scapy.conf.ifaces.dev_from_index(idx)
-        except (ValueError, TypeError):
-            # On Windows, handle GUID without WinPcap prefix
-            if sys.platform == "win32" and isinstance(interface, str) and "{" in interface and "}" in interface:
-                if not interface.startswith("\\Device\\"):
-                    iface_arg = f"\\Device\\NPF_{interface}"
-                else:
-                    iface_arg = interface
-            else:
-                iface_arg = interface
+    # Resolve friendly names to Scapy's concrete adapter object. On Windows this
+    # ensures "Wi-Fi" reaches the matching Npcap device rather than relying on
+    # backend-specific string matching.
+    from core.capture_sources.network import NetworkInterfaceSource
 
-    print(f"[capture] sniffing on {iface_arg}")
+    try:
+        iface_arg = NetworkInterfaceSource.resolve_interface(interface)
+    except ValueError as exc:
+        print(f"[capture] interface resolution failed: {exc}")
+        sys.exit(1)
+
+    capture_name = getattr(iface_arg, "network_name", None) or str(iface_arg)
+    print(f"[capture] sniffing on {capture_name}")
     try:
         # Use stop_filter for clean shutdown — polled every packet
-        sniff(
-            iface=iface_arg,
-            prn=process_packet,
-            store=False,
-            promisc=True,
-            stop_filter=should_stop if stop_event is not None else None
-        )
+        while stop_event is None or not stop_event.is_set():
+            sniff(
+                iface=iface_arg,
+                prn=process_packet,
+                store=False,
+                promisc=True,
+                timeout=1.0 if stop_event is not None else None,
+                stop_filter=should_stop if stop_event is not None else None,
+            )
+            if stop_event is None:
+                break
     except Exception as e:
         print(f"[capture] sniff failed on {iface_arg}: {e}")
         sys.exit(1)

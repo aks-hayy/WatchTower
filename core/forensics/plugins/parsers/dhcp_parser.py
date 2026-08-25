@@ -4,6 +4,7 @@ from core.forensics.base import BaseParser
 
 class DHCPParser(BaseParser):
     name = "DHCP Parser"
+    watched_ports = (67, 68)
 
     def parse(self, packet, context: Dict[str, Any] = None) -> Dict[str, Any]:
         result = {}

@@ -10,7 +10,7 @@ class HTTPParser(BaseParser):
         result = {}
         if TCP in packet and packet[TCP].payload:
             try:
-                payload = bytes(packet[TCP].payload).decode('utf-8', errors='ignore')
+                payload = self.application_payload(packet, context).decode('utf-8', errors='ignore')
                 if "Host: " in payload:
                     for line in payload.split("\r\n"):
                         if line.startswith("Host: "):

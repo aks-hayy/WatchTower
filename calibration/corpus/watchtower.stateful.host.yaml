@@ -1,0 +1,391 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.stateful.host
+  input_kind: session
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: stateful.vertical.positive
+    finding_type: recon.port_scan
+    label: positive
+    variant: positive
+    recipe: &stateful_vertical
+      flows:
+        - repeat: 20
+          src: 10.250.60.10
+          dst: 10.250.60.20
+          sport: 58000
+          dport: "{n}"
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 0
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: false
+  - id: stateful.vertical.positive.matrix
+    finding_type: recon.port_scan
+    label: positive
+    variants: [malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: Representative positive production replay is covered above.
+    recipe: *stateful_vertical
+  - id: stateful.vertical.benign.integrated
+    finding_type: recon.port_scan
+    label: benign
+    variant: benign
+    recipe:
+      <<: *stateful_vertical
+      flows:
+        - repeat: 19
+          src: 10.250.60.10
+          dst: 10.250.60.20
+          sport: 58000
+          dport: "{n}"
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+  - id: stateful.vertical.benign.bulk
+    finding_type: recon.port_scan
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *stateful_vertical
+      flows:
+        - repeat: 19
+          src: 10.250.60.10
+          dst: 10.250.60.20
+          sport: 58000
+          dport: "{n}"
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+
+  - id: stateful.horizontal.positive
+    finding_type: recon.host_scan
+    label: positive
+    variant: positive
+    recipe: &stateful_horizontal
+      flows:
+        - repeat: 20
+          src: 10.250.61.10
+          dst: "10.250.61.{n}"
+          sport: 58100
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 0
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: false
+  - id: stateful.horizontal.positive.matrix
+    finding_type: recon.host_scan
+    label: positive
+    variants: [malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: Representative positive production replay is covered above.
+    recipe: *stateful_horizontal
+  - id: stateful.horizontal.benign.integrated
+    finding_type: recon.host_scan
+    label: benign
+    variant: benign
+    recipe:
+      <<: *stateful_horizontal
+      flows:
+        - repeat: 19
+          src: 10.250.61.10
+          dst: "10.250.61.{n}"
+          sport: 58100
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+  - id: stateful.horizontal.benign.bulk
+    finding_type: recon.host_scan
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *stateful_horizontal
+      flows:
+        - repeat: 19
+          src: 10.250.61.10
+          dst: "10.250.61.{n}"
+          sport: 58100
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+
+  - id: stateful.synflood.positive
+    finding_type: recon.syn_flood
+    input_kind: flow
+    label: positive
+    variant: positive
+    recipe: &stateful_syn_flood
+      src: 10.250.62.10
+      dst: 10.250.62.20
+      sport: 58200
+      dport: 443
+      protocol: TCP
+      tcp_syn_count: 4000
+      tcp_syn_ack_count: 0
+      start_time: 1
+      last_seen: 5
+      l7_metadata:
+        conversation_syn_count: 4000
+        conversation_syn_ack_count: 0
+  - id: stateful.synflood.positive.matrix
+    finding_type: recon.syn_flood
+    input_kind: flow
+    label: positive
+    variants: [malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: Representative positive production replay is covered above.
+    recipe: *stateful_syn_flood
+  - id: stateful.synflood.benign.integrated
+    finding_type: recon.syn_flood
+    input_kind: flow
+    label: benign
+    variant: benign
+    recipe:
+      <<: *stateful_syn_flood
+      tcp_syn_count: 100
+      tcp_syn_ack_count: 90
+      l7_metadata:
+        conversation_syn_count: 100
+        conversation_syn_ack_count: 90
+  - id: stateful.synflood.benign.bulk
+    finding_type: recon.syn_flood
+    input_kind: flow
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *stateful_syn_flood
+      tcp_syn_count: 100
+      tcp_syn_ack_count: 90
+      l7_metadata:
+        conversation_syn_count: 100
+        conversation_syn_ack_count: 90
+
+  - id: stateful.lateral.positive
+    finding_type: lateral.admin_fanout
+    label: positive
+    variant: positive
+    recipe: &stateful_lateral
+      flows:
+        - repeat: 5
+          src: 10.250.63.10
+          dst: "10.250.63.{n}"
+          sport: 58300
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 0
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: false
+            peer_novelty: true
+            auth_failure: true
+  - id: stateful.lateral.positive.matrix
+    finding_type: lateral.admin_fanout
+    label: positive
+    variants: [malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: Representative positive production replay is covered above.
+    recipe: *stateful_lateral
+  - id: stateful.lateral.benign.integrated
+    finding_type: lateral.admin_fanout
+    label: benign
+    variant: benign
+    recipe:
+      <<: *stateful_lateral
+      flows:
+        - repeat: 4
+          src: 10.250.63.10
+          dst: "10.250.63.{n}"
+          sport: 58300
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+            peer_novelty: false
+            auth_failure: false
+  - id: stateful.lateral.benign.bulk
+    finding_type: lateral.admin_fanout
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *stateful_lateral
+      flows:
+        - repeat: 4
+          src: 10.250.63.10
+          dst: "10.250.63.{n}"
+          sport: 58300
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+            peer_novelty: false
+            auth_failure: false
+
+  - id: stateful.exfil.positive
+    finding_type: exfil.volume_anomaly
+    input_kind: flow
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: The representative byte-accurate integrated transfer is replayed once below.
+    recipe: &stateful_exfil
+      src: 10.250.64.10
+      dst: 8.8.8.8
+      sport: 58400
+      dport: 443
+      protocol: TCP
+      packet_count: 2000
+      byte_count: 157286400
+      start_time: 1
+      last_seen: 301
+      l7_metadata:
+        reverse_byte_count: 10485760
+        outbound_bytes_p99: 20971520
+        peer_novelty: true
+        protocol_corroboration: true
+  - id: stateful.exfil.positive.integrated
+    finding_type: exfil.volume_anomaly
+    input_kind: flow
+    label: positive
+    variant: integrated
+    modes: [integrated]
+    recipe:
+      <<: *stateful_exfil
+  - id: stateful.exfil.benign.integrated
+    finding_type: exfil.volume_anomaly
+    input_kind: flow
+    label: benign
+    variant: benign
+    recipe:
+      <<: *stateful_exfil
+      byte_count: 52428800
+      l7_metadata:
+        reverse_byte_count: 52428800
+        outbound_bytes_p99: 20971520
+        peer_novelty: false
+        protocol_corroboration: false
+  - id: stateful.exfil.benign.bulk
+    finding_type: exfil.volume_anomaly
+    input_kind: flow
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *stateful_exfil
+      byte_count: 52428800
+      l7_metadata:
+        reverse_byte_count: 52428800
+        outbound_bytes_p99: 20971520
+        peer_novelty: false
+        protocol_corroboration: false
+
+  - id: stateful.beacon.positive
+    finding_type: behavior.beacon.suspected
+    input_kind: packet
+    label: positive
+    variant: positive
+    modes: [integrated]
+    recipe: &stateful_beacon
+      packets:
+        - repeat: 20
+          interval: 10
+          src: 10.250.65.10
+          dst: 10.250.65.20
+          sport: 58500
+          dport: 4444
+          transport: udp
+          payload_text: "bounded-beacon-marker"
+  - id: stateful.beacon.positive.matrix
+    finding_type: behavior.beacon.suspected
+    input_kind: packet
+    label: positive
+    variants: [malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    modes: [isolation]
+    unsupported:
+      integrated: Representative positive production replay is covered above.
+    recipe: *stateful_beacon
+  - id: stateful.beacon.benign.integrated
+    finding_type: behavior.beacon.suspected
+    input_kind: packet
+    label: benign
+    variant: benign
+    modes: [integrated]
+    recipe: &stateful_beacon_benign
+      <<: *stateful_beacon
+      packets:
+        - repeat: 20
+          interval: 10
+          src: 10.250.65.10
+          dst: 224.0.0.251
+          sport: 5353
+          dport: 5353
+          transport: udp
+          payload_text: "local-discovery"
+  - id: stateful.beacon.benign.bulk
+    finding_type: behavior.beacon.suspected
+    input_kind: packet
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Representative multicast discovery replay is covered above.
+    recipe: *stateful_beacon_benign

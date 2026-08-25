@@ -1,0 +1,74 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.iot-ot.safety
+  input_kind: packet
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: iot.modbus.positive
+    finding_type: ot.modbus.unauthorized_write
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &modbus_write
+      detector_config:
+        policy:
+          enabled: true
+          authorized_masters: [10.250.70.10]
+          authorized_units: [1]
+          authorized_write_functions: [6]
+      src: 10.250.70.99
+      dst: 10.250.70.20
+      sport: 55000
+      dport: 502
+      transport: tcp
+      payload_hex: "000100000006010600010002"
+  - id: iot.modbus.benign.integrated
+    finding_type: ot.modbus.unauthorized_write
+    label: benign
+    variant: benign
+    recipe: &modbus_benign
+      <<: *modbus_write
+      detector_config:
+        policy:
+          enabled: true
+          authorized_masters: [192.168.70.10]
+          authorized_units: [1]
+          authorized_write_functions: [6]
+      src: 192.168.70.10
+  - id: iot.modbus.benign.bulk
+    finding_type: ot.modbus.unauthorized_write
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative authorized Modbus production case.
+    recipe: *modbus_benign
+  - id: iot.mqtt.positive
+    finding_type: credential.cleartext.mqtt
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &mqtt_creds
+      src: 10.250.71.10
+      dst: 10.250.71.20
+      sport: 55100
+      dport: 1883
+      transport: tcp
+      payload_hex: "100c00044d51545404c0003c"
+  - id: iot.mqtt.benign.integrated
+    finding_type: credential.cleartext.mqtt
+    label: benign
+    variant: benign
+    recipe: &mqtt_benign
+      <<: *mqtt_creds
+      payload_hex: "100c00044d5154540400003c"
+  - id: iot.mqtt.benign.bulk
+    finding_type: credential.cleartext.mqtt
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative credential-free MQTT production case.
+    recipe: *mqtt_benign

@@ -1,0 +1,168 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.lan.trust
+  input_kind: packet
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: lan.arp.positive
+    finding_type: network.arp.binding_conflict
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &arp_conflict
+      packets:
+        - network: arp
+          op: 2
+          src: 10.250.20.1
+          dst: 10.250.20.10
+          src_mac: "02:00:00:00:20:01"
+        - repeat: 3
+          network: arp
+          op: 2
+          src: 10.250.20.1
+          dst: 10.250.20.10
+          src_mac: "02:00:00:00:20:99"
+  - id: lan.arp.benign.integrated
+    finding_type: network.arp.binding_conflict
+    label: benign
+    variant: benign
+    recipe: &arp_benign
+      packets:
+        - network: arp
+          op: 2
+          src: 10.250.20.2
+          dst: 10.250.20.10
+          src_mac: "02:00:00:00:20:02"
+  - id: lan.arp.benign.bulk
+    finding_type: network.arp.binding_conflict
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative benign ARP production case.
+    recipe: *arp_benign
+  - id: lan.ndp.positive
+    finding_type: network.ndp.binding_conflict
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe:
+      packets:
+        - network: ipv6
+          transport: none
+          src: fd00::20:1
+          dst: ff02::1
+          target: fd00::20:1
+          src_mac: "02:00:00:00:21:01"
+          icmpv6_nd_na: true
+        - repeat: 3
+          network: ipv6
+          transport: none
+          src: fd00::20:1
+          dst: ff02::1
+          target: fd00::20:1
+          src_mac: "02:00:00:00:21:99"
+          icmpv6_nd_na: true
+  - id: lan.ndp.benign.integrated
+    finding_type: network.ndp.binding_conflict
+    label: benign
+    variant: benign
+    recipe: &ndp_benign
+      packets:
+        - network: ipv6
+          transport: none
+          src: fd00::20:2
+          dst: ff02::1
+          target: fd00::20:2
+          src_mac: "02:00:00:00:21:02"
+          icmpv6_nd_na: true
+  - id: lan.ndp.benign.bulk
+    finding_type: network.ndp.binding_conflict
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative benign NDP production case.
+    recipe: *ndp_benign
+  - id: lan.dhcp.positive
+    finding_type: network.dhcp.untrusted_server
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &rogue_dhcp
+      detector_config:
+        trusted_dhcp_servers: [10.250.30.1]
+      packets:
+        - src: 10.250.30.99
+          dst: 255.255.255.255
+          transport: udp
+          sport: 67
+          dport: 68
+          dhcp:
+            message_type: offer
+            server_id: 10.250.30.99
+            yiaddr: 10.250.30.50
+  - id: lan.dhcp.benign.integrated
+    finding_type: network.dhcp.untrusted_server
+    label: benign
+    variant: benign
+    recipe: &dhcp_benign
+      <<: *rogue_dhcp
+      detector_config:
+        trusted_dhcp_servers: [10.250.30.1]
+      packets:
+        - src: 10.250.30.1
+          dst: 255.255.255.255
+          transport: udp
+          sport: 67
+          dport: 68
+          dhcp:
+            message_type: offer
+            server_id: 10.250.30.1
+            yiaddr: 10.250.30.51
+  - id: lan.dhcp.benign.bulk
+    finding_type: network.dhcp.untrusted_server
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative benign DHCP production case.
+    recipe: *dhcp_benign
+  - id: lan.ra.positive
+    finding_type: network.ipv6.untrusted_router
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &rogue_ra
+      detector_config:
+        trusted_ipv6_routers: [fd00::30:1]
+      packets:
+        - network: ipv6
+          transport: none
+          src: fd00::30:99
+          dst: ff02::1
+          icmpv6_ra: true
+  - id: lan.ra.benign.integrated
+    finding_type: network.ipv6.untrusted_router
+    label: benign
+    variant: benign
+    recipe: &ra_benign
+      <<: *rogue_ra
+      detector_config:
+        trusted_ipv6_routers: [fd00::30:1]
+      packets:
+        - network: ipv6
+          transport: none
+          src: fd00::30:1
+          dst: ff02::1
+          icmpv6_ra: true
+  - id: lan.ra.benign.bulk
+    finding_type: network.ipv6.untrusted_router
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Covered by the representative benign IPv6 RA production case.
+    recipe: *ra_benign

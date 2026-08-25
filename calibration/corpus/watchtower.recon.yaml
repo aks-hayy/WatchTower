@@ -1,0 +1,114 @@
+schema_version: 1
+defaults:
+  detector_id: watchtower.recon
+  input_kind: session
+  modes: [isolation]
+  backends: [python]
+  unsupported:
+    integrated: Recon calibration uses deterministic conversation-flow fixtures; replay parity is covered by stateful pipeline tests.
+cases:
+  - id: recon.portscan.positive
+    finding_type: recon.port_scan
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &vertical_scan
+      flows:
+        - repeat: 20
+          src: 10.250.50.10
+          dst: 10.250.50.20
+          sport: 57000
+          dport: "{n}"
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 0
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: false
+  - id: recon.portscan.benign.bulk
+    finding_type: recon.port_scan
+    repeat: 30
+    label: benign
+    variant: benign
+    recipe:
+      <<: *vertical_scan
+      flows:
+        - repeat: 19
+          src: 10.250.50.10
+          dst: 10.250.50.20
+          sport: 57000
+          dport: "{n}"
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            conversation_established: true
+
+  - id: recon.synflood.positive
+    finding_type: recon.syn_flood
+    input_kind: flow
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &syn_flood
+      src: 10.250.51.10
+      dst: 10.250.51.20
+      sport: 57100
+      dport: 443
+      protocol: TCP
+      tcp_syn_count: 4000
+      tcp_syn_ack_count: 0
+      start_time: 1
+      last_seen: 5
+  - id: recon.synflood.benign.bulk
+    finding_type: recon.syn_flood
+    input_kind: flow
+    repeat: 30
+    label: benign
+    variant: benign
+    recipe:
+      <<: *syn_flood
+      tcp_syn_count: 100
+      tcp_syn_ack_count: 90
+
+  - id: recon.lateral.positive
+    finding_type: lateral.admin_fanout
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &lateral_fanout
+      flows:
+        - repeat: 5
+          src: 10.250.52.10
+          dst: "10.250.52.{n}"
+          sport: 57200
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 0
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            peer_novelty: true
+            conversation_established: false
+  - id: recon.lateral.benign.bulk
+    finding_type: lateral.admin_fanout
+    repeat: 30
+    label: benign
+    variant: benign
+    recipe:
+      <<: *lateral_fanout
+      flows:
+        - repeat: 4
+          src: 10.250.52.10
+          dst: "10.250.52.{n}"
+          sport: 57200
+          dport: 445
+          protocol: TCP
+          tcp_syn_count: 1
+          tcp_syn_ack_count: 1
+          start_time: "{n}"
+          last_seen: "{n}"
+          l7_metadata:
+            peer_novelty: false
+            conversation_established: true

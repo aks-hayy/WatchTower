@@ -1,0 +1,239 @@
+schema_version: 1
+matrix_seeds: 10
+defaults:
+  detector_id: watchtower.application.abuse
+  modes: [isolation, integrated]
+  backends: [python, rust]
+cases:
+  - id: app.secret.positive
+    finding_type: credential.cleartext.generic
+    input_kind: stream
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &app_secret
+      src: 10.250.40.10
+      dst: 10.250.40.20
+      sport: 56000
+      dport: 8080
+      direction: to_server
+      parts: ["POST /login HTTP/1.1\r\n\r\nusername=analyst&password=WT_APP_SECRET"]
+      secret_values: [WT_APP_SECRET]
+  - id: app.secret.benign.integrated
+    finding_type: credential.cleartext.generic
+    input_kind: stream
+    label: benign
+    variant: benign
+    recipe:
+      <<: *app_secret
+      parts: ["POST /status HTTP/1.1\r\n\r\nstate=ok"]
+  - id: app.secret.benign.bulk
+    finding_type: credential.cleartext.generic
+    input_kind: stream
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *app_secret
+      parts: ["POST /status HTTP/1.1\r\n\r\nstate=ok"]
+
+  - id: app.auth.positive
+    finding_type: auth.failure_burst
+    input_kind: packet
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &auth_failures
+      packets:
+        - repeat: 5
+          interval: 1
+          src: 10.250.41.20
+          dst: 10.250.41.10
+          sport: 22
+          dport: 56010
+          transport: tcp
+          payload_text: "authentication failed"
+  - id: app.auth.benign.integrated
+    finding_type: auth.failure_burst
+    input_kind: packet
+    label: benign
+    variant: benign
+    recipe:
+      <<: *auth_failures
+      packets:
+        - repeat: 4
+          interval: 1
+          src: 10.250.41.20
+          dst: 10.250.41.10
+          sport: 22
+          dport: 56010
+          transport: tcp
+          payload_text: "authentication failed"
+  - id: app.auth.benign.bulk
+    finding_type: auth.failure_burst
+    input_kind: packet
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *auth_failures
+      packets:
+        - repeat: 4
+          interval: 1
+          src: 10.250.41.20
+          dst: 10.250.41.10
+          sport: 22
+          dport: 56010
+          transport: tcp
+          payload_text: "authentication failed"
+
+  - id: app.icmp.positive
+    finding_type: icmp.tunnel.suspected
+    input_kind: packet
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &icmp_tunnel
+      packets:
+        - repeat: 10
+          interval: 1
+          src: 10.250.42.10
+          dst: 10.250.42.20
+          transport: icmp
+          payload_deterministic_bytes: 8192
+          payload_seed: 31
+  - id: app.icmp.benign.integrated
+    finding_type: icmp.tunnel.suspected
+    input_kind: packet
+    label: benign
+    variant: benign
+    recipe:
+      <<: *icmp_tunnel
+      packets:
+        - repeat: 9
+          interval: 1
+          src: 10.250.42.10
+          dst: 10.250.42.20
+          transport: icmp
+          payload_text: "normal ping"
+  - id: app.icmp.benign.bulk
+    finding_type: icmp.tunnel.suspected
+    input_kind: packet
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *icmp_tunnel
+      packets:
+        - repeat: 9
+          interval: 1
+          src: 10.250.42.10
+          dst: 10.250.42.20
+          transport: icmp
+          payload_text: "normal ping"
+
+  - id: app.tls.positive
+    finding_type: tls.protocol_mismatch
+    input_kind: packet
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &tls_mismatch
+      packets:
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: S
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: PA
+          payload_text: "GET / HTTP/1.1\r\n\r\n"
+  - id: app.tls.benign.integrated
+    finding_type: tls.protocol_mismatch
+    input_kind: packet
+    label: benign
+    variant: benign
+    recipe:
+      <<: *tls_mismatch
+      packets:
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: S
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: PA
+          payload_hex: "160301002e"
+  - id: app.tls.benign.bulk
+    finding_type: tls.protocol_mismatch
+    input_kind: packet
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *tls_mismatch
+      packets:
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: S
+        - src: 10.250.43.10
+          dst: 10.250.43.20
+          sport: 56020
+          dport: 443
+          transport: tcp
+          flags: PA
+          payload_hex: "160301002e"
+
+  - id: app.protocol.positive
+    finding_type: protocol.nonstandard_service
+    input_kind: packet
+    label: positive
+    variants: [positive, malformed, truncated, fragmented, retransmitted, reordered, directional, reset, memory_bound, positive_extra]
+    recipe: &ssh_nonstandard
+      src: 10.250.44.10
+      dst: 10.250.44.20
+      sport: 56030
+      dport: 2222
+      transport: tcp
+      payload_text: "SSH-2.0-OpenSSH_9.0\r\n"
+  - id: app.protocol.benign.integrated
+    finding_type: protocol.nonstandard_service
+    input_kind: packet
+    label: benign
+    variant: benign
+    recipe:
+      <<: *ssh_nonstandard
+      dport: 22
+  - id: app.protocol.benign.bulk
+    finding_type: protocol.nonstandard_service
+    input_kind: packet
+    repeat: 29
+    label: benign
+    variant: benign
+    modes: [isolation]
+    unsupported:
+      integrated: Bulk benign repetitions use the representative integrated case above.
+    recipe:
+      <<: *ssh_nonstandard
+      dport: 22
