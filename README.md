@@ -4,6 +4,10 @@ WatchTower is a local-first network detection and forensic investigation platfor
 
 WatchTower is intended for networks and captures you own or are authorized to investigate. The V2 rewrite is currently published as release candidate software; the older V1 product remains on the `v1-maintenance` branch.
 
+## Project status
+
+WatchTower is an experimental first attempt and a research project. It is being built to explore practical network detection, forensics, identity resolution, sensor mesh, and analyst workflows in one open-source platform. Expect rough edges, incomplete coverage, and mistakes as the project evolves. Please forgive the gaps, and constructive feedback and contributions are very welcome.
+
 ## What ships
 
 - Rust-first live capture and offline replay, with Python available as a secondary backend.
