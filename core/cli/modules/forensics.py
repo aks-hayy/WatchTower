@@ -885,7 +885,7 @@ class ForensicsModule:
         active_scope = "interfaces" in self.options
         interfaces = self.options.get("interfaces") if active_scope else None
         if interface:
-            stats = self.acc.get_today(source=f"live_{interface}")
+            stats = self.db.get_window_stats(source="live", interface=interface, window_seconds=86400)
         elif active_scope:
             interfaces = sorted({str(name) for name in (interfaces or []) if name})
             if interfaces:
@@ -907,13 +907,10 @@ class ForensicsModule:
                     "total_bytes": sum(item.get("total_bytes", 0) for item in interface_stats),
                 }
         else:
+            # Mesh-prefixed live sources do not create legacy DailyStats rows;
+            # use the same authoritative flow aggregation as the API/UI.
+            stats = self.acc.get_today(source="live")
             interfaces = self.db.get_today_live_interfaces()
-            interface_stats = [self.acc.get_today(source=f"live_{name}") for name in interfaces]
-            stats = {
-                "total_flows": sum(item.get("total_flows", 0) for item in interface_stats),
-                "total_packets": sum(item.get("total_packets", 0) for item in interface_stats),
-                "total_bytes": sum(item.get("total_bytes", 0) for item in interface_stats),
-            }
         table = Table(title=f"Live Stats{f' ({interface})' if interface else ''}")
         table.add_column("Metric")
         table.add_column("Value")

@@ -36,6 +36,11 @@ def _http_ready(url: str, contains: str = "") -> bool:
         return False
 
 
+def _managed_ui_ready(port: int) -> bool:
+    """Recognize the controller/UI started by the hybrid runtime."""
+    return _http_ready(f"http://127.0.0.1:{int(port)}/api/v1/health", '"status"')
+
+
 def _wait_for_http(url: str, process, log_path: Path, contains: str = "", timeout: float = 20.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -50,6 +55,17 @@ def _wait_for_http(url: str, process, log_path: Path, contains: str = "", timeou
 
 
 def launch_ui(console, port: int = 4173, api_port: int = 8000, open_browser: bool = True) -> None:
+    # ``tower > ui`` is often used after ``watchtower.ps1 start``. In that
+    # case the managed controller already owns 4173 and there is no reason to
+    # create a second standalone API on 8000.
+    if port != api_port and _managed_ui_ready(port):
+        url = f"http://127.0.0.1:{port}"
+        console.print(f"[bold cyan]WatchTower UI[/bold cyan]  {url}")
+        console.print("[dim]Managed controller is already running; reusing it.[/dim]")
+        if open_browser:
+            webbrowser.open(url)
+        return
+
     ui_dir = Path(context.root_dir) / "ui"
     vite = ui_dir / "node_modules" / ".bin" / ("vite.cmd" if sys.platform == "win32" else "vite")
     production_server = ui_dir / ".output" / "server" / "index.mjs"

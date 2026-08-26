@@ -8,6 +8,8 @@ import {
   setupAuth,
   unlockWithPasskey,
   unlockWithPin,
+  normalizePin,
+  normalizeRecoveryCode,
   type AuthStatus,
 } from "@/lib/auth";
 
@@ -125,10 +127,14 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
             {error && <AuthErrorText text={error} />}
             <div className="flex flex-wrap gap-2">
               <button
-                disabled={busy || pin.length < 6 || pin !== confirmPin}
+                disabled={
+                  busy ||
+                  normalizePin(pin).length < 6 ||
+                  normalizePin(pin) !== normalizePin(confirmPin)
+                }
                 onClick={() =>
                   run(async () => {
-                    const result = await setupAuth(pin, name);
+                    const result = await setupAuth(normalizePin(pin), name);
                     setRecoveryCode(result.recovery_code);
                   })
                 }
@@ -177,15 +183,17 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
               value={pin}
               onChange={(event) => setPin(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && pin.length >= 6) void run(() => unlockWithPin(pin));
+                if (event.key === "Enter" && normalizePin(pin).length >= 6) {
+                  void run(() => unlockWithPin(normalizePin(pin)));
+                }
               }}
               placeholder="Operator PIN"
               className="h-10 min-w-0 flex-1 border border-border bg-background px-3 mono text-[12px] text-foreground focus:border-signal focus:outline-none"
             />
             <button
               title="Unlock with PIN"
-              onClick={() => run(() => unlockWithPin(pin))}
-              disabled={busy || pin.length < 6}
+              onClick={() => run(() => unlockWithPin(normalizePin(pin)))}
+              disabled={busy || normalizePin(pin).length < 6}
               className="grid h-10 w-10 place-items-center border border-l-0 border-signal text-signal hover:bg-signal hover:text-primary-foreground disabled:opacity-35"
             >
               {busy ? (
@@ -206,7 +214,11 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
               <Field label="Recovery code" value={recoveryInput} onChange={setRecoveryInput} />
               <Field label="New PIN" value={confirmPin} onChange={setConfirmPin} secret />
               <button
-                disabled={busy || recoveryInput.length < 12 || confirmPin.length < 6}
+                disabled={
+                  busy ||
+                  normalizeRecoveryCode(recoveryInput).length < 12 ||
+                  normalizePin(confirmPin).length < 6
+                }
                 onClick={() =>
                   run(async () => {
                     const result = await recoverAuth(recoveryInput, confirmPin);

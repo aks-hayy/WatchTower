@@ -92,6 +92,7 @@ class MeshAgent:
         self.key_path.write_bytes(private_key)
         self.cert_path.write_text(str(result["client_certificate_pem"]), encoding="utf-8")
         self.ca_path.write_text(str(result["ca_certificate_pem"]), encoding="utf-8")
+        controller_ca_fingerprint = certificate_fingerprint(root)
         for path in (self.key_path, self.cert_path, self.ca_path):
             try:
                 path.chmod(0o600)
@@ -99,6 +100,7 @@ class MeshAgent:
                 pass
         config = {
             "node_id": node_id, "name": name or platform.node() or node_id, "controller": controller,
+            "controller_ca_fingerprint": controller_ca_fingerprint,
             "enrollment_port": int(enrollment_port), "ingest_port": int(ingest_port), "next_sequence": 1,
             "flow_after_id": 0, "observation_after": 0.0, "session_after": 0.0,
             "alert_after_id": 0, "finding_after_id": 0, "hardware_after_id": 0,
@@ -108,7 +110,7 @@ class MeshAgent:
             "node_id": node_id,
             "controller": controller,
             "certificate_fingerprint": result["node"]["certificate_fingerprint"],
-            "controller_ca_fingerprint": certificate_fingerprint(root),
+            "controller_ca_fingerprint": controller_ca_fingerprint,
         }
 
     def leave(self, reason: str = "Operator removed this sensor", force: bool = False) -> Dict[str, Any]:
@@ -195,6 +197,7 @@ class MeshAgent:
             config.get("flow_after_id", 0), config.get("observation_after", 0.0), config.get("session_after", 0.0), limit,
             alert_after_id=config.get("alert_after_id", 0), finding_after_id=config.get("finding_after_id", 0),
             hardware_after_id=config.get("hardware_after_id", 0),
+            sensor_node_id=str(config.get("node_id") or ""),
         )
         queued = []
         health = {
@@ -204,7 +207,10 @@ class MeshAgent:
         queued.append(self.queue("health", {"health": health, "capabilities": health["capabilities"]}, priority=10))
         if exported["sessions"]:
             queued.append(self.queue("sessions", {"items": exported["sessions"]}, priority=20))
-            config["session_after"] = max(float(item["started_at"]) for item in exported["sessions"])
+            config["session_after"] = max(
+                max(float(item.get("started_at") or 0.0), float(item.get("ended_at") or 0.0))
+                for item in exported["sessions"]
+            )
         if exported["flows"]:
             queued.append(self.queue("flows", {"items": exported["flows"]}, priority=0))
             config["flow_after_id"] = max(int(item["id"]) for item in exported["flows"])

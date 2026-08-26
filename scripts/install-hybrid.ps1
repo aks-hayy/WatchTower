@@ -29,7 +29,8 @@ function Resolve-DockerDesktop {
     $candidates = @(
         (Join-Path ${env:ProgramFiles} "Docker\Docker\resources\bin\docker.exe"),
         (Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\resources\bin\docker.exe"),
-        (Join-Path $env:LOCALAPPDATA "Docker\Docker\resources\bin\docker.exe")
+        (Join-Path $env:LOCALAPPDATA "Docker\Docker\resources\bin\docker.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\resources\bin\docker.exe")
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
     if ($candidates) {
         $env:Path = "$(Split-Path -Parent $candidates[0]);$env:Path"
@@ -54,6 +55,17 @@ function Require-DockerDesktop {
     if ($LASTEXITCODE -ne 0) {
         throw "Docker Desktop is installed but not ready. Start Docker Desktop and rerun this command."
     }
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & docker info --format "{{.ServerVersion}}" 2>$null | Out-Null
+        $engineReady = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if (-not $engineReady) {
+        throw "Docker Desktop is installed but its Linux engine is not running. Start Docker Desktop, wait until it reports 'Engine running', then rerun this command. Verify with: docker info"
+    }
 }
 
 function Invoke-NativeSetup {
@@ -64,12 +76,14 @@ function Invoke-NativeSetup {
     $previousHome = $env:WATCHTOWER_HOME
     $env:WATCHTOWER_HOME = $SensorHome
     try {
-        $arguments = @("-SkipUI", "-DisableAuth")
-        if ($InstallPrerequisites) { $arguments += "-InstallPrerequisites" }
-        if ($WithSysmon) { $arguments += "-WithSysmon" }
-        if ($WithNeo4j) { $arguments += "-WithNeo4j" }
-        if ($DisableAuth) { $arguments += "-DisableAuth" }
-        if ($SysmonExecutable) { $arguments += @("-SysmonExecutable", $SysmonExecutable) }
+        $arguments = @{
+            SkipUI = $true
+            DisableAuth = $true
+        }
+        if ($InstallPrerequisites) { $arguments.InstallPrerequisites = $true }
+        if ($WithSysmon) { $arguments.WithSysmon = $true }
+        if ($WithNeo4j) { $arguments.WithNeo4j = $true }
+        if ($SysmonExecutable) { $arguments.SysmonExecutable = $SysmonExecutable }
         & (Join-Path $Root "scripts\setup.ps1") @arguments
         if ($LASTEXITCODE -ne 0) { throw "Native sensor installation failed." }
     } finally {

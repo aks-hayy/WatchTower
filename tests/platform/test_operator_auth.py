@@ -81,6 +81,24 @@ def test_pin_failures_are_rate_limited_and_audit_never_contains_pin(tmp_path):
     db.close()
 
 
+def test_pin_and_recovery_accept_copy_paste_whitespace_without_changing_credentials(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    auth = OperatorAuthService(db)
+    setup = auth.setup_pin(" 824691 ")
+
+    auth.lock(setup["token"])
+    assert auth.verify_pin(" 824691 ")["status"]["state"] == "unlocked"
+
+    auth.lock(None, all_sessions=True)
+    recovered = auth.reset_with_recovery(
+        f"  {setup['recovery_code'].lower().replace('-', ' - ')}  ",
+        " 739182 ",
+    )
+    assert recovered["session"]["client_type"] == "cli"
+    assert auth.verify_pin("739182")["status"]["state"] == "unlocked"
+    db.close()
+
+
 def test_api_first_run_setup_lock_and_unlock(tmp_path):
     db = WatchtowerDB(data_dir=str(tmp_path))
     app = create_app(

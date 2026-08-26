@@ -42,6 +42,23 @@ function Invoke-Checked([scriptblock]$Operation, [string]$Failure) {
     if ($LASTEXITCODE -ne 0) { throw $Failure }
 }
 
+function Invoke-Tower([string[]]$Arguments) {
+    # Windows PowerShell promotes native stderr diagnostics to terminating
+    # errors under Stop. tower uses stderr for informational logs, so the
+    # process exit code is the authoritative success signal here.
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Tower @Arguments
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($exitCode -ne 0) {
+        throw "tower $($Arguments -join ' ') failed with exit code $exitCode."
+    }
+}
+
 function Install-WingetPackage([string]$Id, [string]$Label, [string]$Override = "") {
     Require-Command "winget" "Install Microsoft App Installer, then rerun with -InstallPrerequisites."
     Step "Installing $Label"
@@ -67,7 +84,21 @@ function Ensure-Tool([string]$Command, [string]$PackageId, [string]$Label, [stri
 function Get-VerifiedDownload([string]$Uri, [string]$Destination, [string]$ExpectedSha256) {
     $parent = Split-Path -Parent $Destination
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination -TimeoutSec 120 -ErrorAction Stop
+    } catch {
+        # Windows PowerShell's web stack can time out against the official
+        # Npcap endpoint even when the same URL is reachable by curl. Keep the
+        # fallback pinned to the requested URL and verify the digest below.
+        if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+            throw
+        }
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        & curl.exe --fail --location --retry 3 --connect-timeout 15 --max-time 180 --output $Destination $Uri
+        if ($LASTEXITCODE -ne 0) {
+            throw "Download failed with both Invoke-WebRequest and curl.exe: $Uri"
+        }
+    }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Destination).Hash
     if ($actual -ne $ExpectedSha256) {
         Remove-Item -LiteralPath $Destination -Force
@@ -221,23 +252,26 @@ neo4j:
 
     $Tower = Join-Path $Root ".venv\Scripts\tower.exe"
     Step "Configuring local operator access"
-    $authStatus = @(& $Tower auth status 2>&1)
-    $authStatusExit = $LASTEXITCODE
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $authStatus = @(& $Tower auth status 2>&1)
+        $authStatusExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
     $authStatusText = $authStatus | Out-String
     if ($authStatusExit -eq 0 -and $authStatusText -notmatch "SETUP_REQUIRED") {
         Write-Host "Operator access is already configured; keeping the existing trust settings." -ForegroundColor DarkGray
     } elseif ($DisableAuth) {
-        & $Tower auth setup --disable
-        if ($LASTEXITCODE -ne 0) { throw "Operator authentication setup did not complete." }
+        Invoke-Tower @("auth", "setup", "--disable")
     } else {
-        & $Tower auth setup
-        if ($LASTEXITCODE -ne 0) { throw "Operator authentication setup did not complete." }
+        Invoke-Tower @("auth", "setup")
     }
 
     if (-not $SkipDiagnostics) {
         Step "Running installation diagnostics"
-        & $Tower doctor
-        if ($LASTEXITCODE -ne 0) { throw "tower doctor reported an installation problem." }
+        Invoke-Tower @("doctor")
     }
 
     Write-Host "`nWatchTower setup completed." -ForegroundColor Green

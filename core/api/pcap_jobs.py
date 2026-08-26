@@ -145,22 +145,57 @@ class PcapJobManager:
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="watchtower-pcap")
         self._last_persist: Dict[str, float] = {}
-        # The manager serializes analyses, so one production engine can be
-        # warmed during service startup and reused. ``analyze_pcap`` resets
-        # source-scoped state for every immutable analysis; keeping this
-        # engine avoids paying plugin import/validation cost inside the job's
-        # user-visible completion window. Injected test engines stay isolated.
+        # The manager serializes analyses, so one production engine is warmed
+        # and reused. Calibration attestation verification can hash a sizeable
+        # source tree, though, and doing that in the API import path makes the
+        # health endpoint miss the launcher's readiness window. Warm the
+        # default engine asynchronously; a submitted job waits for the same
+        # shared instance instead of constructing a duplicate.
         self._shared_engine = None
-        if engine_factory is ForensicsEngine:
-            try:
-                self._shared_engine = engine_factory(
-                    db=self.db,
-                    data_dir=str(getattr(self.db, "data_dir", context.data_dir)),
-                    silent=True,
-                )
-            except Exception:
-                logger.exception("Unable to pre-warm the forensic analysis engine")
+        self._engine_lock = threading.RLock()
+        self._engine_ready = threading.Event()
+        self._engine_warmup_error: Optional[Exception] = None
+        self._engine_warmup_thread = None
         self._restore()
+        if engine_factory is ForensicsEngine:
+            self._engine_warmup_thread = threading.Thread(
+                target=self._warm_shared_engine,
+                name="watchtower-pcap-warmup",
+                daemon=True,
+            )
+            self._engine_warmup_thread.start()
+
+    def _warm_shared_engine(self) -> None:
+        try:
+            engine = self.engine_factory(
+                db=self.db,
+                data_dir=str(getattr(self.db, "data_dir", context.data_dir)),
+                silent=True,
+            )
+            with self._engine_lock:
+                self._shared_engine = engine
+        except Exception as exc:
+            self._engine_warmup_error = exc
+            logger.exception("Unable to pre-warm the forensic analysis engine")
+        finally:
+            self._engine_ready.set()
+
+    def _analysis_engine(self):
+        """Return the shared engine, waiting only outside API startup."""
+        if self.engine_factory is not ForensicsEngine:
+            return self.engine_factory(
+                db=self.db,
+                data_dir=str(getattr(self.db, "data_dir", context.data_dir)),
+                silent=True,
+            )
+        self._engine_ready.wait()
+        with self._engine_lock:
+            engine = self._shared_engine
+        if engine is not None:
+            return engine
+        if self._engine_warmup_error is not None:
+            raise RuntimeError("Forensic engine warm-up failed") from self._engine_warmup_error
+        raise RuntimeError("Forensic engine did not become ready")
 
     def submit(self, path: str, filename: str, mode: str, backend: str = None,
                keylog_path: Optional[str] = None, retain_input: bool = True) -> Dict[str, Any]:
@@ -344,11 +379,7 @@ class PcapJobManager:
                     self.tshark_dissector.dissect,
                     plaintext_pcap,
                 )
-            engine = self._shared_engine or self.engine_factory(
-                db=self.db,
-                data_dir=str(getattr(self.db, "data_dir", context.data_dir)),
-                silent=True,
-            )
+            engine = self._analysis_engine()
             analyze_options = {
                 "progress_callback": progress,
                 "source_name": job.source,
@@ -575,6 +606,8 @@ class PcapJobManager:
         # Let queued jobs enter _run so their temporary uploads are removed.
         # Active analyses observe cancel_event during packet processing.
         self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._engine_warmup_thread and self._engine_warmup_thread.is_alive():
+            self._engine_warmup_thread.join(timeout=5)
 
     def _persist(self, job: PcapJob, clear_paths: bool = False) -> None:
         if not hasattr(self.db, "save_pcap_analysis_job"):

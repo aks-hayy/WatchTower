@@ -117,6 +117,7 @@ class OperatorAuthService:
         client_type: str = "browser",
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        pin = self._normalize_pin(pin)
         self._validate_pin(pin)
         session = self.db._get_session()
         account = self._account()
@@ -183,6 +184,7 @@ class OperatorAuthService:
 
     def set_enabled(self, enabled: bool, token: str, pin: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         current = self.require_step_up(token)
+        pin = self._normalize_pin(pin)
         account = self._account()
         if account is None:
             raise AuthError("setup_required", "Operator authentication has not been configured", 409)
@@ -228,6 +230,7 @@ class OperatorAuthService:
 
     def step_up_pin(self, token: str, pin: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         operator_session = self.authenticate(token)
+        pin = self._normalize_pin(pin)
         self._verify_pin_value(pin)
         operator_session.step_up_at = self.clock()
         self.db._get_session().commit()
@@ -439,6 +442,8 @@ class OperatorAuthService:
         client_type: str = "cli",
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        recovery_code = self._normalize_recovery_code(recovery_code)
+        new_pin = self._normalize_pin(new_pin)
         self._validate_pin(new_pin)
         account = self._account()
         if not account or not account.recovery_hash:
@@ -477,6 +482,7 @@ class OperatorAuthService:
         account = self._account()
         if account is None:
             return self.setup_pin(new_pin, client_type=client_type)
+        new_pin = self._normalize_pin(new_pin)
         self._validate_pin(new_pin)
         recovery = "-".join(secrets.token_hex(3).upper() for _ in range(4))
         account.pin_hash = self.passwords.hash(new_pin)
@@ -493,6 +499,7 @@ class OperatorAuthService:
         return {"token": raw_token, "recovery_code": recovery, "session": self._session_public(operator_session)}
 
     def _verify_pin_value(self, pin: str) -> None:
+        normalized_pin = self._normalize_pin(pin)
         account = self._account()
         if not account or not account.setup_completed or not account.auth_enabled:
             raise AuthError("authentication_unavailable", "PIN authentication is not enabled", 409)
@@ -503,9 +510,16 @@ class OperatorAuthService:
         valid = False
         if account.pin_hash:
             try:
-                valid = self.passwords.verify(account.pin_hash, pin)
+                valid = self.passwords.verify(account.pin_hash, normalized_pin)
             except (VerifyMismatchError, InvalidHashError):
                 valid = False
+            # Keep accounts created by older versions usable if an operator
+            # deliberately chose leading/trailing whitespace.
+            if not valid and normalized_pin != pin:
+                try:
+                    valid = self.passwords.verify(account.pin_hash, pin)
+                except (VerifyMismatchError, InvalidHashError):
+                    valid = False
         if not valid:
             account.failed_attempts = int(account.failed_attempts or 0) + 1
             if account.failed_attempts >= 5:
@@ -517,8 +531,18 @@ class OperatorAuthService:
         account.locked_until = None
         account.updated_at = now
         if self.passwords.check_needs_rehash(account.pin_hash):
-            account.pin_hash = self.passwords.hash(pin)
+            account.pin_hash = self.passwords.hash(normalized_pin)
         self.db._get_session().commit()
+
+    @staticmethod
+    def _normalize_pin(pin: str) -> str:
+        return str(pin or "").strip()
+
+    @staticmethod
+    def _normalize_recovery_code(code: str) -> str:
+        # Generated codes contain no whitespace. Removing pasted spaces or
+        # newlines and normalizing case makes the one-time flow reliable.
+        return "".join(str(code or "").split()).upper()
 
     @staticmethod
     def _validate_pin(pin: str) -> None:

@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Any
 from datetime import date
 
 from sqlalchemy import Integer, and_, create_engine, select, update, insert, delete, func, or_, case
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
 from core.storage.models import (
@@ -38,6 +39,11 @@ import os
 
 logger = setup_logger("database")
 _database_scope = ContextVar("watchtower_database_scope", default=None)
+
+
+def _live_source_clause(column):
+    """Match local and mesh-prefixed live capture sources."""
+    return or_(column.like("live%"), column.like("mesh:%:live%"))
 
 
 def _session_scope_key():
@@ -342,11 +348,22 @@ class WatchtowerDB:
                 capabilities_json=json.dumps({"capture": True, "endpoint_telemetry": os.name == "nt"}, sort_keys=True),
                 health_json="{}", created_at=time.time(), last_seen_at=time.time(),
             ))
-        for table in (Flow, Alert, CaptureSession, EndpointIdentity, HardwareObservation, DetectionFinding, RiskSnapshot, CarvedFile):
-            session.query(table).filter(getattr(table, "sensor_node_id").is_(None)).update(
-                {"sensor_node_id": node_id}, synchronize_session=False,
-            )
-        session.commit()
+        try:
+            for table in (Flow, Alert, CaptureSession, EndpointIdentity, HardwareObservation, DetectionFinding, RiskSnapshot, CarvedFile):
+                session.query(table).filter(getattr(table, "sensor_node_id").is_(None)).update(
+                    {"sensor_node_id": node_id}, synchronize_session=False,
+                )
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            # A live sensor service can briefly hold the SQLite file while a
+            # second headless status command opens it. The node-boundary
+            # backfill is an idempotent migration, not a reason to make
+            # read-only health/status calls fail. Capture and telemetry writes
+            # still surface their own persistence errors to the caller.
+            if "readonly" not in str(exc).lower():
+                raise
+            logger.warning("Deferred local sensor-node backfill while SQLite is read-only: %s", exc)
         return node_id
 
     def _local_sensor_cache_key(self) -> str:
@@ -770,6 +787,13 @@ class WatchtowerDB:
                 "processing_state": str(value.get("processing_state") or "running"),
                 "complete": bool(value.get("complete") or False), "completion_reason": value.get("completion_reason"),
                 "error": value.get("error"), "metadata_json": json.dumps(value.get("metadata") or {}, sort_keys=True),
+                "daemon_instance_id": value.get("daemon_instance_id"),
+                "last_heartbeat_at": value.get("last_heartbeat_at"),
+                "shutdown_stage": value.get("shutdown_stage"),
+                "worker_acknowledged": bool(value.get("worker_acknowledged") or False),
+                "evidence_acknowledged": bool(value.get("evidence_acknowledged") or False),
+                "persisted_generation": int(value.get("persisted_generation") or 0),
+                "process_exit_outcome": value.get("process_exit_outcome"),
             }
             for name in ("received_packets", "emitted_packets", "dropped_packets", "queue_full_events", "processed_packets", "detector_errors", "evidence_dropped", "snapshot_dropped", "pending_packets", "queue_depth_high_watermark"):
                 fields[name] = int(value.get(name) or 0)
@@ -1438,7 +1462,7 @@ class WatchtowerDB:
          .outerjoin(flow_counts, Entity.ip == flow_counts.c.entity_ip)
         
         if source:
-            query = query.filter(Entity.source == source)
+            query = query.filter(_live_source_clause(Entity.source) if source == "live" else Entity.source == source)
             
         entities = query.order_by(Entity.risk_score.desc()).all()
         
@@ -1471,7 +1495,7 @@ class WatchtowerDB:
 
         def scoped(query):
             if source:
-                query = query.filter(Flow.source.like("live%")) if source == "live" else query.filter(Flow.source == source)
+                query = query.filter(_live_source_clause(Flow.source)) if source == "live" else query.filter(Flow.source == source)
             if interface:
                 query = query.filter(Flow.capture_interface == interface)
             return query.filter(Flow.last_seen >= window_start)
@@ -1771,7 +1795,7 @@ class WatchtowerDB:
         if subject:
             query = query.filter(DetectionFinding.subject == subject)
         if source:
-            query = query.filter(DetectionFinding.source.like("live%")) if source == "live" else query.filter_by(source=source)
+            query = query.filter(_live_source_clause(DetectionFinding.source)) if source == "live" else query.filter_by(source=source)
         if interface:
             query = query.filter(DetectionFinding.capture_interface == interface)
         if capture_session_id:
@@ -1967,6 +1991,31 @@ class WatchtowerDB:
             result.append(item)
         return result
 
+    def get_risk_subjects(self, source: str = None, interface: str = None,
+                          capture_session_id: str = None, sensor_node_id: str = None,
+                          limit: int = 5000) -> List[str]:
+        """Return bounded endpoint subjects observed in the requested flow scope."""
+        session = self._get_session()
+
+        def scoped(query):
+            if source:
+                query = query.filter(_live_source_clause(Flow.source) if source == "live" else Flow.source == source)
+            if interface:
+                query = query.filter(Flow.capture_interface == interface)
+            if capture_session_id:
+                query = query.filter(Flow.capture_session_id == capture_session_id)
+            if sensor_node_id:
+                query = query.filter(Flow.sensor_node_id == sensor_node_id)
+            return query
+
+        source_subjects = scoped(session.query(Flow.src_ip.label("subject")))
+        destination_subjects = scoped(session.query(Flow.dst_ip.label("subject")))
+        subjects = source_subjects.union(destination_subjects).subquery()
+        rows = session.query(subjects.c.subject).filter(subjects.c.subject.is_not(None)).order_by(
+            subjects.c.subject.asc()
+        ).limit(max(1, min(int(limit), 5000))).all()
+        return [str(row[0]) for row in rows if row[0]]
+
     def update_feature_baseline(self, subject: str, feature: str, value: float, timestamp: float,
                                 source: str = "live", interface: str = None,
                                 dimension: str = "") -> Dict:
@@ -2108,7 +2157,7 @@ class WatchtowerDB:
         if source:
             if source == "live":
                 from sqlalchemy import or_
-                query = query.filter(Alert.source.like("live%"))
+                query = query.filter(_live_source_clause(Alert.source))
             else:
                 query = query.filter_by(source=source)
         if interface:
@@ -2297,7 +2346,7 @@ class WatchtowerDB:
         query = session.query(Flow)
         if source:
             if source == "live":
-                query = query.filter(Flow.source.like("live%"))
+                query = query.filter(_live_source_clause(Flow.source))
             else:
                 query = query.filter_by(source=source)
         if interface:
@@ -2337,7 +2386,7 @@ class WatchtowerDB:
         with self.session_scope() as session:
             query = session.query(Flow)
             if source:
-                query = query.filter(Flow.source.like("live%")) if source == "live" else query.filter(Flow.source == source)
+                query = query.filter(_live_source_clause(Flow.source)) if source == "live" else query.filter(Flow.source == source)
             if interface:
                 query = query.filter(Flow.capture_interface == interface)
             if capture_session_id:
@@ -2452,7 +2501,7 @@ class WatchtowerDB:
         )
         if source:
             if source == "live":
-                query = query.filter(Flow.source.like("live%"))
+                query = query.filter(_live_source_clause(Flow.source))
             else:
                 query = query.filter(Flow.source == source)
         if interface:
@@ -2660,7 +2709,7 @@ class WatchtowerDB:
             query = query.filter(EndpointIdentity.entity_ip == ip)
         if source:
             if source == "live":
-                query = query.filter(EndpointIdentity.source.like("live%"))
+                query = query.filter(_live_source_clause(EndpointIdentity.source))
             elif source.startswith("live_") and "#" not in source:
                 query = query.filter(EndpointIdentity.source.like(f"{source}#%"))
             else:
@@ -2730,7 +2779,7 @@ class WatchtowerDB:
             query = query.filter(IdentityObservation.subject_ip == subject_ip)
         if source:
             if source == "live":
-                query = query.filter(IdentityObservation.source.like("live%"))
+                query = query.filter(_live_source_clause(IdentityObservation.source))
             elif source.startswith("live_") and "#" not in source:
                 query = query.filter(IdentityObservation.source.like(f"{source}#%"))
             else:
@@ -2961,9 +3010,16 @@ class WatchtowerDB:
         session = self._get_session()
         now = time.time()
         node_id = str(node["id"])
+        requested_name = str(node.get("name") or node_id)[:256]
         row = session.query(SensorNode).filter_by(id=node_id).first()
         if row is None:
-            row = SensorNode(id=node_id, name=str(node.get("name") or node_id), created_at=now)
+            name_conflict = session.query(SensorNode).filter_by(name=requested_name).first()
+            if name_conflict and name_conflict.status in {"revoked", "decommissioned"}:
+                # A node identity is immutable for historical evidence, but a
+                # replacement sensor must be able to reclaim its operator
+                # chosen name after the old certificate was revoked.
+                name_conflict.name = f"{requested_name} [retired {str(name_conflict.id)[-8:]}]"[:256]
+            row = SensorNode(id=node_id, name=requested_name, created_at=now)
             session.add(row)
         for field in ("name", "certificate_fingerprint", "status", "platform", "agent_version", "revoked_at", "revoke_reason"):
             if field in node:
@@ -2973,7 +3029,14 @@ class WatchtowerDB:
         if "health" in node:
             row.health_json = json.dumps(node["health"] or {}, sort_keys=True)
         row.last_seen_at = float(node.get("last_seen_at") or now)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise ValueError(
+                f"A live sensor node already uses the name '{requested_name}'. "
+                "Choose a different node name or decommission the existing node."
+            ) from exc
         return self._mesh_node_row(row)
 
     def get_sensor_node(self, node_id: str) -> Optional[Dict]:
@@ -3069,7 +3132,13 @@ class WatchtowerDB:
         session = self._get_session()
         existing = session.query(MeshCommand).filter_by(idempotency_key=idempotency_key).first()
         if existing:
-            return self._row_dict(existing)
+            # A completed command is a safe idempotent replay, while a failed
+            # or rejected command must not poison the next operator retry with
+            # its old result.  Keep the original record for auditability and
+            # allocate a fresh key for the new attempt.
+            if existing.status not in {"failed", "rejected"}:
+                return self._row_dict(existing)
+            idempotency_key = f"{idempotency_key}:{uuid.uuid4().hex}"
         row = MeshCommand(
             id=command_id, sensor_node_id=node_id, action=action,
             arguments_json=json.dumps(arguments or {}, sort_keys=True), status="queued", requested_at=time.time(),
@@ -3127,38 +3196,52 @@ class WatchtowerDB:
     def mesh_export_batch(self, flow_after_id: int = 0, observation_after: float = 0.0,
                           session_after: float = 0.0, limit: int = 250,
                           alert_after_id: int = 0, finding_after_id: int = 0,
-                          hardware_after_id: int = 0) -> Dict[str, List[Dict]]:
+                          hardware_after_id: int = 0,
+                          sensor_node_id: str = None) -> Dict[str, List[Dict]]:
         """Read a bounded local-node telemetry delta for an outbound agent."""
         session = self._get_session()
-        node_id = self.local_sensor_node_id()
+        local_node_id = self.local_sensor_node_id()
+        # The capture database has an installation-local identity, while an
+        # enrolled mesh agent has a controller-issued identity. Export may
+        # bridge those two identities, but the local rows remain untouched.
+        export_node_id = str(sensor_node_id or local_node_id)
+        sensor_ids = {local_node_id, export_node_id}
         max_rows = max(1, min(int(limit), 1000))
         flows = session.query(Flow).filter(
-            Flow.sensor_node_id == node_id, Flow.id > int(flow_after_id),
+            Flow.sensor_node_id.in_(sensor_ids), Flow.id > int(flow_after_id),
         ).order_by(Flow.id.asc()).limit(max_rows).all()
         flow_rows = []
         for row in flows:
             item = self._row_dict(row)
+            item["sensor_node_id"] = export_node_id
             try:
                 item["l7_metadata"] = json.loads(item.get("l7_metadata") or "{}")
             except (ValueError, TypeError):
                 item["l7_metadata"] = {}
             flow_rows.append(item)
         observations = session.query(EndpointProcessObservation).filter(
-            EndpointProcessObservation.sensor_node_id == node_id,
+            EndpointProcessObservation.sensor_node_id.in_(sensor_ids),
             EndpointProcessObservation.created_at > float(observation_after),
         ).order_by(EndpointProcessObservation.created_at.asc()).limit(max_rows).all()
         capture_sessions = session.query(CaptureSession).filter(
-            CaptureSession.sensor_node_id == node_id,
-            CaptureSession.started_at > float(session_after),
+            CaptureSession.sensor_node_id.in_(sensor_ids),
+            or_(
+                CaptureSession.started_at > float(session_after),
+                CaptureSession.processing_state.in_(("running", "draining")),
+                and_(
+                    CaptureSession.ended_at.is_not(None),
+                    CaptureSession.ended_at > float(session_after),
+                ),
+            ),
         ).order_by(CaptureSession.started_at.asc()).limit(max_rows).all()
         alerts = session.query(Alert).filter(
-            Alert.sensor_node_id == node_id, Alert.id > int(alert_after_id),
+            Alert.sensor_node_id.in_(sensor_ids), Alert.id > int(alert_after_id),
         ).order_by(Alert.id.asc()).limit(max_rows).all()
         findings = session.query(DetectionFinding).filter(
-            DetectionFinding.sensor_node_id == node_id, DetectionFinding.id > int(finding_after_id),
+            DetectionFinding.sensor_node_id.in_(sensor_ids), DetectionFinding.id > int(finding_after_id),
         ).order_by(DetectionFinding.id.asc()).limit(max_rows).all()
         hardware = session.query(HardwareObservation).filter(
-            HardwareObservation.sensor_node_id == node_id, HardwareObservation.id > int(hardware_after_id),
+            HardwareObservation.sensor_node_id.in_(sensor_ids), HardwareObservation.id > int(hardware_after_id),
         ).order_by(HardwareObservation.id.asc()).limit(max_rows).all()
         alert_rows = []
         for row in alerts:
@@ -3176,12 +3259,30 @@ class WatchtowerDB:
             except (ValueError, TypeError):
                 item["metadata"] = {}
             hardware_rows.append(item)
+        session_rows = []
+        for row in capture_sessions:
+            item = self._row_dict(row)
+            item["sensor_node_id"] = export_node_id
+            session_rows.append(item)
+        finding_rows = []
+        for row in findings:
+            item = self._finding_dict(row)
+            item["sensor_node_id"] = export_node_id
+            finding_rows.append(item)
+        for item in alert_rows:
+            item["sensor_node_id"] = export_node_id
+        hardware_rows = [dict(item, sensor_node_id=export_node_id) for item in hardware_rows]
+        observation_rows = []
+        for row in observations:
+            item = self._endpoint_observation_row(row)
+            item["sensor_node_id"] = export_node_id
+            observation_rows.append(item)
         return {
             "flows": flow_rows,
-            "endpoint_observations": [self._endpoint_observation_row(row) for row in observations],
-            "sessions": [self._row_dict(row) for row in capture_sessions],
+            "endpoint_observations": observation_rows,
+            "sessions": session_rows,
             "alerts": alert_rows,
-            "findings": [self._finding_dict(row) for row in findings],
+            "findings": finding_rows,
             "hardware_observations": hardware_rows,
         }
 
@@ -3364,7 +3465,7 @@ class WatchtowerDB:
             query = query.filter_by(entity_ip=entity_ip)
         if source:
             if source == "live":
-                query = query.filter(CarvedFile.source.like("live%"))
+                query = query.filter(_live_source_clause(CarvedFile.source))
             else:
                 query = query.filter_by(source=source)
         if sensor_node_id:
@@ -3452,11 +3553,11 @@ class WatchtowerDB:
         today_str = date.today().isoformat()
         
         if source == "live":
-            rows = session.query(DailyStats).filter(DailyStats.date == today_str, DailyStats.source.like("live%")).all()
+            rows = session.query(DailyStats).filter(DailyStats.date == today_str, _live_source_clause(DailyStats.source)).all()
         else:
             rows = session.query(DailyStats).filter_by(date=today_str, source=source).all()
 
-        if not rows:
+        if not rows and source != "live":
             return {
                 "date": today_str, "total_packets": 0, "total_bytes": 0,
                 "total_flows": 0, "snapshot_count": 0,
@@ -3496,7 +3597,7 @@ class WatchtowerDB:
         # as well as a guard against future accumulator drift.
         flow_query = session.query(Flow).filter(Flow.session_date == today_str)
         if source == "live":
-            flow_query = flow_query.filter(Flow.source.like("live%"))
+            flow_query = flow_query.filter(_live_source_clause(Flow.source))
         elif source.startswith("live_"):
             flow_query = flow_query.filter(or_(
                 Flow.source == source,
@@ -3523,7 +3624,7 @@ class WatchtowerDB:
 
         # Fetch aggregated timeline
         if source == "live":
-            tl_rows = session.query(Timeline).filter(Timeline.date == today_str, Timeline.source.like("live%")).all()
+            tl_rows = session.query(Timeline).filter(Timeline.date == today_str, _live_source_clause(Timeline.source)).all()
         else:
             tl_rows = session.query(Timeline).filter_by(date=today_str, source=source).all()
         
@@ -3561,7 +3662,7 @@ class WatchtowerDB:
             flows = session.query(Flow).filter(
                 Flow.l7_metadata.isnot(None),
                 Flow.session_date == today_str,
-                Flow.source.like("live%")
+                _live_source_clause(Flow.source)
             ).limit(500).all()
         else:
             flows = session.query(Flow).filter(

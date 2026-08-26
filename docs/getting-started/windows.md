@@ -25,4 +25,15 @@ secrets directory. Set `WATCHTOWER_NEO4J_PASSWORD_FILE` only when supplying
 an operator-managed secret file.
 
 The recommended runtime is the hybrid controller plus native Rust sensor.
-Use `watchtower.ps1 status`, `logs`, and `repair` for lifecycle recovery.
+Use the small public lifecycle surface:
+
+```powershell
+.\watchtower.ps1 start       # start the runtime and both operator surfaces
+.\watchtower.ps1 ui          # start/reuse the runtime and open only the UI
+.\watchtower.ps1 cli         # start/reuse the runtime and open only the CLI
+.\watchtower.ps1 stop        # drain capture and stop WatchTower services
+.\watchtower.ps1 uninstall   # remove generated runtime state after confirmation
+```
+
+Advanced diagnostics and bridge repair remain available through the scripts
+under `scripts/`.

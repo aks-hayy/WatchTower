@@ -99,14 +99,17 @@ class TestForensicPlugins(unittest.TestCase):
     def test_plugin_health_reports_effective_scoring_calibration(self):
         plugins = self.loader.list_plugins()
         ftp = plugins["BaseDetector:Cleartext FTP Credential Detector"]
-        self.assertTrue(ftp["calibrated"])
-        self.assertEqual(ftp["calibration_level"], "FIELD_CALIBRATED")
+        # The detector source changed in this branch, so the previous
+        # attestation is intentionally stale until calibration is rerun.
+        self.assertFalse(ftp["calibrated"])
+        self.assertEqual(ftp["calibration_level"], "UNCALIBRATED")
+        self.assertIn("stale", ftp["calibration"][0]["stale_reason"])
         self.assertEqual(ftp["calibration"][0]["finding_type"], "credential.cleartext.ftp")
-        self.assertGreater(ftp["calibration"][0]["effective_cap"], 5)
+        self.assertEqual(ftp["calibration"][0]["effective_cap"], 5)
         self.assertFalse(plugins["BaseDetector:Beaconing Detector"]["calibrated"])
         dns = plugins["BaseDetector:DNS Anomaly Detector"]
-        self.assertTrue(dns["calibrated"])
-        self.assertEqual(dns["calibration_level"], "FIELD_CALIBRATED")
+        self.assertFalse(dns["calibrated"])
+        self.assertEqual(dns["calibration_level"], "UNCALIBRATED")
 
 if __name__ == '__main__':
     unittest.main()

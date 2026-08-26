@@ -143,6 +143,9 @@ class FlowAggregate:
 
     packet_sizes: List[int] = field(default_factory=list)
     arrival_times: List[float] = field(default_factory=list)
+    # Per-second counters keep live snapshots bounded. The packet sample
+    # arrays above are retained for detector evidence and compatibility.
+    timeline_buckets: Dict[int, Dict[str, int]] = field(default_factory=dict)
     l7_metadata: Dict = field(default_factory=dict)
     raw_packets: List[bytes] = field(default_factory=list)
 
@@ -152,6 +155,10 @@ class FlowAggregate:
     
     # Track when specific alert types were last triggered for this flow
     alert_history: Dict[str, float] = field(default_factory=dict)
+    # Packet-level parsers only need a bounded number of payload samples per
+    # conversation. Stream and conversation detectors continue to receive all
+    # payloads, so this counter is strictly a live forensic hot-path budget.
+    live_forensics_payloads: int = 0
 
     reassembled_to_server: Optional[bytes] = None
     reassembled_to_client: Optional[bytes] = None
@@ -164,6 +171,17 @@ class FlowAggregate:
         if len(self.arrival_times) < 500:
             self.arrival_times.append(timestamp)
         self.last_seen = timestamp
+
+        bucket = int(timestamp)
+        bucket_stats = self.timeline_buckets.setdefault(bucket, {"packets": 0, "bytes": 0})
+        bucket_stats["packets"] += 1
+        bucket_stats["bytes"] += int(size)
+        # A flow can remain active for a long time. Keep enough history for
+        # the largest live window while preventing idle flows from growing
+        # without bound.
+        if len(self.timeline_buckets) > 120:
+            oldest = min(self.timeline_buckets)
+            self.timeline_buckets.pop(oldest, None)
         
         if raw and len(self.raw_packets) < 100: # Limit raw packets stored per flow
             self.raw_packets.append(raw)

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict
 
@@ -98,6 +99,15 @@ class MeshRuntimeManager:
         stop_path = directory / "stop.request"
         stop_path.unlink(missing_ok=True)
         log_path = directory / "runtime.log"
+        try:
+            log_handle = log_path.open("ab")
+        except PermissionError:
+            # A previous elevated install may have left its runtime log with
+            # an owner-only ACL. Keep durable runtime state in place, but use
+            # a user-writable log so the current operator can still start the
+            # sensor runtime without manual ACL repair.
+            log_path = Path(tempfile.gettempdir()) / f"watchtower-{directory.name}-runtime.log"
+            log_handle = log_path.open("ab")
         arguments = [
             sys.executable, "-m", "core.mesh.runtime", command,
             "--data-dir", str(self.data_dir), *(extra or []),
@@ -105,13 +115,13 @@ class MeshRuntimeManager:
         creation_flags = 0
         if os.name == "nt":
             creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        with log_path.open("ab") as log:
+        with log_handle:
             process = subprocess.Popen(
                 arguments,
                 cwd=str(Path(__file__).resolve().parents[2]),
                 stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
+                stdout=log_handle,
+                stderr=log_handle,
                 close_fds=os.name != "nt",
                 creationflags=creation_flags,
             )

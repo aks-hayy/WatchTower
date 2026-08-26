@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 import time
 
@@ -65,12 +66,28 @@ class EndpointAttributor:
         self.sensor_node_id = sensor_node_id or db.local_sensor_node_id()
         self.skew_seconds = max(1.0, float(skew_seconds))
         self.services = ServiceResolver()
+        # Enumerating sockets is comparatively expensive on Windows. Reuse a
+        # short-lived snapshot for all new flows observed in the same worker
+        # interval; attribution remains explicitly a socket fallback and is
+        # refreshed frequently enough for live correlation.
+        self._socket_cache: Dict[str, Tuple[float, List[Any]]] = {}
+        self._cache_seconds = 1.0
+        self._result_cache: OrderedDict[Tuple, Dict[str, Any]] = OrderedDict()
+        self._result_cache_limit = 4096
 
     def attribute(
         self, *, src_ip: str, src_port: int, dst_ip: str, dst_port: int,
         protocol: str, observed_at: float,
     ) -> Dict[str, Any]:
         protocol = str(protocol or "").upper()
+        cache_key = (
+            str(src_ip), int(src_port or 0), str(dst_ip), int(dst_port or 0),
+            protocol, int(float(observed_at or 0.0) // self.skew_seconds),
+        )
+        cached = self._result_cache.get(cache_key)
+        if cached is not None:
+            self._result_cache.move_to_end(cache_key)
+            return dict(cached)
         exact = []
         for endpoint, local_ip, local_port, remote_ip, remote_port in (
             ("source", src_ip, src_port, dst_ip, dst_port),
@@ -83,15 +100,38 @@ class EndpointAttributor:
             )
             exact.extend((endpoint, row) for row in rows)
         if exact:
-            return self._sysmon_result(exact)
+            result = self._sysmon_result(exact)
+            self._remember_result(cache_key, result)
+            return result
         fallback = self._socket_fallback(src_ip, src_port, dst_ip, dst_port, protocol)
         if fallback:
+            self._remember_result(cache_key, fallback)
             return fallback
-        return {
+        result = {
             "provenance": "unattributed",
             "confidence": 0.0,
             "reason": "No matching Sysmon network event or local socket was available.",
         }
+        self._remember_result(cache_key, result)
+        return result
+
+    def _remember_result(self, key: Tuple, result: Dict[str, Any]) -> None:
+        self._result_cache[key] = dict(result)
+        self._result_cache.move_to_end(key)
+        while len(self._result_cache) > self._result_cache_limit:
+            self._result_cache.popitem(last=False)
+
+    def _connections(self, kind: str) -> List[Any]:
+        now = time.monotonic()
+        cached = self._socket_cache.get(kind)
+        if cached is not None and now - cached[0] < self._cache_seconds:
+            return cached[1]
+        try:
+            connections = list(psutil.net_connections(kind=kind))
+        except (psutil.Error, OSError):
+            connections = []
+        self._socket_cache[kind] = (now, connections)
+        return connections
 
     def _sysmon_result(self, matches: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, Any]:
         unique = {(row.get("pid"), row.get("process_guid"), row.get("image")): (endpoint, row) for endpoint, row in matches}
@@ -130,14 +170,11 @@ class EndpointAttributor:
         socket_kind = "tcp" if protocol == "TCP" else "udp" if protocol == "UDP" else None
         if socket_kind is None:
             return None
+        connections = self._connections(socket_kind)
         for endpoint, local_ip, local_port, remote_ip, remote_port in (
             ("source", src_ip, src_port, dst_ip, dst_port),
             ("destination", dst_ip, dst_port, src_ip, src_port),
         ):
-            try:
-                connections = psutil.net_connections(kind=socket_kind)
-            except (psutil.Error, OSError):
-                return None
             for connection in connections:
                 current_local_ip, current_local_port = _endpoint_tuple(connection.laddr)
                 current_remote_ip, current_remote_port = _endpoint_tuple(connection.raddr)

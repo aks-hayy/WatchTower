@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any
 
 from core.mesh.service import MeshControllerService
@@ -53,6 +54,11 @@ def start_capture(db, interface: str, backend: str | None = None, source_type: s
         "capture.start",
         {"interface": interface, "source_type": source_type, **({"backend": backend} if backend else {})},
         requested_by="hybrid-controller-cli",
+        # Each operator invocation represents a new capture session. The
+        # command remains idempotent when the caller retries the same request
+        # with an explicit key, while a later start is not mistaken for the
+        # already-completed command from an earlier session.
+        idempotency_key=f"capture.start:{node['id']}:{interface}:{uuid.uuid4().hex}",
     )
 
 
@@ -69,6 +75,7 @@ def stop_capture(db, interface: str | None = None) -> list[dict[str, Any]]:
     return [
         controller.queue_command(
             str(node["id"]), "capture.stop", {"interface": item}, requested_by="hybrid-controller-cli",
+            idempotency_key=f"capture.stop:{node['id']}:{item}:{uuid.uuid4().hex}",
         )
         for item in interfaces
     ]

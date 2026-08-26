@@ -4,6 +4,7 @@ import sys
 import os
 import logging
 import queue as queue_module
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure local imports work when spawned in a new process on Windows
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,8 +27,43 @@ from scapy.all import wrpcap, Ether, IP, TCP, UDP
 from core.packet_engine.utils import get_geoip_info
 from core.endpoint.attribution import EndpointAttributor, legacy_process_label
 from core.packet_engine.processors import StatAggregator, SecurityScorer, AlertManager
+from core.detection.payload import application_payload
 
 logger = logging.getLogger("flow_worker")
+
+# Deep Scapy parsing and plugin dispatch are bounded for live capture. Flow
+# and conversation accounting still consume every packet. These protocols
+# need continuous parsing because their evidence is distributed across
+# datagrams; other payloads are sampled and re-opened for direct markers.
+LIVE_FORENSIC_SAMPLE_LIMIT = 16
+LIVE_FORENSIC_CONTROL_PORTS = frozenset({
+    53, 67, 68, 88, 123, 137, 138, 161, 162, 389, 445, 546, 547,
+    1900, 5353, 5355,
+})
+LIVE_FORENSIC_MARKERS = (
+    b"user ", b"pass ", b"password", b"authorization", b"ntlmssp",
+    b"ssh-", b"get ", b"post ", b"http/", b"\x16\x03", b"mqtt",
+    b"modbus", b"coap", b"mz", b"authentication failed", b"login failed",
+)
+
+
+def _should_deep_inspect_live_packet(event, flow) -> bool:
+    """Decide whether a live frame warrants Scapy/plugin processing."""
+    if not event.raw:
+        return False
+    protocol = str(event.protocol or "").upper()
+    if protocol in {"ARP", "ICMP", "ICMPV6", "OTHER"}:
+        return True
+    ports = {int(event.src_port or 0), int(event.dst_port or 0)}
+    if ports & LIVE_FORENSIC_CONTROL_PORTS:
+        return True
+    if flow is None or flow.live_forensics_payloads < LIVE_FORENSIC_SAMPLE_LIMIT:
+        return True
+    # Rust events retain the complete frame. A bounded byte search lets a
+    # later suspicious marker re-open inspection without decoding every
+    # ordinary encrypted/data segment with Scapy.
+    sample = bytes(event.raw[:64 * 1024]).lower()
+    return any(marker in sample for marker in LIVE_FORENSIC_MARKERS)
 
 
 def _record_baseline_event(windows, event):
@@ -150,12 +186,17 @@ def enforce_memory_limit(flow_table, max_size):
 
 def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, forensics_engine=None,
                    behavioral_engine=None, source=None, capture_interface=None,
-                   capture_session_id=None, capture_backend=None, detection_flow_ids=None):
+                   capture_session_id=None, capture_backend=None, detection_flow_ids=None,
+                   baseline_cache=None):
     stats = StatAggregator()
     scorer = SecurityScorer(analytics_engine, forensics_engine, behavioral_engine)
     alert_mgr = AlertManager()
     alert_mgr.behavioral = behavioral_engine
     evidence_tasks = []
+    # Behavioral baselines are keyed by subject, not by directional flow.
+    # Reusing the lookup for a snapshot avoids one SQLite query per flow during
+    # busy-window refreshes while preserving the same subject-scoped result.
+    baseline_cache = baseline_cache if baseline_cache is not None else {}
     
     active_flows = [f for f in flow_table.values() if f.last_seen >= window_start]
     
@@ -178,9 +219,12 @@ def build_snapshot(flow_table, window_start, window_end, analytics_engine=None, 
                 behavioral_engine.check_peer_anomaly(f.flow_id[0], f.flow_id[1]) > 0
             )
         if should_detect and forensics_engine is not None and hasattr(forensics_engine.db, "get_feature_baselines"):
-            baselines = forensics_engine.db.get_feature_baselines(
-                subject=f.flow_id[0], feature="outbound_bytes",
-            )
+            subject = str(f.flow_id[0])
+            if subject not in baseline_cache:
+                baseline_cache[subject] = forensics_engine.db.get_feature_baselines(
+                    subject=subject, feature="outbound_bytes",
+                )
+            baselines = baseline_cache[subject]
             mature = next((item for item in baselines if item["maturity"]["mature"]), None)
             if mature:
                 f.l7_metadata["outbound_bytes_p99"] = float(mature.get("p99") or 0.0)
@@ -290,6 +334,11 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
     dirty_flow_ids = defaultdict(set)
     conversations = ConversationTracker(maximum=config.max_flow_table_size)
     streams = LiveTCPStreamTracker(maximum_streams=min(config.max_flow_table_size, 16_384))
+    geoip_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="watchtower-geoip")
+    geoip_pending = {}
+    geoip_waiters = defaultdict(list)
+    geoip_results = {}
+    last_conversation_evaluation = {}
     draining = False
     drain_reason = "operator_stop"
     persisted_generation = 0
@@ -311,6 +360,57 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
     last_baseline_purge = time.time()
 
     last_snapshot_time = time.time()
+
+    def schedule_geoip(flow, ip):
+        """Schedule public enrichment without blocking packet analytics."""
+        ip = str(ip or "")
+        if not ip or ip in geoip_results:
+            if ip in geoip_results:
+                flow.l7_metadata["geoip"] = geoip_results[ip]
+            return
+        if ip not in geoip_pending:
+            geoip_pending[ip] = geoip_executor.submit(get_geoip_info, ip)
+        flow.l7_metadata["geoip_pending"] = True
+        geoip_waiters[ip].append(flow)
+
+    def drain_geoip():
+        for ip, future in list(geoip_pending.items()):
+            if not future.done():
+                continue
+            try:
+                info = future.result()
+            except Exception:
+                info = {"country": "Unknown", "city": "Remote", "asn": "Unknown ASN"}
+            geoip_results[ip] = info
+            for flow in geoip_waiters.pop(ip, ()):
+                flow.l7_metadata.pop("geoip_pending", None)
+                flow.l7_metadata["geoip"] = info
+            geoip_pending.pop(ip, None)
+        # Keep this enrichment cache bounded for long-running sensors.
+        while len(geoip_results) > 4096:
+            geoip_results.pop(next(iter(geoip_results)))
+
+    def should_evaluate_conversation(delta) -> bool:
+        """Throttle expensive stateful checks without losing control events."""
+        key = delta.key
+        event_time = float(delta.event_time)
+        immediate = (
+            int(delta.generation) <= 1
+            or int(delta.syn_delta) > 0
+            or int(delta.syn_ack_delta) > 0
+            or int(delta.rst_delta) > 0
+        )
+        previous = last_conversation_evaluation.get(key)
+        if immediate or previous is None or event_time - previous >= 1.0:
+            last_conversation_evaluation[key] = event_time
+            if len(last_conversation_evaluation) > 32_768:
+                oldest = sorted(
+                    last_conversation_evaluation.items(), key=lambda item: item[1]
+                )[:8_192]
+                for old_key, _old_time in oldest:
+                    last_conversation_evaluation.pop(old_key, None)
+            return True
+        return False
 
     last_snapshot_time = time.time()
 
@@ -363,6 +463,7 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
     try:
         while True:
             current_time = time.time()
+            drain_geoip()
             if current_time - last_baseline_purge >= 86400:
                 db.purge_inactive_feature_baselines(as_of=current_time)
                 last_baseline_purge = current_time
@@ -479,13 +580,45 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                         })
                         dirty_flow_ids[event.interface].add(reverse_flow_id)
                     
-                    # Live forensic processing: extract identities and write to SQLite
-                    if event.raw:
+                    # Live forensic processing: extract identities and write to SQLite.
+                    # Flow accounting above remains lossless; deep packet work
+                    # is bounded so busy encrypted sessions cannot starve it.
+                    if event.raw and _should_deep_inspect_live_packet(event, flow):
                         try:
                             from scapy.all import Ether as EtherParse
                             raw_packet = EtherParse(event.raw)
                             stream_alerts = []
-                            stream_snapshot = streams.update(raw_packet, event)
+                            payload = application_payload(raw_packet, maximum=16 * 1024 * 1024)
+                            has_live_evidence = forensics.has_live_evidence(raw_packet, payload=payload)
+                            packet_evidence = has_live_evidence
+                            if (
+                                packet_evidence
+                                and raw_packet.haslayer(TCP)
+                                and payload
+                            ):
+                                # Inspect connection starts and suspicious or
+                                # protocol-shaped payloads, but do not run the
+                                # full packet plugin set on every bulk TLS or
+                                # HTTP body segment. The stream tracker below
+                                # remains lossless within its bounded spool.
+                                sample = payload[:8192].lower()
+                                evidence_markers = (
+                                    b"user ", b"pass ", b"password", b"authorization",
+                                    b"ntlmssp", b"ssh-", b"get ", b"post ", b"http/",
+                                    b"\x16\x03", b"mqtt", b"modbus", b"coap", b"mz",
+                                )
+                                if flow.live_forensics_payloads >= 8 and not any(
+                                    marker in sample for marker in evidence_markers
+                                ):
+                                    packet_evidence = False
+                                else:
+                                    flow.live_forensics_payloads += 1
+                            stream_snapshot = (
+                                streams.update(raw_packet, event)
+                                if has_live_evidence and raw_packet.haslayer(TCP)
+                                and bool(raw_packet[TCP].payload)
+                                else None
+                            )
                             if stream_snapshot is not None:
                                 stream_alerts = forensics.process_live_stream(
                                     flow, stream_snapshot.payload, stream_snapshot.direction,
@@ -498,13 +631,17 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                                 alert.type for alert in stream_alerts
                                 if alert.type in {"CLEARTEXT_CREDENTIALS", "CLEARTEXT_SECRET"}
                             }
-                            identities, live_alerts = forensics.process_live_packet(
-                                raw_packet, flow, capture_interface=event.interface,
-                                capture_session_id=event.session_id,
-                                capture_backend=event.backend,
-                                persist_identity=False,
-                                suppressed_alert_types=suppressed_types,
-                            )
+                            if packet_evidence:
+                                identities, live_alerts = forensics.process_live_packet(
+                                    raw_packet, flow, capture_interface=event.interface,
+                                    capture_session_id=event.session_id,
+                                    capture_backend=event.backend,
+                                    persist_identity=False,
+                                    suppressed_alert_types=suppressed_types,
+                                    payload_override=payload,
+                                )
+                            else:
+                                identities, live_alerts = {}, []
                             # Merge identities into flow metadata
                             if identities:
                                 flow.l7_metadata.update({k: v for k, v in identities.items() if v})
@@ -520,8 +657,8 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                             _increment_metric(metrics, "detector_errors")
                     
                     # Enrich new flows
-                    if "geoip" not in flow.l7_metadata:
-                        flow.l7_metadata["geoip"] = get_geoip_info(event.dst_ip)
+                    if "geoip" not in flow.l7_metadata and "geoip_pending" not in flow.l7_metadata:
+                        schedule_geoip(flow, event.dst_ip)
 
                 conversation_metadata_for_detection = dict(event.l7_info or {})
                 if config.monitoring_mode in ["GLOBAL", "HYBRID"]:
@@ -531,16 +668,17 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
                 conversation_delta = conversations.enrich_delta(
                     conversation_delta, conversation_metadata_for_detection
                 )
-                forensics.process_live_conversation(
-                    conversation_delta,
-                    source=(capture_origin or {}).get("source") or (
-                        f"live_{event.interface}#{event.session_id[:12]}"
-                        if event.session_id else f"live_{event.interface}"
-                    ),
-                    capture_interface=event.interface,
-                    capture_session_id=event.session_id,
-                    capture_backend=event.backend,
-                )
+                if should_evaluate_conversation(conversation_delta):
+                    forensics.process_live_conversation(
+                        conversation_delta,
+                        source=(capture_origin or {}).get("source") or (
+                            f"live_{event.interface}#{event.session_id[:12]}"
+                            if event.session_id else f"live_{event.interface}"
+                        ),
+                        capture_interface=event.interface,
+                        capture_session_id=event.session_id,
+                        capture_backend=event.backend,
+                    )
 
                 # PER_DEVICE MODE
                 if config.monitoring_mode in ["PER_DEVICE", "HYBRID"]:
@@ -611,6 +749,19 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
 
             # Sliding Window Snapshot
             if current_time - last_snapshot_time >= config.step_size:
+                # Snapshot scoring and persistence are intentionally deferred
+                # while capture is under pressure. This prevents a dashboard
+                # refresh from competing with packet processing and turning a
+                # temporary burst into queue loss. The next quiet iteration
+                # builds the complete window from the in-memory aggregates.
+                try:
+                    snapshot_queue_depth = int(packet_queue.qsize())
+                except (NotImplementedError, OSError):
+                    snapshot_queue_depth = 0
+                snapshot_pressure_limit = max(512, int(config.packet_queue_size * 0.25))
+                if snapshot_queue_depth > snapshot_pressure_limit:
+                    time.sleep(0.01)
+                    continue
 
                 window_start = current_time - config.window_size
                 window_end = current_time
@@ -711,5 +862,9 @@ def flow_worker(packet_queue, snapshot_queue, config, control_queue=None, eviden
             pass
         try:
             db.close()
+        except Exception:
+            pass
+        try:
+            geoip_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass

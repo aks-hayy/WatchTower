@@ -74,6 +74,7 @@ class AuthModule:
         table.add_column("Value")
         table.add_row("State", str(result["state"]).upper())
         table.add_row("Authentication", "enabled" if result["auth_enabled"] else "disabled")
+        table.add_row("Trust store", str(self.db.db_path))
         table.add_row("Session lifetime", "8 hours absolute")
         table.add_row("Idle timeout", "none")
         table.add_row("Passkeys", str(result["credential_count"]))

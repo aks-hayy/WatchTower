@@ -1,6 +1,7 @@
 import sys
 import argparse
 import multiprocessing
+import os
 from pathlib import Path
 import time
 from core.context import context
@@ -140,6 +141,7 @@ def main():
     # Daemon Control
     daemon_parser = subparsers.add_parser("daemon", help="Manage background service")
     daemon_parser.add_argument("action", choices=["start", "stop", "restart", "repair", "status", "bg"])
+    daemon_parser.add_argument("--force", action="store_true", help="Terminate only a verified stale WatchTower daemon during repair")
     
     # Background Mode (Global)
     bg_parser = subparsers.add_parser("background", help="Interactive background mode setup")
@@ -369,7 +371,14 @@ def main():
     diagnostic_command = args.command == "doctor" or (
         args.command == "graph" and getattr(args, "graph_command", None) == "status"
     )
-    if args.command not in {"auth", "ui"} and not diagnostic_command:
+    sensor_service_operation = os.environ.get("WATCHTOWER_SENSOR_SERVICE") == "1" and (
+        args.command in {"start", "stop", "daemon"}
+        or (
+            args.command == "mesh"
+            and getattr(args, "mesh_command", None) == "agent"
+        )
+    )
+    if args.command not in {"auth", "ui"} and not diagnostic_command and not sensor_service_operation:
         from core.cli.modules.auth import AuthModule
 
         auth_module = AuthModule(console=console)
@@ -547,7 +556,7 @@ def main():
             if result.get("status") == "error":
                 raise SystemExit(1)
         elif args.action == "repair":
-            result = DaemonManager.repair_state()
+            result = DaemonManager.repair_state(force=args.force)
             console.print_json(data=result)
             if result.get("status") == "blocked":
                 raise SystemExit(1)

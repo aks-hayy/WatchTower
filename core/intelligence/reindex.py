@@ -31,7 +31,12 @@ class EnrichmentReindexer:
         query = session.query(Flow)
         if source:
             if source == "live":
-                query = query.filter(Flow.source.like("live%"))
+                # Local and mesh sensors both project live traffic. Mesh
+                # ingestion prefixes the originating source with
+                # ``mesh:<node>:``; keep rebuilds and CLI enrichment aligned
+                # with the normal live projections.
+                from core.storage.database import _live_source_clause
+                query = query.filter(_live_source_clause(Flow.source))
             elif source.startswith("live_") and "#" not in source:
                 query = query.filter(Flow.source.like(f"{source}#%"))
             else:
@@ -140,12 +145,49 @@ class EnrichmentReindexer:
                     row.l7_metadata = json.dumps(metadata, sort_keys=True)
 
             entity_rows = session.query(Entity).filter(Entity.ip.in_(ip_set)).all() if ip_set else []
+            existing_entity_ips = {str(entity.ip) for entity in entity_rows}
+            observed_by_ip: Dict[str, Dict[str, Any]] = {}
+            for flow in flow_dicts:
+                observed_at = float(flow.get("last_seen") or flow.get("start_time") or time.time())
+                for endpoint_ip in (flow.get("src_ip"), flow.get("dst_ip")):
+                    endpoint_ip = str(endpoint_ip or "").strip()
+                    if not endpoint_ip or endpoint_ip in existing_entity_ips:
+                        continue
+                    prior = observed_by_ip.get(endpoint_ip)
+                    if prior is None:
+                        observed_by_ip[endpoint_ip] = {
+                            "ip": endpoint_ip,
+                            "device_type": "network_endpoint",
+                            "asset_role": "unknown",
+                            "confidence_score": 0.0,
+                            "identity_source": "flow_observation",
+                            "source": flow.get("source") or source or "live",
+                            "first_seen": observed_at,
+                            "last_seen": observed_at,
+                        }
+                    else:
+                        prior["first_seen"] = min(prior["first_seen"], observed_at)
+                        prior["last_seen"] = max(prior["last_seen"], observed_at)
+            # Compatibility entities make CLI/API dive addressable. They are
+            # explicitly low-confidence and contain no invented identity.
+            if observed_by_ip and not dry_run:
+                session.add_all(Entity(**values) for values in observed_by_ip.values())
+                session.flush()
+                entity_rows = session.query(Entity).filter(Entity.ip.in_(ip_set)).all()
             for entity in entity_rows:
-                endpoint = evidence.endpoint(str(entity.ip))
+                entity_ip = str(entity.ip if hasattr(entity, "ip") else entity.get("ip"))
+                endpoint = evidence.endpoint(entity_ip)
                 trusted = (endpoint.get("mac") or {}).get("mac")
-                remote = endpoint["scope"] == "global" and not endpoint["is_local_endpoint"]
-                should_clear_role = remote and entity.asset_role in DERIVED_REMOTE_ROLES
-                if entity.mac != trusted or (not trusted and entity.vendor) or should_clear_role:
+                if hasattr(entity, "asset_role"):
+                    remote = endpoint["scope"] == "global" and not endpoint["is_local_endpoint"]
+                    should_clear_role = remote and entity.asset_role in DERIVED_REMOTE_ROLES
+                    current_mac = entity.mac
+                    current_vendor = entity.vendor
+                else:
+                    should_clear_role = False
+                    current_mac = None
+                    current_vendor = None
+                if current_mac != trusted or (not trusted and current_vendor) or should_clear_role:
                     changed_entities += 1
                     if not dry_run:
                         entity.mac = trusted

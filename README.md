@@ -96,10 +96,18 @@ interface and presses Start in either surface. Raw captures and local evidence
 remain on the host by default.
 
 ```powershell
-.\watchtower.ps1 status
+.\watchtower.ps1 ui       # UI only
+.\watchtower.ps1 cli      # CLI only
 .\watchtower.ps1 stop
-.\watchtower.ps1 repair  # re-enroll only the local sensor bridge
+.\watchtower.ps1 uninstall
 ```
+
+`start` launches the complete local runtime. `ui` and `cli` launch only the
+requested operator surface while reusing the same runtime. `stop` drains
+capture and shuts down WatchTower-owned services. `uninstall` stops the
+runtime and removes generated dependencies, containers, volumes, and local
+sensor state after an explicit confirmation. Advanced repair and diagnostics
+remain available under `scripts/`.
 
 The sensor's private runtime is stored under
 `%LOCALAPPDATA%\WatchTower\hybrid-sensor`; the controller state remains in the
@@ -108,14 +116,19 @@ controller session: unlocking either one unlocks the other, and locking either
 one locks both. See [hybrid containers](docs/containers.md#windows-hybrid-runtime)
 for scope and recovery details.
 
+Use the companion CLI window opened by `watchtower.ps1 start` for controller
+operations and the UI PIN. The standalone `.venv\Scripts\tower.exe` process is
+sensor-scoped in the hybrid deployment, so its local trust store is intentionally
+separate from the controller PIN.
+
 ## Start using WatchTower
 
 Windows:
 
 ```powershell
-.\.venv\Scripts\tower.exe sources
-.\.venv\Scripts\tower.exe start -i "Ethernet"
-.\.venv\Scripts\tower.exe ui
+.\watchtower.ps1 start
+.\watchtower.ps1 ui
+.\watchtower.ps1 cli
 ```
 
 Linux:

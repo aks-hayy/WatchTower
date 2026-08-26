@@ -16,13 +16,14 @@ def test_version_source_reports_watchtower_2_0_rc1():
 
 
 def test_windows_paths_use_localappdata_state_root(tmp_path):
+    localappdata = PureWindowsPath("C:/") / "Users" / "WatchTowerTest" / "AppData" / "Local"
     paths = RuntimePaths.from_environment(
-        environment={"LOCALAPPDATA": r"C:\\Users\\Analyst\\AppData\\Local"},
+        environment={"LOCALAPPDATA": str(localappdata)},
         platform_name="Windows",
         repository_root=tmp_path,
     )
 
-    assert paths.data == PureWindowsPath(r"C:\Users\Analyst\AppData\Local\WatchTower")
+    assert paths.data == localappdata / "WatchTower"
     assert paths.config == paths.data / "config"
     assert paths.cache == paths.data / "cache"
     assert paths.logs == paths.data / "logs"

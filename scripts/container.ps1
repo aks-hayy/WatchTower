@@ -35,6 +35,17 @@ function Require-Docker {
     }
     & docker compose version | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose is unavailable. Start Docker Desktop and retry." }
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & docker info --format "{{.ServerVersion}}" 2>$null | Out-Null
+        $engineReady = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if (-not $engineReady) {
+        throw "Docker Desktop is installed but its Linux engine is not running. Start Docker Desktop, wait until it reports 'Engine running', then retry. Verify with: docker info"
+    }
 }
 
 function New-Secret([string]$Path, [int]$Bytes = 32) {

@@ -29,7 +29,10 @@ class DaemonManager:
             return True
 
         # Not running, need to start it
-        if not context.is_admin:
+        # The hybrid sensor daemon is a local service coordinator. It does not
+        # need an elevated operator shell just to bind its loopback control
+        # socket; capture privileges are enforced by the selected backend.
+        if not context.is_admin and os.environ.get("WATCHTOWER_SENSOR_SERVICE") != "1":
             if silent: return False
             print("[Watchtower] Daemon is not running and requires Administrator privileges to start.")
             print("[Watchtower] Please grant permission in the UAC prompt...")
@@ -66,10 +69,21 @@ class DaemonManager:
             DaemonManager.get_or_create_key()
             
             if sys.platform == 'win32':
+                # CREATE_NEW_CONSOLE can inherit a broken interactive console
+                # across UAC/PowerShell boundaries and leave the caller stuck
+                # inside CreateProcess. The daemon is a background service;
+                # detach its stdio and give it its own process group instead.
+                creation_flags = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                )
                 subprocess.Popen(
                     [sys.executable, daemon_script],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    cwd=context.root_dir
+                    creationflags=creation_flags,
+                    cwd=context.root_dir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
             else:
                 subprocess.Popen(
@@ -96,15 +110,17 @@ class DaemonManager:
     @staticmethod
     def get_or_create_key():
         """Ensures a fresh daemon key is present."""
-        if not os.path.exists(context.daemon_key_file):
-            os.makedirs(context.data_dir, exist_ok=True)
-            new_key = uuid.uuid4().hex
-            with open(context.daemon_key_file, "w") as f:
-                f.write(new_key)
-            return new_key
-        
-        with open(context.daemon_key_file, "r") as f:
-            return f.read().strip()
+        os.makedirs(context.data_dir, exist_ok=True)
+        try:
+            with open(context.daemon_key_file, "x", encoding="ascii") as handle:
+                handle.write(uuid.uuid4().hex)
+        except FileExistsError:
+            # Multiple launcher/worker paths can initialize the daemon at the
+            # same time on Windows. Exclusive creation prevents one process
+            # from replacing a key another already-bound listener is using.
+            pass
+        with open(context.daemon_key_file, "r", encoding="ascii") as handle:
+            return handle.read().strip()
 
     @staticmethod
     def stop_daemon():
@@ -130,8 +146,8 @@ class DaemonManager:
         return {"status": "restarted" if started else "error", "running": bool(started)}
 
     @staticmethod
-    def repair_state():
-        """Remove only a verified stale daemon identity record."""
+    def repair_state(force=False):
+        """Repair stale daemon state, optionally stopping one verified daemon PID."""
         path = Path(context.data_dir) / "daemon.instance.json"
         status = DaemonClient().get_status()
         if status.get("running"):
@@ -140,7 +156,46 @@ class DaemonManager:
                 "daemon_instance_id": status.get("daemon_instance_id"),
                 "pid": status.get("pid"),
             }
+
+        listener_pids = {
+            int(connection.pid)
+            for connection in psutil.net_connections(kind="tcp")
+            if connection.pid
+            and connection.status == psutil.CONN_LISTEN
+            and connection.laddr
+            and int(connection.laddr.port) == int(context.daemon_port)
+        }
+
+        def terminate_listener(process, pid, executable):
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            return {
+                "status": "repaired",
+                "message": "Terminated the verified stale WatchTower daemon listener",
+                "pid": pid,
+                "executable": executable,
+            }
+
         if not path.exists():
+            if force:
+                for listener_pid in sorted(listener_pids):
+                    try:
+                        process = psutil.Process(listener_pid)
+                        executable = str(Path(process.exe()).resolve())
+                        working_directory = str(Path(process.cwd()).resolve())
+                        verified_owner = (
+                            Path(executable).name.casefold() in {"python.exe", "pythonw.exe"}
+                            and working_directory.casefold() == str(Path(context.root_dir).resolve()).casefold()
+                        )
+                        if not verified_owner:
+                            continue
+                        return terminate_listener(process, listener_pid, executable)
+                    except (psutil.Error, OSError, ValueError):
+                        continue
             return {"status": "clean", "message": "No stale daemon state was present"}
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
@@ -150,11 +205,43 @@ class DaemonManager:
         if pid and psutil.pid_exists(pid):
             try:
                 process = psutil.Process(pid)
+                if pid not in listener_pids:
+                    path.unlink(missing_ok=True)
+                    return {
+                        "status": "repaired",
+                        "message": "Removed stale daemon identity; recorded process was not listening on the daemon port",
+                        "pid": pid,
+                    }
+                executable = str(Path(process.exe()).resolve())
+                expected_executable = str(Path(state.get("executable") or "").resolve())
+                working_directory = str(Path(process.cwd()).resolve())
+                expected_directory = str(Path(context.root_dir).resolve())
+                same_recorded_interpreter = (
+                    Path(executable).name.casefold() == Path(expected_executable).name.casefold()
+                    and Path(executable).name.casefold() in {"python.exe", "pythonw.exe"}
+                )
+                verified_owner = (
+                    bool(expected_executable)
+                    and (
+                        executable.casefold() == expected_executable.casefold()
+                        or same_recorded_interpreter
+                    )
+                    and working_directory.casefold() == expected_directory.casefold()
+                )
+                if force and verified_owner:
+                    result = terminate_listener(process, pid, executable)
+                    path.unlink(missing_ok=True)
+                    result["message"] = "Terminated the verified stale WatchTower daemon and removed its identity record"
+                    return result
                 return {
                     "status": "blocked",
-                    "message": "The recorded process is still alive but is not answering WatchTower commands",
+                    "message": (
+                        "The recorded process is still alive but is not answering WatchTower commands"
+                        if verified_owner else
+                        "The recorded PID is alive but could not be verified as the recorded WatchTower daemon"
+                    ),
                     "pid": pid,
-                    "executable": process.exe(),
+                    "executable": executable,
                 }
             except (psutil.Error, OSError):
                 return {

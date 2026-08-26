@@ -14,6 +14,8 @@ from core.packet_engine.schemas import PacketEvent
 class StreamDirection:
     segments: Dict[int, bytes] = field(default_factory=dict)
     truncated: bool = False
+    updates: int = 0
+    last_emitted_update: int = 0
 
 
 @dataclass
@@ -36,11 +38,21 @@ class LiveStreamSnapshot:
 
 class LiveTCPStreamTracker:
     def __init__(self, maximum_streams: int = 4096, maximum_bytes: int = 1024 * 1024,
-                 maximum_segments: int = 2048):
+                 maximum_segments: int = 128, emit_interval: int = 8):
         self.maximum_streams = max(64, int(maximum_streams))
         self.maximum_bytes = max(8192, int(maximum_bytes))
         self.maximum_segments = max(32, int(maximum_segments))
+        self.emit_interval = max(1, int(emit_interval))
         self.states: Dict[ConversationKey, LiveStreamState] = {}
+
+    @staticmethod
+    def _has_evidence_marker(payload: bytes) -> bool:
+        sample = bytes(payload[:8192]).lower()
+        return any(marker in sample for marker in (
+            b"user ", b"pass ", b"password", b"authorization", b"ntlmssp",
+            b"ssh-", b"get ", b"post ", b"http/", b"\x16\x03", b"mqtt",
+            b"modbus", b"coap", b"mz",
+        ))
 
     def update(self, packet, event: PacketEvent) -> Optional[LiveStreamSnapshot]:
         if TCP not in packet:
@@ -59,10 +71,36 @@ class LiveTCPStreamTracker:
             return None
         if len(stream.segments) >= self.maximum_segments and sequence not in stream.segments:
             stream.truncated = True
-            return None
+            # A bounded stream may still expose a newly observed protocol
+            # marker.  The direct payload is safe evidence, while retaining
+            # the existing segment map prevents unbounded memory growth.
+            if not self._has_evidence_marker(payload):
+                return None
+            return LiveStreamSnapshot(
+                flow_id=(event.src_ip, event.dst_ip, event.src_port, event.dst_port, event.protocol),
+                direction=direction, payload=payload, timestamp=float(event.timestamp),
+                truncated=True,
+            )
         stream.segments[sequence] = payload
+        stream.updates += 1
+
+        # Reassembly is deliberately sparse for bulk traffic.  The first
+        # sixteen segments preserve fragmented handshakes/credentials; after
+        # that, marked payloads and periodic samples are sufficient for the
+        # bounded live stream detectors without sorting the whole stream for
+        # every packet.
+        segment_count = len(stream.segments)
+        marked = self._has_evidence_marker(payload)
+        if (
+            segment_count > 16
+            and not marked
+            and stream.updates - stream.last_emitted_update < self.emit_interval
+        ):
+            self._evict_if_needed()
+            return None
         reassembled, truncated = self._reassemble(stream.segments)
         stream.truncated = stream.truncated or truncated
+        stream.last_emitted_update = stream.updates
         self._evict_if_needed()
         return LiveStreamSnapshot(
             flow_id=(event.src_ip, event.dst_ip, event.src_port, event.dst_port, event.protocol),

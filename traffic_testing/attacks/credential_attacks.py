@@ -20,11 +20,11 @@ from traffic_testing.config import TARGET_IP, FTP_PORT, HTTP_PORT, AUTH_FAILURE_
 
 class FTPCredentialExposure(BaseAttack):
     CREDENTIALS = [
-        ("admin", "P@ssw0rd123"),
-        ("ftpuser", "ftp_password_2024"),
-        ("backup", "Backup!Secure#99"),
-        ("test", "test1234"),
-        ("deploy", "D3pl0y!Secret"),
+        ("fixture-user-1", "WATCHTOWER_TEST_PLACEHOLDER_1"),
+        ("fixture-user-2", "WATCHTOWER_TEST_PLACEHOLDER_2"),
+        ("fixture-user-3", "WATCHTOWER_TEST_PLACEHOLDER_3"),
+        ("fixture-user-4", "WATCHTOWER_TEST_PLACEHOLDER_4"),
+        ("fixture-user-5", "WATCHTOWER_TEST_PLACEHOLDER_5"),
     ]
 
     def __init__(self, target_ip: str = TARGET_IP):
@@ -83,10 +83,10 @@ class FTPCredentialExposure(BaseAttack):
 
 class HTTPBasicAuthExposure(BaseAttack):
     CREDENTIALS = [
-        ("admin", "admin123"),
-        ("user", "password"),
-        ("service", "api_key_abcdef123456"),
-        ("backup", "backup!secret#2024"),
+        ("fixture-user-1", "WATCHTOWER_TEST_PLACEHOLDER_1"),
+        ("fixture-user-2", "WATCHTOWER_TEST_PLACEHOLDER_2"),
+        ("fixture-user-3", "WATCHTOWER_TEST_PLACEHOLDER_3"),
+        ("fixture-user-4", "WATCHTOWER_TEST_PLACEHOLDER_4"),
     ]
 
     def __init__(self, target_ip: str = TARGET_IP):
@@ -141,9 +141,9 @@ class HTTPPasswordParamExposure(BaseAttack):
     def execute(self) -> None:
         import urllib.parse
         params_list = [
-            {"user": "admin", "password": "P@ssw0rd!"},
-            {"login": "root", "passwd": "toor1234"},
-            {"username": "test", "pass": "testing!"},
+            {"user": "fixture-user-1", "password": "WATCHTOWER_TEST_PLACEHOLDER_1"},
+            {"login": "fixture-user-2", "passwd": "WATCHTOWER_TEST_PLACEHOLDER_2"},
+            {"username": "fixture-user-3", "pass": "WATCHTOWER_TEST_PLACEHOLDER_3"},
         ]
         for params in params_list:
             if self._stop_event.is_set():
@@ -186,8 +186,8 @@ class HTTPPasswordParamExposure(BaseAttack):
 
 class SMTPCredentialExposure(BaseAttack):
     CREDENTIALS = [
-        ("relay@corp.local", "RelayP@ss2024"),
-        ("scanner@corp.local", "Scan!Secure#1"),
+        ("fixture-user-1-at-example-invalid", "WATCHTOWER_TEST_PLACEHOLDER_1"),
+        ("fixture-user-2-at-example-invalid", "WATCHTOWER_TEST_PLACEHOLDER_2"),
     ]
 
     def __init__(self, target_ip: str = TARGET_IP):
@@ -247,8 +247,8 @@ class SMTPCredentialExposure(BaseAttack):
 
 
 class AuthFailureBurst(BaseAttack):
-    USERNAMES = ["admin", "root", "administrator", "user", "test", "backup", "svc", "deploy"]
-    PASSWORDS = ["wrong1", "wrong2", "wrong3", "wrong4", "wrong5"]
+    USERNAMES = ["fixture-user-1", "fixture-user-2", "fixture-user-3", "fixture-user-4", "fixture-user-5", "fixture-user-6", "fixture-user-7", "fixture-user-8"]
+    PASSWORDS = ["WATCHTOWER_TEST_PLACEHOLDER_1", "WATCHTOWER_TEST_PLACEHOLDER_2", "WATCHTOWER_TEST_PLACEHOLDER_3", "WATCHTOWER_TEST_PLACEHOLDER_4", "WATCHTOWER_TEST_PLACEHOLDER_5"]
 
     def __init__(self, target_ip: str = TARGET_IP, port: int = 22, protocol: str = "SSH"):
         super().__init__("auth_failure_burst", "credential", target_ip)

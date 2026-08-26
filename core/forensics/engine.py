@@ -116,8 +116,76 @@ class ForensicsEngine:
         self._native_analysis_id = None
         self._native_persistence_failed = False
         self._fast_tls_payloads = set()
+        # Live capture is a hot path. Plugin instances are immutable for the
+        # lifetime of an engine, so keep the enabled, ordered subsets here
+        # instead of rebuilding and sorting them for every packet.
+        self._live_parsers = tuple(parser for parser in self.plugin_loader.get_parsers() if parser.enabled)
+        self._live_parser_port_filters = {
+            id(parser): frozenset(
+                int(port) for port in getattr(parser, "watched_ports", ())
+                if int(port) >= 0
+            )
+            for parser in self._live_parsers
+        }
+        enabled_detectors = tuple(
+            detector for detector in self.plugin_loader.get_detectors() if detector.enabled
+        )
+        detector_order = lambda detector: (
+            getattr(detector.manifest, "detector_id", "") == "watchtower.application.abuse",
+            getattr(detector.manifest, "detector_id", ""),
+        )
+        self._live_packet_detectors = tuple(sorted(
+            (
+                detector for detector in enabled_detectors
+                if getattr(detector, "manifest", None) is None
+                or "packet" in detector.manifest.input_kinds
+            ),
+            key=detector_order,
+        ))
+        self._live_stream_detectors = tuple(sorted(
+            (
+                detector for detector in enabled_detectors
+                if getattr(detector, "manifest", None) is not None
+                and "stream" in detector.manifest.input_kinds
+            ),
+            key=detector_order,
+        ))
+        self._live_flow_detectors = tuple(
+            detector for detector in enabled_detectors
+            if getattr(detector, "manifest", None) is not None
+            and "flow" in detector.manifest.input_kinds
+        )
+        self._live_conversation_detectors = tuple(
+            detector for detector in enabled_detectors
+            if getattr(detector, "manifest", None) is not None
+            and "conversation" in detector.manifest.input_kinds
+        )
         from core.survey.probe_registry import ProbeRegistry
         self._probe_registry = ProbeRegistry(self.data_dir)
+
+    @staticmethod
+    def has_live_evidence(packet, payload: bytes = None) -> bool:
+        """Return whether a frame can change packet-level forensic state.
+
+        TCP handshakes, empty UDP datagrams, and pure ACK/RST packets are
+        already represented by the conversation tracker. Avoiding payload
+        parsers and packet detectors for those frames is important on busy
+        links, while ARP/NDP/ICMP control traffic remains eligible.
+        """
+        if packet is None:
+            return False
+        if scapy.ARP in packet:
+            return True
+        for layer_name in (
+            "ICMP", "ICMPv6ND_NS", "ICMPv6ND_NA", "ICMPv6ND_RA",
+            "ICMPv6EchoRequest", "ICMPv6EchoReply",
+        ):
+            layer = getattr(scapy, layer_name, None)
+            if layer is not None and packet.haslayer(layer):
+                return True
+        if payload is not None:
+            return bool(payload)
+        return bool(application_payload(packet, maximum=1))
 
     def get_vendor(self, mac: str) -> Optional[str]:
         """Simple OUI lookup for common hardware vendors."""
@@ -226,7 +294,7 @@ class ForensicsEngine:
     def process_live_packet(self, packet, flow: FlowAggregate = None, capture_interface: str = None,
                             capture_session_id: str = None, capture_backend: str = None,
                             persist_identity: bool = True,
-                            suppressed_alert_types=None) -> Tuple[Dict, List[ForensicAlert]]:
+                            suppressed_alert_types=None, payload_override: bytes = None) -> Tuple[Dict, List[ForensicAlert]]:
         """Lightweight per-packet processing for live capture.
         
         Extracts identities and runs live detection rules.
@@ -260,6 +328,27 @@ class ForensicsEngine:
         if watchtower_probe and flow is not None:
             flow.l7_metadata["generated_by"] = "WatchTower"
 
+        # Extract the bounded application payload once. Every built-in parser
+        # accepts the context contract, so this avoids repeating Scapy payload
+        # traversal for every parser on the same frame.
+        shared_payload = (
+            payload_override if isinstance(payload_override, bytes)
+            else application_payload(packet, maximum=16 * 1024 * 1024)
+        )
+        parser_context = {
+            "application_payload": shared_payload,
+            "transport": packet[scapy.TCP] if scapy.TCP in packet else (
+                packet[scapy.UDP] if scapy.UDP in packet else None
+            ),
+        }
+        packet_ports = {
+            int(packet[layer].sport) for layer in (scapy.TCP, scapy.UDP)
+            if layer in packet
+        } | {
+            int(packet[layer].dport) for layer in (scapy.TCP, scapy.UDP)
+            if layer in packet
+        }
+
         # 1. Run Parsers
         all_found_alerts = []
         identities = {
@@ -273,10 +362,14 @@ class ForensicsEngine:
             
         tls_info = {}
         protocol_metadata = {}
-        for parser in self.plugin_loader.get_parsers():
-            if not parser.enabled: continue
+        for parser in self._live_parsers:
+            watched_ports = self._live_parser_port_filters.get(id(parser), ())
+            if watched_ports and watched_ports.isdisjoint(packet_ports):
+                continue
+            if not self._fast_parser_applies(parser, packet, shared_payload):
+                continue
             try:
-                res = parser.parse(packet)
+                res = parser.parse(packet, context=parser_context)
                 if "identities" in res:
                     identities.update(self.identity_resolver.observe(
                         src_ip, parser.name, res["identities"], float(packet.time)
@@ -303,21 +396,11 @@ class ForensicsEngine:
 
         # 2. Run Detectors
         os_info = "Unknown"
-        packet_detectors = [
-            detector for detector in self.plugin_loader.get_detectors()
-            if detector.enabled
-            and (
-                getattr(detector, "manifest", None) is None
-                or "packet" in detector.manifest.input_kinds
-            )
-        ]
-        packet_detectors.sort(key=lambda detector: (
-            getattr(detector.manifest, "detector_id", "") == "watchtower.application.abuse",
-            getattr(detector.manifest, "detector_id", ""),
-        ))
         claimed_protocol = False
-        for detector in packet_detectors:
+        for detector in self._live_packet_detectors:
             if watchtower_probe: continue
+            if not self._fast_detector_applies(detector, packet, shared_payload):
+                continue
             try:
                 if hop_limit is not None and hasattr(detector, 'detect_os'):
                     res_os = detector.detect_os(hop_limit)
@@ -327,12 +410,13 @@ class ForensicsEngine:
                     packet=packet, flow=flow,
                     domain=protocol_metadata.get("dns_domain") or identities.get("remote_hostname"),
                     metadata=protocol_metadata,
+                    application_payload=shared_payload,
                     claimed_protocol=claimed_protocol,
                 )
                 for alert in alerts:
                     if alert.type == "CLEARTEXT_CREDENTIALS":
                         claimed_protocol = True
-                    if alert.type in set(suppressed_alert_types or ()):
+                    if alert.type in (suppressed_alert_types or ()):
                         continue
                     alert.timestamp = float(packet.time)
                     self._add_flow_evidence(alert, flow)
@@ -384,14 +468,7 @@ class ForensicsEngine:
                             add_to_report: bool = False) -> List[ForensicAlert]:
         """Run stream plugins in deterministic protocol-specific-first order."""
         found = []
-        detectors = [
-            detector for detector in self.plugin_loader.get_detectors()
-            if detector.enabled and "stream" in getattr(getattr(detector, "manifest", None), "input_kinds", ())
-        ]
-        detectors.sort(key=lambda detector: (
-            getattr(detector.manifest, "detector_id", "") == "watchtower.application.abuse",
-            getattr(detector.manifest, "detector_id", ""),
-        ))
+        detectors = self._live_stream_detectors
         claimed_protocol = False
         for detector in detectors:
             try:
@@ -427,10 +504,8 @@ class ForensicsEngine:
         self._source = source
         found = []
         subject = flow.flow_id[0]
-        for detector in self.plugin_loader.get_detectors():
-            manifest = getattr(detector, "manifest", None)
-            if not detector.enabled or manifest is None or "flow" not in manifest.input_kinds:
-                continue
+        for detector in self._live_flow_detectors:
+            manifest = detector.manifest
             # Conversation-capable detectors receive every dirty generation through
             # process_live_conversation. Re-running them from snapshots duplicates
             # findings and makes detector timing depend on dashboard cadence.
@@ -468,10 +543,8 @@ class ForensicsEngine:
         self._source = source
         found = []
         subject = str(conversation.initiator[0])
-        for detector in self.plugin_loader.get_detectors():
-            manifest = getattr(detector, "manifest", None)
-            if not detector.enabled or manifest is None or "conversation" not in manifest.input_kinds:
-                continue
+        for detector in self._live_conversation_detectors:
+            manifest = detector.manifest
             try:
                 alerts = detector.detect(conversation=conversation) or []
                 for alert in alerts:
@@ -1504,20 +1577,58 @@ class ForensicsEngine:
                 self.plugin_loader.record_error(detector, e)
                 if not self.silent: print(f"Detector error {detector.name}: {e}")
 
-    def _fast_parser_applies(self, parser, packet) -> bool:
+    def _fast_parser_applies(self, parser, packet, payload=None) -> bool:
         """Avoid invoking generic Python plugins on irrelevant fast frames."""
         name = parser.name
-        payload = packet.application_payload
-        if name == "ARP and NDP Parser":
-            return packet.arp is not None or packet.protocol_number == 58
-        if name == "ICMP Metadata Parser":
-            return packet.protocol_number in {1, 58}
-        if name == "LLDP and CDP Parser":
-            return bool(packet.ethernet and packet.ethernet.type == 0x88CC) or (
-                b"\x01\x00\x0c\xcc\xcc\xcc" in packet.raw[:32]
+        payload = payload if isinstance(payload, bytes) else getattr(packet, "application_payload", b"")
+        has_arp = packet.haslayer(scapy.ARP) if hasattr(packet, "haslayer") else getattr(packet, "arp", None) is not None
+        has_ipv6 = packet.haslayer(scapy.IPv6) if hasattr(packet, "haslayer") else False
+        icmpv6 = getattr(scapy, "ICMPv6", None)
+        has_icmp = packet.haslayer(scapy.ICMP) if hasattr(packet, "haslayer") else False
+        if hasattr(packet, "haslayer"):
+            if icmpv6 is not None:
+                has_icmp = has_icmp or packet.haslayer(icmpv6)
+            has_icmp = has_icmp or any(
+                packet.haslayer(getattr(scapy, layer_name))
+                for layer_name in (
+                    "ICMPv6ND_NS", "ICMPv6ND_NA", "ICMPv6ND_RA",
+                    "ICMPv6EchoRequest", "ICMPv6EchoReply",
+                )
+                if getattr(scapy, layer_name, None) is not None
             )
+        protocol_number = getattr(packet, "protocol_number", None)
+        if protocol_number is None:
+            if hasattr(packet, "haslayer") and packet.haslayer(scapy.TCP):
+                protocol_number = 6
+            elif hasattr(packet, "haslayer") and packet.haslayer(scapy.UDP):
+                protocol_number = 17
+            elif has_icmp:
+                protocol_number = 1
+        if hasattr(packet, "haslayer"):
+            transport = packet[scapy.TCP] if packet.haslayer(scapy.TCP) else (
+                packet[scapy.UDP] if packet.haslayer(scapy.UDP) else None
+            )
+            sport = int(getattr(transport, "sport", 0) or 0) if transport is not None else 0
+            dport = int(getattr(transport, "dport", 0) or 0) if transport is not None else 0
+        else:
+            sport = int(getattr(packet, "sport", 0) or 0)
+            dport = int(getattr(packet, "dport", 0) or 0)
+        if name == "ARP and NDP Parser":
+            return has_arp or has_ipv6 and protocol_number == 58
+        if name == "ICMP Metadata Parser":
+            return protocol_number in {1, 58} or has_icmp
+        if name == "LLDP and CDP Parser":
+            ethernet = getattr(packet, "ethernet", None)
+            ether_type = getattr(ethernet, "type", None)
+            raw = getattr(packet, "raw", None)
+            if raw is None:
+                try:
+                    raw = bytes(packet)
+                except Exception:
+                    raw = b""
+            return bool(ether_type == 0x88CC) or b"\x01\x00\x0c\xcc\xcc\xcc" in raw[:32]
         if name == "QUIC Metadata Parser":
-            return packet.protocol_number == 17 and 443 in {packet.sport, packet.dport} and bool(payload[:1] and payload[0] & 0x80)
+            return protocol_number == 17 and 443 in {sport, dport} and bool(payload[:1] and payload[0] & 0x80)
         if name == "SSH Parser":
             return payload.startswith(b"SSH-")
         if name == "HTTP Parser":
@@ -1529,30 +1640,67 @@ class ForensicsEngine:
         if name == "NTLM Parser":
             return b"NTLMSSP" in payload
         if name == "TLS Parser":
-            return 443 in {packet.sport, packet.dport} and len(payload) >= 6 and payload[:2] == b"\x16\x03" and payload[5] == 0x01
+            return 443 in {sport, dport} and len(payload) >= 6 and payload[:2] == b"\x16\x03" and payload[5] == 0x01
         return True
 
-    def _fast_detector_applies(self, detector, packet) -> bool:
+    def _fast_detector_applies(self, detector, packet, payload=None) -> bool:
         """Preserve detector semantics while skipping inert encrypted frames."""
         name = detector.name
-        payload = packet.application_payload
-        ports = {packet.sport, packet.dport}
+        payload = payload if isinstance(payload, bytes) else getattr(packet, "application_payload", b"")
+        if hasattr(packet, "haslayer"):
+            transport = packet[scapy.TCP] if packet.haslayer(scapy.TCP) else (
+                packet[scapy.UDP] if packet.haslayer(scapy.UDP) else None
+            )
+            sport = int(getattr(transport, "sport", 0) or 0) if transport is not None else 0
+            dport = int(getattr(transport, "dport", 0) or 0) if transport is not None else 0
+            protocol_number = 6 if packet.haslayer(scapy.TCP) else 17 if packet.haslayer(scapy.UDP) else 1 if packet.haslayer(scapy.ICMP) else None
+            src_ip = packet[scapy.IP].src if packet.haslayer(scapy.IP) else packet[scapy.IPv6].src if packet.haslayer(scapy.IPv6) else ""
+            dst_ip = packet[scapy.IP].dst if packet.haslayer(scapy.IP) else packet[scapy.IPv6].dst if packet.haslayer(scapy.IPv6) else ""
+            flags = str(getattr(packet[scapy.TCP], "flags", "")) if packet.haslayer(scapy.TCP) else ""
+            has_arp = packet.haslayer(scapy.ARP)
+            icmpv6 = getattr(scapy, "ICMPv6", None)
+            has_icmp = packet.haslayer(scapy.ICMP)
+            if icmpv6 is not None:
+                has_icmp = has_icmp or packet.haslayer(icmpv6)
+            has_icmp = has_icmp or any(
+                packet.haslayer(getattr(scapy, layer_name))
+                for layer_name in (
+                    "ICMPv6ND_NS", "ICMPv6ND_NA", "ICMPv6ND_RA",
+                    "ICMPv6EchoRequest", "ICMPv6EchoReply",
+                )
+                if getattr(scapy, layer_name, None) is not None
+            )
+        else:
+            sport = int(getattr(packet, "sport", 0) or 0)
+            dport = int(getattr(packet, "dport", 0) or 0)
+            protocol_number = getattr(packet, "protocol_number", None)
+            src_ip = getattr(packet, "src_ip", "")
+            dst_ip = getattr(packet, "dst_ip", "")
+            flags = str(getattr(packet, "flags", ""))
+            has_arp = getattr(packet, "arp", None) is not None
+            has_icmp = protocol_number in {1, 58}
+        ports = {sport, dport}
         if name == "LAN Trust Detector":
-            return packet.arp is not None or packet.protocol_number == 58
+            return has_arp or has_icmp
         if name == "Cleartext FTP Credential Detector":
-            return packet.protocol_number == 6 and packet.dport == 21 and payload.startswith(b"PASS ")
+            # FTP credentials may arrive as USER and PASS in the same segment
+            # or across separate segments. Keep the port gate tight, but let
+            # either command reach the protocol-specific detector.
+            return protocol_number == 6 and dport == 21 and (
+                b"USER " in payload.upper() or b"PASS " in payload.upper()
+            )
         if name == "File Transfer Detector":
             return b"MZ" in payload
         if name == "IoT and OT Safety Detector":
-            return packet.protocol_number == 6 and bool(payload) and bool(ports & {502, 1883})
+            return protocol_number == 6 and bool(payload) and bool(ports & {502, 1883})
         if name == "Application Abuse Detector":
-            if packet.protocol_number in {1, 58}:
+            if protocol_number in {1, 58} or has_icmp:
                 # ICMP tunnel findings require high entropy.  A bounded
                 # diversity sample cheaply rejects ordinary echo payloads
                 # (including large padding-style payloads) before the
                 # detector performs a full entropy calculation.
                 return bool(payload) and len(set(payload[:256])) >= 16
-            if packet.protocol_number != 6:
+            if protocol_number != 6:
                 return False
             if 443 not in ports:
                 # These are the only packet-level conditions evaluated by
@@ -1575,8 +1723,13 @@ class ForensicsEngine:
                     or payload.startswith((b"SSH-", b"RFB ", b"\x03\x00"))
                 )
             if not payload:
-                return "S" in packet.flags and "A" not in packet.flags
-            connection = tuple(sorted(((packet.src_ip, packet.sport), (packet.dst_ip, packet.dport))))
+                return "S" in flags and "A" not in flags
+            # Only the initiator's first application payload is eligible for
+            # TLS mismatch analysis. A server response on port 443 must not
+            # consume the one-shot gate.
+            if dport != 443:
+                return False
+            connection = tuple(sorted(((src_ip, sport), (dst_ip, dport))))
             if connection in self._fast_tls_payloads:
                 return False
             self._fast_tls_payloads.add(connection)

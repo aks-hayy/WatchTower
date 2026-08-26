@@ -193,8 +193,13 @@ class MeshControllerService:
             return self.db.upsert_endpoint_process_observations(rows)
         if envelope.envelope_type == "flows":
             rows = []
+            observed_entities = {}
             for row in list(payload.get("items") or [])[:1000]:
                 value = dict(row)
+                # SQLite IDs are local to the originating sensor. Reusing one
+                # at the controller can collide with another node's flow;
+                # the canonical conversation/source key remains the identity.
+                value.pop("id", None)
                 original_source = str(value.get("source") or "live")
                 value["source"] = original_source if original_source.startswith(f"mesh:{node_id}:") else f"mesh:{node_id}:{original_source}"
                 value["sensor_node_id"] = node_id
@@ -204,6 +209,31 @@ class MeshControllerService:
                     value["l7_metadata"] = metadata
                 rows.append(value)
             self.db.bulk_upsert_flows(rows)
+            # The legacy Entity table is still the compatibility anchor used
+            # by CLI dive and older API projections. A mesh sensor normally
+            # sends flows and identity observations as separate envelopes; do
+            # not leave those flow endpoints invisible between the two. This
+            # projection is deliberately address-only: it never invents a
+            # device, MAC, vendor, role, or confidence from a tuple alone.
+            for value in rows:
+                observed_at = float(value.get("last_seen") or value.get("start_time") or time.time())
+                for endpoint in (value.get("src_ip"), value.get("dst_ip")):
+                    ip = str(endpoint or "").strip()
+                    if not ip:
+                        continue
+                    current = observed_entities.get(ip)
+                    if current is None or observed_at > current["last_seen"]:
+                        observed_entities[ip] = {
+                            "ip": ip,
+                            "device_type": "network_endpoint",
+                            "asset_role": "unknown",
+                            "confidence_score": 0.0,
+                            "identity_source": "flow_observation",
+                            "source": value["source"],
+                            "last_seen": observed_at,
+                        }
+            if observed_entities:
+                self.db.bulk_upsert_entities(list(observed_entities.values()))
             return len(rows)
         if envelope.envelope_type == "alerts":
             count = 0
@@ -230,6 +260,14 @@ class MeshControllerService:
                 if not value["source"].startswith(f"mesh:{node_id}:"):
                     value["source"] = f"mesh:{node_id}:{value['source']}"
                 value["sensor_node_id"] = node_id
+                # Database projections persist first_seen/last_seen while the
+                # V2 wire contract also requires the event timestamp. Use the
+                # most specific persisted timestamp available so replayed
+                # envelopes remain valid and deterministic.
+                value.setdefault(
+                    "observed_at",
+                    value.get("last_seen") or value.get("first_seen") or time.time(),
+                )
                 allowed = {name: value[name] for name in DetectionFindingV2.__dataclass_fields__ if name in value}
                 finding = DetectionFindingV2(**allowed)
                 self.db.upsert_detection_finding(finding)
@@ -268,14 +306,15 @@ class MeshControllerService:
         raise ValueError("Unsupported mesh telemetry type")
 
     def queue_command(self, node_id: str, action: str, arguments: Dict[str, Any],
-                      requested_by: str = "local-operator", ttl_seconds: int = 300) -> Dict[str, Any]:
+                      requested_by: str = "local-operator", ttl_seconds: int = 300,
+                      idempotency_key: Optional[str] = None) -> Dict[str, Any]:
         if action not in ALLOWED_COMMANDS:
             raise ValueError("Unsupported mesh command")
         node = self.db.get_sensor_node(node_id)
         if not node or node.get("status") in {"revoked", "decommissioned"}:
             raise ValueError("Mesh node is unavailable")
         normalized = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"))
-        key = sha256(f"{node_id}:{action}:{normalized}".encode("utf-8")).hexdigest()
+        key = idempotency_key or sha256(f"{node_id}:{action}:{normalized}".encode("utf-8")).hexdigest()
         return self.db.queue_mesh_command(
             str(uuid.uuid4()), node_id, action, arguments or {}, time.time() + max(30, min(int(ttl_seconds), 3600)), key,
             requested_by,

@@ -24,10 +24,21 @@ export interface AuthStatus {
 
 type RecordValue = Record<string, unknown>;
 
+export function normalizePin(value: string) {
+  return value.trim();
+}
+
+export function normalizeRecoveryCode(value: string) {
+  return value.replace(/\s+/g, "").toUpperCase();
+}
+
 async function authRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiV2Base()}/auth${path}`, {
     ...init,
-    credentials: "same-origin",
+    // The production UI normally proxies through its own origin. `include`
+    // also keeps auth working when an operator explicitly configures a
+    // loopback API origin during development.
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers || {}),
@@ -49,7 +60,7 @@ export function fetchAuthStatus() {
 export function setupAuth(pin: string, displayName: string) {
   return authRequest<{ status: AuthStatus; recovery_code: string }>("/setup", {
     method: "POST",
-    body: JSON.stringify({ mode: "secure", pin, display_name: displayName }),
+    body: JSON.stringify({ mode: "secure", pin: normalizePin(pin), display_name: displayName }),
   });
 }
 
@@ -63,7 +74,7 @@ export function disableAuthFirstRun() {
 export function unlockWithPin(pin: string) {
   return authRequest<{ status: AuthStatus }>("/pin/verify", {
     method: "POST",
-    body: JSON.stringify({ pin, client_type: "browser" }),
+    body: JSON.stringify({ pin: normalizePin(pin), client_type: "browser" }),
   });
 }
 
@@ -74,7 +85,7 @@ export function lockAuth() {
 export function stepUpWithPin(pin: string) {
   return authRequest<{ status: AuthStatus }>("/step-up", {
     method: "POST",
-    body: JSON.stringify({ pin, client_type: "browser" }),
+    body: JSON.stringify({ pin: normalizePin(pin), client_type: "browser" }),
   });
 }
 
@@ -88,7 +99,10 @@ export function setAuthEnabled(enabled: boolean, pin: string) {
 export function recoverAuth(recoveryCode: string, newPin: string) {
   return authRequest<{ status: AuthStatus; recovery_code: string }>("/recovery", {
     method: "POST",
-    body: JSON.stringify({ recovery_code: recoveryCode, new_pin: newPin }),
+    body: JSON.stringify({
+      recovery_code: normalizeRecoveryCode(recoveryCode),
+      new_pin: normalizePin(newPin),
+    }),
   });
 }
 

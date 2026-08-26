@@ -20,6 +20,15 @@ The UI opens at `http://127.0.0.1:4173` and a controller-backed `tower` CLI
 opens alongside it. Operator authentication is shared between them for the
 same eight-hour session.
 
+Use the focused launch commands when only one surface is needed:
+
+```powershell
+.\watchtower.ps1 ui
+.\watchtower.ps1 cli
+.\watchtower.ps1 stop
+.\watchtower.ps1 uninstall
+```
+
 ### Advanced native-only installation
 
 Prerequisites can be installed through the setup script when `winget` is available:

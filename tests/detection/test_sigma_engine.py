@@ -81,7 +81,7 @@ def _commit_rule(repo, rule):
     rules.mkdir(exist_ok=True)
     (rules / "rule.yml").write_text(yaml.safe_dump(rule), encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "-c", "user.name=WatchTower Tests", "-c", "user.email=tests@watchtower.local",
+    subprocess.run(["git", "-c", "user.name=WatchTower Tests", "-c", "user.email=watchtower-tests-at-example-invalid",
                     "commit", "-m", "rules"], cwd=repo, check=True, capture_output=True)
 
 

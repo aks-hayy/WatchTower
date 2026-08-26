@@ -373,3 +373,19 @@ def test_node_decommission_rejects_commands_and_preserves_node_history(tmp_path)
     with pytest.raises(ValueError, match="unavailable"):
         service.queue_command("node-test-1", "capture.stop", {"interface": "eth0"})
     db.close()
+
+
+def test_failed_command_can_be_retried_without_reusing_old_result(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    _enroll(service)
+
+    first = service.queue_command("node-test-1", "capture.start", {"interface": "eth0"})
+    service.db.complete_mesh_command(first["id"], "failed", {"message": "daemon unavailable"})
+    second = service.queue_command("node-test-1", "capture.start", {"interface": "eth0"})
+
+    assert second["id"] != first["id"]
+    assert second["status"] == "queued"
+    assert second["idempotency_key"] != first["idempotency_key"]
+    db.close()

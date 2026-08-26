@@ -161,12 +161,15 @@ Examples:
 
         from core.ui_launcher import launch_ui
 
-        launch_ui(
-            console,
-            port=port,
-            api_port=api_port,
-            open_browser=open_browser,
-        )
+        try:
+            launch_ui(
+                console,
+                port=port,
+                api_port=api_port,
+                open_browser=open_browser,
+            )
+        except RuntimeError as exc:
+            console.print(f"[bold red]UI launch failed:[/bold red] {exc}")
 
     def do_chat(self, arg):
         """Open the shared WatchTower AI analyst conversation.

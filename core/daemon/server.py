@@ -236,6 +236,7 @@ class EngineManager:
                 backend=backend, link_type=origin["link_type"], source=record_source,
                 metadata={"backend_version": backend_version} if backend_version else None,
                 daemon_instance_id=self.daemon_instance_id,
+                sensor_node_id=self.local_node_id,
             )
             session_db.close()
 
@@ -606,7 +607,10 @@ class EngineManager:
                 logger.error(f"Snapshot relay error for {interface}: {e}")
 
 
-manager = EngineManager()
+# Windows multiprocessing re-imports this module in capture/worker children.
+# Those children must not construct an EngineManager or reconcile the parent
+# daemon's active session as orphaned; only the real server process owns it.
+manager = None if __name__ == "__mp_main__" else EngineManager()
 
 
 def _start_engine_from_request(engine_manager, request):
@@ -716,7 +720,7 @@ class ThreadedTCPServer(ThreadingMixIn, TCPServer):
 
 
 def run_daemon():
-    if not context.is_admin:
+    if not context.is_admin and os.environ.get("WATCHTOWER_SENSOR_SERVICE") != "1":
         print("ERROR: Daemon must run as Administrator.")
         sys.exit(1)
 

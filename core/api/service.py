@@ -122,7 +122,10 @@ class WatchtowerApiService:
         if not source:
             return True
         record_source = str(record.get("source") or "")
-        return record_source.startswith("live") if source == "live" else record_source == source
+        return (
+            record_source.startswith("live") or
+            (record_source.startswith("mesh:") and ":live" in record_source)
+        ) if source == "live" else record_source == source
 
     def daemon_status(self, force: bool = False) -> Dict[str, Any]:
         checked_at, cached = self._daemon_cache
@@ -990,6 +993,26 @@ class WatchtowerApiService:
             )
         except BackendPolicyError as exc:
             raise ApiServiceError(422, "invalid_backend", str(exc)) from exc
+
+        # In the managed hybrid deployment the API/UI runs in the controller
+        # container while the capture daemon runs on the host. Route capture
+        # control through the enrolled native sensor instead of starting a
+        # second, invisible daemon inside the controller container.
+        from core.mesh.hybrid import hybrid_enabled
+        if hybrid_enabled():
+            from core.mesh.hybrid import start_capture as start_native_capture
+            try:
+                command = start_native_capture(self.db, interface, backend, source_type)
+            except (RuntimeError, ValueError) as exc:
+                raise ApiServiceError(503, "native_sensor_unavailable", str(exc)) from exc
+            return {
+                "status": "queued",
+                "interface": interface,
+                "backend": backend,
+                "source_type": source_type,
+                "command": command,
+            }
+
         if not self.daemon_status(force=True).get("running"):
             try:
                 from core.daemon.manager import DaemonManager
@@ -1019,6 +1042,18 @@ class WatchtowerApiService:
         return result
 
     def stop_capture(self, interface: str) -> Dict[str, Any]:
+        from core.mesh.hybrid import hybrid_enabled
+        if hybrid_enabled():
+            from core.mesh.hybrid import stop_capture as stop_native_capture
+            try:
+                commands = stop_native_capture(self.db, interface)
+            except (RuntimeError, ValueError) as exc:
+                raise ApiServiceError(503, "native_sensor_unavailable", str(exc)) from exc
+            return {
+                "status": "draining" if commands else "not_running",
+                "interface": interface,
+                "commands": commands,
+            }
         result = self.daemon.stop_engine(interface)
         self._daemon_cache = (0.0, {"running": False})
         if result.get("status") == "error":
@@ -1108,6 +1143,28 @@ class WatchtowerApiService:
             self._capture_stops[session_id] = {"state": "draining", "interface": interface, "requested_at": time.time()}
         if hasattr(self.db, "update_capture_session_state"):
             self.db.update_capture_session_state(session_id, "draining", reason=reason)
+
+        from core.mesh.hybrid import hybrid_enabled
+        if hybrid_enabled():
+            from core.mesh.hybrid import stop_capture as stop_native_capture
+            try:
+                commands = stop_native_capture(self.db, interface)
+            except (RuntimeError, ValueError) as exc:
+                with self._capture_stop_lock:
+                    self._capture_stops[session_id] = {
+                        "state": "failed", "error": str(exc), "finished_at": time.time(),
+                    }
+                raise ApiServiceError(503, "native_sensor_unavailable", str(exc)) from exc
+            if not commands:
+                with self._capture_stop_lock:
+                    self._capture_stops[session_id] = {
+                        "state": "failed", "error": "Native sensor has no active capture command", "finished_at": time.time(),
+                    }
+                raise ApiServiceError(409, "native_capture_not_active", "The native sensor has no active capture on this interface")
+            return {
+                "status": "draining", "session_id": session_id, "interface": interface,
+                "reason": reason, "commands": commands,
+            }
 
         def drain_capture():
             try:
@@ -2078,6 +2135,29 @@ class WatchtowerApiService:
         from core.detection.scoring import ScoringConfig
 
         position = self._decode_cursor(offset)
+        # A risk snapshot is normally created when a finding is persisted.
+        # Endpoints with only benign traffic still need an explicit V2
+        # zero-priority record so the entity view cannot silently disappear.
+        if not position and hasattr(self.db, "get_risk_subjects"):
+            subjects = self.db.get_risk_subjects(
+                source=source, interface=interface, capture_session_id=session,
+                sensor_node_id=sensor_node_id, limit=5000,
+            )
+            existing = {
+                str(item.get("subject") or "")
+                for item in self.db.get_risk_snapshots(
+                    source, interface, session, limit=5000, sensor_node_id=sensor_node_id,
+                )
+            }
+            now = time.time()
+            for subject in subjects:
+                if subject in existing:
+                    continue
+                self.db.recompute_risk(
+                    subject, source=source, interface=interface,
+                    capture_session_id=session, as_of=now, persist=True,
+                    sensor_node_id=sensor_node_id,
+                )
         rows = self.db.get_risk_snapshots(
             source, interface, session, limit=limit + 1,
             offset=int(position.get("offset") or 0), sensor_node_id=sensor_node_id,

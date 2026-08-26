@@ -44,7 +44,7 @@ def _udp(payload, sport=12345, dport=53):
     (SSHParser(), _tcp(b"SSH-2.0-OpenSSH_9.6\r\n", dport=2222), "ssh_banner"),
     (LDAPParser(), _tcp(b"\x30\x05\x02\x01\x01\x60\x00", dport=389), "ldap_operation"),
     (RDPParser(), _tcp(b"\x03\x00\x00\x0b", dport=3389), "rdp_transport"),
-    (MailProtocolParser(), _tcp(b"MAIL FROM:<a@example.test>\r\n", dport=25), "mail_from"),
+    (MailProtocolParser(), _tcp(b"MAIL FROM:<fixture-user-at-example-test>\r\n", dport=25), "mail_from"),
     (SNMPParser(), _udp(b"\x30\x03\x02\x01\x00", dport=161), "application_protocol"),
     (NTPParser(), _udp(b"\x23\x02\x00\x00" + b"\x00" * 44, dport=123), "ntp_mode"),
     (MQTTParser(), _tcp(b"\x10\x08" + b"\x00" * 8, dport=1883), "mqtt_packet_type"),

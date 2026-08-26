@@ -8,10 +8,11 @@ param(
 )
 
 $Root = (Resolve-Path $PSScriptRoot).Path
-$arguments = @()
-if ($InstallPrerequisites) { $arguments += "-InstallPrerequisites" }
-if ($WithSysmon) { $arguments += "-WithSysmon" }
-if ($WithNeo4j) { $arguments += "-WithNeo4j" }
-if ($DisableAuth) { $arguments += "-DisableAuth" }
-if ($SysmonExecutable) { $arguments += @("-SysmonExecutable", $SysmonExecutable) }
+$arguments = @{}
+if ($InstallPrerequisites) { $arguments.InstallPrerequisites = $true }
+if ($WithSysmon) { $arguments.WithSysmon = $true }
+if ($WithNeo4j) { $arguments.WithNeo4j = $true }
+if ($DisableAuth) { $arguments.DisableAuth = $true }
+if ($SysmonExecutable) { $arguments.SysmonExecutable = $SysmonExecutable }
 & (Join-Path $Root "scripts\install-hybrid.ps1") @arguments
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

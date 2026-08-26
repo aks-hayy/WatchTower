@@ -32,7 +32,16 @@ class StatAggregator:
         self.top_talkers[src_ip] += flow.byte_count
 
         # Timeline
-        if hasattr(flow, "arrival_times"):
+        if getattr(flow, "timeline_buckets", None):
+            for ts, bucket in flow.timeline_buckets.items():
+                if ts < window_start:
+                    continue
+                self.timeline_buckets[ts] = {
+                    "time": ts,
+                    "packets": self.timeline_buckets.get(ts, {}).get("packets", 0) + int(bucket.get("packets", 0)),
+                    "bytes": self.timeline_buckets.get(ts, {}).get("bytes", 0) + int(bucket.get("bytes", 0)),
+                }
+        elif hasattr(flow, "arrival_times"):
             for ts, size in zip(flow.arrival_times, flow.packet_sizes):
                 if ts < window_start: continue
                 b_time = math.floor(ts)
