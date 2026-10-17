@@ -25,7 +25,7 @@ function Find-WatchTowerRuntimeProcesses {
             if ($runtimeNames -notcontains $name.ToLowerInvariant()) { continue }
 
             $normalized = $commandLine.Replace('/', '\')
-            if (-not $normalized.Contains($root, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($normalized.IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
             $hasRuntimeMarker = $false
             foreach ($marker in $runtimeMarkers) {
                 if ($normalized.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
