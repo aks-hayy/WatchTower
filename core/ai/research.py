@@ -26,6 +26,12 @@ _CVE_PREFIX = "CVE-"
 _ASN_PREFIX = "AS"
 
 
+def _reverse_dns_name(indicator: str) -> str:
+    """Return the correct reverse-DNS zone for IPv4 and IPv6 indicators."""
+    address = ipaddress.ip_address(indicator)
+    return address.reverse_pointer
+
+
 class ResearchSafetyError(ValueError):
     pass
 
@@ -48,6 +54,12 @@ class ResearchDocument:
             kind="external", url=self.canonical_url, retrieved_at=self.retrieved_at,
             content_hash=self.content_hash,
         )
+
+
+@dataclass
+class ResearchExecution:
+    documents: List[ResearchDocument]
+    source_statuses: List[Dict[str, str]]
 
 
 def _canonical_url(value: str) -> str:
@@ -118,22 +130,52 @@ class ResearchBroker:
 
     def research(self, indicators: Iterable[str] = (), query: str = "", include_web: bool = True,
                  web_provider: str = "brave") -> List[ResearchDocument]:
+        return self.research_detailed(indicators, query, include_web, web_provider).documents
+
+    def research_detailed(self, indicators: Iterable[str] = (), query: str = "", include_web: bool = True,
+                          web_provider: str = "brave") -> ResearchExecution:
         indicators = public_indicators(indicators)
         if not indicators and not query.strip():
             raise ValueError("Research requires a public indicator or query")
         if any(not is_public_indicator(value) for value in indicators):
             raise ResearchSafetyError("Only public indicators can be researched automatically")
         documents: List[ResearchDocument] = []
+        source_statuses: List[Dict[str, str]] = []
         for indicator in indicators[:5]:
-            documents.extend(self._authoritative(indicator))
-            documents.extend(self._threat_intelligence(indicator))
+            documents.extend(self._authoritative(indicator, source_statuses))
+            documents.extend(self._threat_intelligence(indicator, source_statuses))
         if include_web and query.strip():
-            documents.extend(self._open_web(redact_text(query, 512), web_provider))
+            documents.extend(self._open_web(redact_text(query, 512), web_provider, source_statuses))
         deduplicated = {item.canonical_url: item for item in documents}
         result = list(deduplicated.values())[:MAX_DOCUMENTS_PER_RUN]
         for document in result:
             self._cache(document)
-        return result
+        return ResearchExecution(result, source_statuses)
+
+    @staticmethod
+    def _record_status(statuses: Optional[List[Dict[str, str]]], source: str, status: str) -> None:
+        if statuses is not None:
+            statuses.append({"source": source, "status": status})
+
+    @staticmethod
+    def _error_status(exc: Exception) -> str:
+        return "timed_out" if isinstance(exc, requests.Timeout) else "failed"
+
+    @staticmethod
+    def _response_has_records(source: str, content: bytes) -> bool:
+        if source == "dns-ptr":
+            try:
+                payload = json.loads(content.decode("utf-8", errors="replace"))
+                return any(str(item.get("type")) == "12" for item in payload.get("Answer") or [])
+            except (AttributeError, TypeError, ValueError):
+                return False
+        if source == "certificate-transparency":
+            try:
+                payload = json.loads(content.decode("utf-8", errors="replace"))
+                return bool(payload) if isinstance(payload, (list, dict)) else True
+            except (TypeError, ValueError):
+                return bool(content.strip())
+        return True
 
     def _document(self, lane: str, url: str, content: bytes, title: str = "", facts: Optional[List[Dict[str, object]]] = None) -> ResearchDocument:
         text = redact_text(content.decode("utf-8", errors="replace"), 16000).replace("\x00", " ")
@@ -176,47 +218,62 @@ class ResearchBroker:
                  if str(item.get("type")) == "12" and item.get("data")]
         return [{"subject": indicator, "predicate": "ptr", "value": name, "confidence": 0.9} for name in names]
 
-    def _authoritative(self, indicator: str) -> List[ResearchDocument]:
+    def _authoritative(self, indicator: str, statuses: Optional[List[Dict[str, str]]] = None) -> List[ResearchDocument]:
         documents = []
         upper = indicator.upper()
         parsed_url = urlsplit(indicator)
         if parsed_url.scheme == "https":
             try:
                 url, body, _ = self.client.get(indicator)
+                self._record_status(statuses, "public-indicator", "returned")
                 return [self._document("public-indicator", url, body, f"Public indicator URL: {parsed_url.hostname}")]
-            except (requests.RequestException, ResearchSafetyError):
+            except (requests.RequestException, ResearchSafetyError) as exc:
+                self._record_status(statuses, "public-indicator", self._error_status(exc))
                 return []
         if upper.startswith(_CVE_PREFIX):
-            return self._cve_documents(upper)
+            return self._cve_documents(upper, statuses)
         if upper.startswith(_ASN_PREFIX) and upper[2:].isdigit():
             try:
                 url, body, _ = self.client.get(f"https://rdap.org/autnum/{quote(upper[2:], safe='')}")
+                self._record_status(statuses, "rdap-asn", "returned")
                 return [self._document("rdap-asn", url, body, f"RDAP for {upper}")]
-            except (requests.RequestException, ResearchSafetyError):
+            except (requests.RequestException, ResearchSafetyError) as exc:
+                self._record_status(statuses, "rdap-asn", self._error_status(exc))
                 return []
         try:
             parsed = ipaddress.ip_address(indicator)
         except ValueError:
             parsed = None
-        try:
-            if parsed:
+        if parsed:
+            try:
                 url, body, _ = self.client.get(f"https://rdap.org/ip/{quote(indicator, safe='')}")
                 documents.append(self._document("rdap", url, body, f"RDAP for {indicator}", self._rdap_facts(indicator, body)))
-                reverse = ".".join(reversed(indicator.split("."))) + ".in-addr.arpa"
+                self._record_status(statuses, "rdap", "returned")
+            except (requests.RequestException, ResearchSafetyError) as exc:
+                self._record_status(statuses, "rdap", self._error_status(exc))
+            try:
+                reverse = _reverse_dns_name(indicator)
                 ptr_url = f"https://dns.google/resolve?name={quote(reverse, safe='')}&type=PTR"
                 try:
                     canonical, ptr_body, _ = self.client.get(ptr_url, headers={"Accept": "application/dns-json"})
                     documents.append(self._document("dns-ptr", canonical, ptr_body, f"PTR for {indicator}", self._ptr_facts(indicator, ptr_body)))
-                except (requests.RequestException, ResearchSafetyError):
-                    pass
-            elif "." in indicator:
+                    status = "returned" if self._response_has_records("dns-ptr", ptr_body) else "no_results"
+                    self._record_status(statuses, "dns-ptr", status)
+                except (requests.RequestException, ResearchSafetyError) as exc:
+                    self._record_status(statuses, "dns-ptr", self._error_status(exc))
+            except ValueError:
+                self._record_status(statuses, "dns-ptr", "failed")
+        elif "." in indicator:
+            try:
                 url, body, _ = self.client.get(f"https://crt.sh/?q={quote(indicator, safe='')}&output=json")
                 documents.append(self._document("certificate-transparency", url, body, f"Certificate transparency for {indicator}"))
-        except (requests.RequestException, ResearchSafetyError):
-            pass
+                status = "returned" if self._response_has_records("certificate-transparency", body) else "no_results"
+                self._record_status(statuses, "certificate-transparency", status)
+            except (requests.RequestException, ResearchSafetyError) as exc:
+                self._record_status(statuses, "certificate-transparency", self._error_status(exc))
         return documents
 
-    def _cve_documents(self, cve_id: str) -> List[ResearchDocument]:
+    def _cve_documents(self, cve_id: str, statuses: Optional[List[Dict[str, str]]] = None) -> List[ResearchDocument]:
         """Query NVD and extract only the matching CISA KEV record.
 
         The KEV feed is intentionally summarized before it becomes research
@@ -229,8 +286,13 @@ class ResearchBroker:
                 f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={quote(cve_id, safe='')}"
             )
             documents.append(self._document("nvd", url, body, f"NVD record for {cve_id}"))
-        except (requests.RequestException, ResearchSafetyError):
-            pass
+            try:
+                has_record = bool((json.loads(body.decode("utf-8", errors="replace")).get("vulnerabilities") or []))
+            except (AttributeError, TypeError, ValueError):
+                has_record = True
+            self._record_status(statuses, "nvd", "returned" if has_record else "no_results")
+        except (requests.RequestException, ResearchSafetyError) as exc:
+            self._record_status(statuses, "nvd", self._error_status(exc))
         try:
             url, body, _ = self.client.get(
                 "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -243,21 +305,24 @@ class ResearchBroker:
                     "cisa-kev", url, json.dumps(match, sort_keys=True).encode("utf-8"),
                     f"CISA KEV entry for {cve_id}",
                 ))
-        except (ValueError, requests.RequestException, ResearchSafetyError):
-            pass
+            self._record_status(statuses, "cisa-kev", "returned" if match else "no_results")
+        except (ValueError, requests.RequestException, ResearchSafetyError) as exc:
+            self._record_status(statuses, "cisa-kev", self._error_status(exc))
         return documents
 
-    def _threat_intelligence(self, indicator: str) -> List[ResearchDocument]:
+    def _threat_intelligence(self, indicator: str, statuses: Optional[List[Dict[str, str]]] = None) -> List[ResearchDocument]:
         documents = []
         for name, config, path, header in (
             ("virustotal", self.config.virustotal, f"/ip_addresses/{quote(indicator, safe='')}", "x-apikey"),
             ("abuseipdb", self.config.abuseipdb, "/check", "Key"),
         ):
             if not config.enabled:
+                self._record_status(statuses, name, "disabled")
                 continue
             try:
                 secret = self.credentials.get(config.credential_ref)
                 if not secret:
+                    self._record_status(statuses, name, "missing_credential")
                     continue
                 url = f"{config.base_url.rstrip('/')}{path}"
                 if name == "abuseipdb":
@@ -267,21 +332,25 @@ class ResearchBroker:
                     headers = {header: secret, "Accept": "application/json"}
                 canonical, body, _ = self.client.get(url, headers=headers)
                 documents.append(self._document(name, canonical, body, f"{name} reputation for {indicator}"))
-            except Exception:
+                self._record_status(statuses, name, "returned")
+            except Exception as exc:
+                self._record_status(statuses, name, self._error_status(exc))
                 continue
         return documents
 
-    def _open_web(self, query: str, provider: str) -> List[ResearchDocument]:
+    def _open_web(self, query: str, provider: str, statuses: Optional[List[Dict[str, str]]] = None) -> List[ResearchDocument]:
         if provider == "openai":
-            return self._openai_web(query)
+            return self._openai_web(query, statuses)
         if provider != "brave":
             raise ValueError("web_provider must be brave or openai")
         config = self.config.brave
         if not config.enabled:
+            self._record_status(statuses, "brave", "disabled")
             return []
         try:
             secret = self.credentials.get(config.credential_ref)
             if not secret:
+                self._record_status(statuses, "brave", "missing_credential")
                 return []
             url = f"{config.base_url.rstrip('/')}/res/v1/web/search?q={quote(query, safe='')}"
             canonical, body, _ = self.client.get(url, headers={"X-Subscription-Token": secret, "Accept": "application/json"})
@@ -293,17 +362,21 @@ class ResearchBroker:
                     continue
                 text = json.dumps({"title": item.get("title"), "description": item.get("description"), "url": target}).encode("utf-8")
                 documents.append(self._document("brave", _canonical_url(target), text, str(item.get("title") or "Web result")))
+            self._record_status(statuses, "brave", "returned" if documents else "no_results")
             return documents
-        except Exception:
+        except Exception as exc:
+            self._record_status(statuses, "brave", self._error_status(exc))
             return []
 
-    def _openai_web(self, query: str) -> List[ResearchDocument]:
+    def _openai_web(self, query: str, statuses: Optional[List[Dict[str, str]]] = None) -> List[ResearchDocument]:
         config = self.config.openai
         if not config.enabled:
+            self._record_status(statuses, "openai-web-search", "disabled")
             return []
         try:
             secret = self.credentials.get(config.credential_ref)
             if not secret:
+                self._record_status(statuses, "openai-web-search", "missing_credential")
                 return []
             endpoint = _canonical_url(f"{config.base_url.rstrip('/')}/responses")
             response = requests.post(
@@ -332,8 +405,10 @@ class ResearchBroker:
                     continue
             if not documents and text:
                 documents.append(self._document("openai-web-search", endpoint, text.encode("utf-8"), "OpenAI web search"))
+            self._record_status(statuses, "openai-web-search", "returned" if documents else "no_results")
             return documents
-        except Exception:
+        except Exception as exc:
+            self._record_status(statuses, "openai-web-search", self._error_status(exc))
             return []
 
     def _cache(self, document: ResearchDocument) -> None:

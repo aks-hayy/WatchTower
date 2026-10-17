@@ -15,15 +15,20 @@ import type { LucideIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import {
   fetchPluginCalibrationStatus,
+  fetchPluginCoverage,
   fetchPluginInventory,
   promotePluginCalibration,
   runPluginCalibration,
   verifyPluginCalibration,
 } from "@/lib/api.functions";
+import { pluginStatusPresentation } from "@/lib/plugin-coverage";
+import { calibrationTrustPresentation } from "@/lib/calibration-trust";
 import type {
   CalibrationReportSummary,
   PluginCalibrationStatus,
   PluginCalibrationTarget,
+  PluginCoverage,
+  PluginCoverageItem,
   PluginInventory,
   PluginRecord,
 } from "@/types/watchtower";
@@ -31,11 +36,12 @@ import type {
 export const Route = createFileRoute("/plugins")({
   head: () => ({ meta: [{ title: "Plugin Inventory - Watchtower" }] }),
   loader: async () => {
-    const [inventory, calibration] = await Promise.all([
+    const [inventory, calibration, coverage] = await Promise.all([
       fetchPluginInventory(),
       fetchPluginCalibrationStatus(),
+      fetchPluginCoverage(),
     ]);
-    return { inventory, calibration };
+    return { inventory, calibration, coverage };
   },
   component: PluginsPage,
 });
@@ -44,6 +50,7 @@ function PluginsPage() {
   const initial = Route.useLoaderData();
   const [inventory, setInventory] = useState<PluginInventory>(initial.inventory);
   const [calibration, setCalibration] = useState<PluginCalibrationStatus>(initial.calibration);
+  const [coverage, setCoverage] = useState<PluginCoverage>(initial.coverage);
   const [backend, setBackend] = useState<"all" | "python" | "rust">("all");
   const [reviewer, setReviewer] = useState("local-analyst");
   const [reason, setReason] = useState("Reviewed latest WatchTower calibration report");
@@ -61,12 +68,14 @@ function PluginsPage() {
   }, [calibration.targets]);
 
   const refresh = async (clearMessage = false) => {
-    const [nextInventory, nextCalibration] = await Promise.all([
+    const [nextInventory, nextCalibration, nextCoverage] = await Promise.all([
       fetchPluginInventory(),
       fetchPluginCalibrationStatus(),
+      fetchPluginCoverage(),
     ]);
     setInventory(nextInventory);
     setCalibration(nextCalibration);
+    setCoverage(nextCoverage);
     if (clearMessage) setMessage(null);
   };
 
@@ -222,6 +231,38 @@ function PluginsPage() {
         )}
 
         <section className="panel">
+          <div className="border-b border-border px-4 py-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="h-3.5 w-3.5 text-signal" />
+              <span className="text-sm text-foreground">Coverage status</span>
+              <span className="ml-auto mono text-[10px] text-muted-foreground">
+                {coverage.summary.ready || 0} ready /{" "}
+                {(coverage.summary.disabled_by_policy || 0) +
+                  (coverage.summary.unavailable_dependency || 0) +
+                  (coverage.summary.invalid_plugin || 0)}{" "}
+                unavailable
+              </span>
+            </div>
+            <p className="mt-1 max-w-3xl text-[11px] text-muted-foreground">
+              A capability can be installed but still disabled, unsupported, or blocked by a
+              dependency. WatchTower will not present those states as empty hunt results.
+            </p>
+          </div>
+          <div className="grid gap-px bg-border sm:grid-cols-2 lg:grid-cols-4">
+            {(
+              ["ready", "disabled_by_policy", "unavailable_dependency", "invalid_plugin"] as const
+            ).map((state) => (
+              <div key={state} className="bg-background px-4 py-3">
+                <div className="mono text-[10px] uppercase text-muted-foreground">
+                  {state.replaceAll("_", " ")}
+                </div>
+                <div className="mt-1 text-xl text-foreground">{coverage.summary[state] || 0}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="panel">
           <div className="grid gap-4 p-4 lg:grid-cols-[160px_1fr_1fr_auto]">
             <label>
               <span className="section-label">BACKEND</span>
@@ -271,6 +312,7 @@ function PluginsPage() {
           title="Detectors"
           icon={ShieldCheck}
           records={inventory.detectors}
+          coverageItems={coverage.items}
           calibrationTargets={targetsByDetector}
           busy={busy}
           onRun={run}
@@ -287,6 +329,7 @@ function PluginSection({
   title,
   icon: Icon,
   records,
+  coverageItems,
   calibrationTargets,
   busy,
   reviewerReady = false,
@@ -296,6 +339,7 @@ function PluginSection({
   title: string;
   icon: LucideIcon;
   records: PluginRecord[];
+  coverageItems?: PluginCoverageItem[];
   calibrationTargets?: Map<string, PluginCalibrationTarget[]>;
   busy?: string | null;
   reviewerReady?: boolean;
@@ -312,6 +356,16 @@ function PluginSection({
       <div className="grid gap-px bg-border lg:grid-cols-2 2xl:grid-cols-3">
         {records.map((item) => {
           const targets = item.detector_id ? calibrationTargets?.get(item.detector_id) || [] : [];
+          const capability = item.detector_id
+            ? coverageItems?.find((coverageItem) => coverageItem.detector_id === item.detector_id)
+            : undefined;
+          const availability = pluginStatusPresentation(item, capability);
+          const availabilityClass =
+            capability?.state === "ready" || (!capability && item.enabled && item.valid)
+              ? "text-ok"
+              : capability?.state === "invalid_plugin" || !item.valid
+                ? "text-severity-critical"
+                : "text-severity-medium";
           return (
             <div
               key={`${item.type || item.source_type}:${item.name}`}
@@ -319,10 +373,8 @@ function PluginSection({
             >
               <div className="flex items-center justify-between gap-3">
                 <span className="truncate text-[13px] text-foreground">{item.name}</span>
-                <span
-                  className={`mono text-[9px] uppercase ${item.valid ? "text-ok" : "text-severity-critical"}`}
-                >
-                  {item.valid ? "ready" : "error"}
+                <span className={`mono text-[9px] uppercase ${availabilityClass}`}>
+                  {availability.label}
                 </span>
               </div>
               <div className="mt-2 mono text-[10px] uppercase text-muted-foreground">
@@ -334,13 +386,22 @@ function PluginSection({
                   item.backends?.join(", ") ||
                   "no capability metadata"}
               </div>
+              {availability.detail && (
+                <div className="mt-2 text-[11px] text-muted-foreground">{availability.detail}</div>
+              )}
+              {availability.nextAction && (
+                <div className="mt-1 text-[11px] text-signal">Next: {availability.nextAction}</div>
+              )}
 
               {item.type === "detector" && (
                 <div className="mt-3 border-t border-border pt-3">
                   <div className="mb-2 flex items-center justify-between gap-2 mono text-[9px] uppercase">
                     <span className="text-muted-foreground">Scoring trust</span>
                     <span className={trustColor(item.calibration_level)}>
-                      {(item.calibration_level || "UNCALIBRATED").replaceAll("_", " ")}
+                      {targets.length > 0 &&
+                      targets.every((target) => target.trust_basis === "bootstrap_corpus")
+                        ? "BOOTSTRAP QUALIFIED"
+                        : (item.calibration_level || "UNCALIBRATED").replaceAll("_", " ")}
                     </span>
                   </div>
                   <div className="space-y-2">
@@ -393,6 +454,10 @@ function CalibrationTargetRow({
   const canPromote =
     Boolean(report?.report_path && report.passed && reviewerReady) &&
     levelRank(report?.awarded_level) > levelRank(target.calibration_level);
+  const trustPresentation = calibrationTrustPresentation(
+    target.trust_basis,
+    target.calibration_level,
+  );
 
   return (
     <div className="border border-border bg-surface/40 p-3">
@@ -401,9 +466,17 @@ function CalibrationTargetRow({
           {target.finding_type}
         </span>
         <span className={`mono text-[9px] uppercase ${trustColor(target.calibration_level)}`}>
-          {shortLevel(target.calibration_level)} / {target.effective_cap.toFixed(0)}
+          {target.trust_basis === "bootstrap_corpus"
+            ? "BOOTSTRAP"
+            : shortLevel(target.calibration_level)}{" "}
+          / {target.effective_cap.toFixed(0)}
         </span>
       </div>
+      {trustPresentation.detail && (
+        <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+          {trustPresentation.detail}
+        </p>
+      )}
       <ReportStrip target={target} report={report} reportCount={target.report_count} />
       <div className="mt-3 flex flex-wrap gap-2">
         <button
@@ -482,7 +555,7 @@ function ReportStrip({
         <span className={report.passed ? "text-ok" : "text-severity-high"}>
           {report.passed ? "PASS" : "FAIL"}
         </span>
-        <span>{report.awarded_level.replaceAll("_", " ")}</span>
+        <span>{calibrationTrustPresentation(report.trust_basis, report.awarded_level).label}</span>
         <span>
           {reportCount} report{reportCount === 1 ? "" : "s"}
         </span>

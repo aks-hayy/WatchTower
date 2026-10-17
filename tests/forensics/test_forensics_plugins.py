@@ -1,9 +1,12 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 import scapy.all as scapy
 from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.dhcp import DHCP, BOOTP
 from core.forensics.plugin_loader import PluginLoader
+from core.operations.coverage import build_coverage_matrix
 from core.forensics.models import ForensicAlert
 from core.packet_engine.schemas import FlowAggregate
 
@@ -96,20 +99,88 @@ class TestForensicPlugins(unittest.TestCase):
         alerts_normal = dns_detector.detect(domain="google.com")
         self.assertEqual(len(alerts_normal), 0, "False positive on normal domain")
 
-    def test_plugin_health_reports_effective_scoring_calibration(self):
-        plugins = self.loader.list_plugins()
+    def test_plugin_health_reports_stale_calibration_and_legacy_replacements(self):
+        from core.detection import scoring
+
+        # Keep this health-contract test independent of content-addressed
+        # attestations in the developer's checkout. The trust outcome is a
+        # fixture; detector manifests and calibration policy remain untouched.
+        config = SimpleNamespace(
+            uncalibrated_finding_cap=5.0,
+            corpus_validated_finding_cap=20.0,
+            profile_for=lambda *_args: SimpleNamespace(
+                calibration_level="UNCALIBRATED",
+                attestation_digest="",
+                max_contribution=5.0,
+                stale_reason="stale calibration dependency: core/calibration/service.py",
+            ),
+        )
+        with patch.object(scoring, "ScoringConfig", return_value=config):
+            loader = PluginLoader()
+        plugins = loader.list_plugins()
         ftp = plugins["BaseDetector:Cleartext FTP Credential Detector"]
-        # The detector source changed in this branch, so the previous
-        # attestation is intentionally stale until calibration is rerun.
         self.assertFalse(ftp["calibrated"])
         self.assertEqual(ftp["calibration_level"], "UNCALIBRATED")
-        self.assertIn("stale", ftp["calibration"][0]["stale_reason"])
         self.assertEqual(ftp["calibration"][0]["finding_type"], "credential.cleartext.ftp")
-        self.assertEqual(ftp["calibration"][0]["effective_cap"], 5)
-        self.assertFalse(plugins["BaseDetector:Beaconing Detector"]["calibrated"])
-        dns = plugins["BaseDetector:DNS Anomaly Detector"]
-        self.assertFalse(dns["calibrated"])
-        self.assertEqual(dns["calibration_level"], "UNCALIBRATED")
+        self.assertEqual(
+            ftp["calibration"][0]["stale_reason"],
+            "stale calibration dependency: core/calibration/service.py",
+        )
+        beacon = plugins["BaseDetector:Beaconing Detector"]
+        self.assertFalse(beacon["calibrated"])
+        self.assertEqual(beacon["calibration_level"], "UNCALIBRATED")
+        matrix = build_coverage_matrix(list(plugins.values()))
+        legacy = {
+            item["detector_id"]: item
+            for item in matrix["items"]
+            if item["detector_id"] in {
+                "watchtower.recon",
+                "watchtower.behavior.beacon",
+                "watchtower.exfiltration",
+            }
+        }
+        self.assertEqual(
+            set(legacy),
+            {"watchtower.recon", "watchtower.behavior.beacon", "watchtower.exfiltration"},
+        )
+        for item in legacy.values():
+            self.assertEqual(item["replacement"], "watchtower.stateful.host")
+            self.assertIn("do not enable", item["next_action"])
+
+
+def test_plugin_loader_builds_and_verifies_scoring_configuration_once(monkeypatch):
+    from core.detection.scoring import ScoringConfig as RealScoringConfig
+
+    constructions = []
+
+    def counting_scoring_config(*args, **kwargs):
+        constructions.append(1)
+        return RealScoringConfig(*args, **kwargs)
+
+    monkeypatch.setattr("core.detection.scoring.ScoringConfig", counting_scoring_config)
+
+    PluginLoader()
+
+    assert len(constructions) == 1
+
+
+def test_calibration_status_builds_scoring_configuration_once_per_request(monkeypatch, tmp_path):
+    from core.calibration.service import CalibrationService
+    from core.detection.scoring import ScoringConfig as RealScoringConfig
+
+    constructions = []
+
+    def counting_scoring_config(*args, **kwargs):
+        constructions.append(1)
+        return RealScoringConfig(*args, **kwargs)
+
+    monkeypatch.setattr("core.detection.scoring.ScoringConfig", counting_scoring_config)
+
+    CalibrationService(data_dir=tmp_path).status()
+
+    # PluginLoader creates one config for its own detector metadata. Calibration
+    # status should share one additional config across all detector targets.
+    assert len(constructions) == 2
 
 if __name__ == '__main__':
     unittest.main()

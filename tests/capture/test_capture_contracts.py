@@ -1,4 +1,7 @@
 import threading
+import os
+
+import pytest
 
 import core.capture_sources.network as network_source_module
 from core.capture_sources.base import CaptureDevice
@@ -91,6 +94,72 @@ def test_disconnected_network_interface_is_not_available(monkeypatch):
 
     assert not device.available
     assert "disconnected or disabled" in device.unavailable_reason
+
+
+def test_network_interface_missing_from_os_stats_is_not_reported_available(monkeypatch):
+    class Interface:
+        name = "WAN Miniport (Network Monitor)"
+        description = "WAN Miniport (Network Monitor)"
+        ip = ""
+
+    monkeypatch.setattr(network_source_module.psutil, "net_if_stats", lambda: {})
+
+    device = NetworkInterfaceSource._to_device(Interface())
+
+    assert device.available is False
+    assert "could not confirm" in device.unavailable_reason.lower()
+
+
+def test_network_interface_does_not_advertise_missing_rust_sensor(monkeypatch):
+    class Interface:
+        name = "Ethernet"
+        description = "Test adapter"
+        ip = "192.0.2.10"
+
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: False)
+
+    device = NetworkInterfaceSource._to_device(Interface())
+
+    assert device.backends == ["python"]
+
+
+def test_network_interface_advertises_rust_only_when_sensor_is_installed(monkeypatch):
+    class Interface:
+        name = "Ethernet"
+        description = "Test adapter"
+        ip = "192.0.2.10"
+
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: True)
+
+    device = NetworkInterfaceSource._to_device(Interface())
+
+    assert device.backends == ["python", "rust"]
+
+
+def test_network_interface_disables_live_backends_when_windows_npcap_is_missing(monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Npcap live-capture prerequisite is Windows-specific")
+
+    class Interface:
+        name = "Ethernet"
+        description = "Test adapter"
+        ip = "192.0.2.10"
+
+    class Stats:
+        isup = True
+
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: True)
+    monkeypatch.setattr(
+        "core.operations.capabilities.CapabilityRegistry._npcap",
+        staticmethod(lambda: (False, "Npcap runtime is missing")),
+    )
+    monkeypatch.setattr(network_source_module.psutil, "net_if_stats", lambda: {"Ethernet": Stats()})
+
+    device = NetworkInterfaceSource._to_device(Interface())
+
+    assert device.available is False
+    assert device.backends == []
+    assert "Npcap runtime is missing" in device.unavailable_reason
 
 
 def test_daemon_rejects_disconnected_interface_before_process_start(monkeypatch):

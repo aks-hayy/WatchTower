@@ -6,6 +6,7 @@ This documentation describes the WatchTower 2.0 source release. Commands assume 
 
 ## Operators
 
+- [Complete user and technical guide](user-guide/README.md) — orientation to every UI area, CLI paths, features, architecture, data flow, security, deployments, and limitations.
 - [Getting started](getting-started.md)
 - [Operations](operations.md)
 - [Live monitoring and detection](live-detection.md)

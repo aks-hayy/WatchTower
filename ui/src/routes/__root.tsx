@@ -1,10 +1,13 @@
 import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
-import { Menu, Radar, X } from "lucide-react";
-import { useState } from "react";
+import { CheckCircle2, Menu, Radar, TriangleAlert, X } from "lucide-react";
+import { useEffect, useState } from "react";
 import { AppSidebar } from "@/components/AppSidebar";
 import { AuthGate } from "@/components/AuthGate";
 import { SensorScopeProvider, SensorScopeSelector } from "@/components/SensorScope";
 import { useSensorScope } from "@/components/useSensorScope";
+import { fetchHealth } from "@/lib/api.functions";
+import { describeServiceStatus, resolveWorkspaceServiceState } from "@/lib/service-status";
+import type { HealthStatus } from "@/types/watchtower";
 import appCss from "../styles.css?url";
 
 declare global {
@@ -93,16 +96,65 @@ function WatchTowerWorkspace() {
             <span className="text-[13px] text-foreground">Watchtower</span>
           </div>
         </div>
-        <div className="sticky top-0 z-20 flex h-9 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur md:px-5">
-          <SensorScopeSelector />
-          <span className="ml-auto truncate mono text-[9px] uppercase text-muted-foreground">
-            Workspace / {selectedLabel}
-          </span>
-        </div>
+        <WorkspaceStatusBar selectedLabel={selectedLabel} />
         <main className="min-w-0 overflow-auto">
           <Outlet />
         </main>
       </div>
+    </div>
+  );
+}
+
+function WorkspaceStatusBar({ selectedLabel }: { selectedLabel: string }) {
+  const [health, setHealth] = useState<HealthStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const nextHealth = await fetchHealth();
+      if (!cancelled) setHealth(nextHealth);
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  const serviceState = resolveWorkspaceServiceState(health);
+  const servicePresentation = describeServiceStatus(health);
+  const needsAttention = serviceState === "attention";
+  const offline = serviceState === "offline";
+  const checking = serviceState === "checking";
+  return (
+    <div className="sticky top-0 z-20 flex min-h-11 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border bg-background/95 px-3 py-2 backdrop-blur md:px-5">
+      <SensorScopeSelector />
+      <div className="flex items-center gap-2 text-[12px]">
+        {checking || needsAttention || offline ? (
+          <TriangleAlert className="h-3.5 w-3.5 text-severity-medium" />
+        ) : (
+          <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
+        )}
+        <span
+          className={
+            checking
+              ? "text-muted-foreground"
+              : offline
+                ? "text-severity-high"
+                : needsAttention
+                  ? "text-severity-medium"
+                  : "text-ok"
+          }
+        >
+          {servicePresentation.label}
+        </span>
+      </div>
+      <div className="hidden h-4 w-px bg-border sm:block" />
+      <div className="text-[12px] text-muted-foreground">
+        {checking ? "Checking capture status" : servicePresentation.nextAction}
+      </div>
+      <span className="ml-auto truncate text-[11px] text-muted-foreground">{selectedLabel}</span>
     </div>
   );
 }

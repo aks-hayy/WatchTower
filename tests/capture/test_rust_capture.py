@@ -1,7 +1,9 @@
 import io
+import json
 from pathlib import Path
 import queue
 import struct
+from types import SimpleNamespace
 
 import pytest
 from scapy.all import Ether, IP, IPv6, TCP, UDP, wrpcap
@@ -9,7 +11,8 @@ from scapy.utils import RawPcapWriter
 
 from core.packet_engine.capture import packet_to_event
 from core.packet_engine.rust_capture import (
-    FRAME_EVENTS, MAGIC, aggregate_replay_events, build_aggregate_analysis_plan,
+    FRAME_EVENTS, FRAME_HEALTH, FRAME_TERMINAL, MAGIC, aggregate_replay_events, build_aggregate_analysis_plan,
+    decode_terminal_certificate,
     decode_event_batch, read_frame, replay_events,
     rust_sensor_available, sensor_binary, start_rust_capture,
 )
@@ -30,6 +33,95 @@ def test_binary_frame_rejects_invalid_and_truncated_data():
         read_frame(io.BytesIO(b"BAD!" + bytes([1, FRAME_EVENTS]) + struct.pack(">I", 0)))
     with pytest.raises(EOFError):
         read_frame(io.BytesIO(MAGIC + bytes([1, FRAME_EVENTS]) + struct.pack(">I", 100)))
+
+
+@pytest.mark.parametrize("certificate", [
+    {"status": "running", "received_packets": 3, "emitted_events": 2, "link_type": "loopback-ip"},
+    {"status": "stopped", "received_packets": -1, "emitted_events": 2, "link_type": "loopback-ip"},
+    {"status": "stopped", "received_packets": 3, "emitted_events": 2, "link_type": "loopback-ip"},
+])
+def test_rust_terminal_certificate_rejects_invalid_or_incomplete_counts(certificate):
+    with pytest.raises(ValueError):
+        decode_terminal_certificate(json.dumps(certificate).encode(), adapter_event_count=3)
+
+
+def test_rust_terminal_certificate_accepts_only_stopped_complete_delivery():
+    certificate = {
+        "status": "stopped", "received_packets": 4, "emitted_events": 3,
+        "flows": 2, "link_type": "loopback-ip",
+    }
+
+    assert decode_terminal_certificate(
+        json.dumps(certificate).encode(), adapter_event_count=3
+    ) == certificate
+
+
+def test_rust_capture_stop_drains_final_batch_and_records_terminal_certificate(monkeypatch, tmp_path):
+    import core.packet_engine.rust_capture as rust_capture
+
+    binary = tmp_path / "watchtower-sensor"
+    binary.write_bytes(b"sensor")
+    event_payload = _encode_test_event(b"fixture")
+    frames = b"".join(
+        MAGIC + bytes([1, frame_type]) + struct.pack(">I", len(payload)) + payload
+        for frame_type, payload in (
+            (FRAME_HEALTH, b'{"status":"ready","link_type":"loopback-ip"}'),
+            (FRAME_EVENTS, event_payload),
+            (FRAME_TERMINAL, json.dumps({
+                "status": "stopped", "received_packets": 1,
+                "emitted_events": 1, "flows": 1, "link_type": "loopback-ip",
+            }).encode()),
+        )
+    )
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(frames)
+            self.stderr = io.BytesIO()
+            self.stdin = io.BytesIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    process = FakeProcess()
+    monkeypatch.setattr(rust_capture, "sensor_binary", lambda: binary)
+    monkeypatch.setattr(rust_capture.subprocess, "Popen", lambda *args, **kwargs: process)
+    packet_queue = queue.Queue()
+    metrics = {
+        key: SimpleNamespace(value=0)
+        for key in (
+            "received_packets", "emitted_packets", "dropped_packets", "queue_full_events",
+            "last_packet_at", "sensor_terminal_received", "sensor_received_packets",
+            "sensor_emitted_events", "sensor_flow_count", "sensor_exit_code",
+        )
+    }
+    stop = __import__("threading").Event()
+    stop.set()
+    readiness = queue.Queue(maxsize=1)
+
+    start_rust_capture(
+        "Loopback", packet_queue, stop_event=stop,
+        origin={"session_id": "fixture", "device_id": "Loopback"}, metrics=metrics,
+        readiness_queue=readiness,
+    )
+
+    assert process.stdin.getvalue() == b"STOP\n"
+    assert packet_queue.get_nowait().src_ip == "10.0.0.1"
+    assert readiness.get_nowait() == {"status": "ready", "link_type": "loopback-ip"}
+    assert metrics["sensor_terminal_received"].value == 1
+    assert metrics["sensor_emitted_events"].value == 1
+    assert metrics["sensor_exit_code"].value == 0
 
 
 def test_binary_batch_preserves_raw_packet_and_provenance():

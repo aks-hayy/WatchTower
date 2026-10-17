@@ -1,5 +1,8 @@
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+export type ExperienceMode = "simple" | "standard" | "analyst";
+export type DeploymentRole = "native" | "controller" | "offline";
+
 export interface JsonObject {
   [key: string]: JsonValue;
 }
@@ -10,13 +13,37 @@ export interface CursorPage<T> {
   limit: number;
 }
 
+export interface RuntimeCapability {
+  name: string;
+  available: boolean;
+  state: "ready" | "unavailable" | string;
+  reason?: string;
+  next_action?: string;
+  details?: JsonObject;
+}
+
+export interface OperationEnvelope {
+  operation_id: string;
+  state: string;
+  summary: string;
+  error?: { code?: string; detail?: string } | null;
+  next_actions: string[];
+  effective_scope: JsonObject;
+  completeness: string;
+}
+
 export interface HealthStatus {
   status: "ok" | "degraded" | "offline";
   version: string;
   database: string;
-  daemon: "online" | "offline";
+  daemon: "online" | "offline" | "not_applicable";
   daemon_healthy: boolean;
+  capture_state?: "unavailable" | "idle" | "starting" | "active" | "stopping" | "failed";
+  capture_interface?: string | null;
+  deployment_role?: DeploymentRole;
+  next_action?: string;
   message?: string;
+  capabilities?: Record<string, RuntimeCapability>;
 }
 
 export interface SystemInfo {
@@ -72,6 +99,7 @@ export interface CaptureSession {
   complete?: boolean;
   completeness?: string;
   completion_reason?: string | null;
+  operation?: OperationEnvelope;
 }
 
 export interface SensorNode {
@@ -123,6 +151,7 @@ export interface EvidenceGraphStatus {
   pending: number;
   failed: number;
   last_materialized_at?: number | null;
+  limitations?: string[];
 }
 
 export interface RiskContributor {
@@ -259,6 +288,7 @@ export interface IpLookup {
   is_private: boolean;
   is_global: boolean;
   summary: string;
+  scope_limitations?: string[];
   endpoint_identity?: EndpointIdentitySummary | null;
   endpoint_processes?: EndpointProcessObservation[];
   identity: {
@@ -410,6 +440,7 @@ export interface TopologyNode {
     label: string;
     type: string;
     risk: number;
+    risk_available?: boolean;
     risk_level?: string;
     assessment_confidence?: number;
   };
@@ -482,6 +513,7 @@ export interface PcapResult {
   alerts: Alert[];
   protocols: ProtocolEntry[];
   ports: PortEntry[];
+  operation?: OperationEnvelope;
 }
 
 export interface DashboardData {
@@ -524,6 +556,7 @@ export interface PluginRecord {
 export interface PluginCalibrationRecord {
   finding_type: string;
   calibration_level: "UNCALIBRATED" | "CORPUS_VALIDATED" | "FIELD_CALIBRATED";
+  trust_basis?: "bootstrap_corpus" | "field_evidence" | "corpus" | "uncalibrated" | "unknown";
   effective_cap: number;
   attestation_digest: string;
   stale_reason: string;
@@ -540,6 +573,44 @@ export interface PluginInventory {
   hardware: PluginRecord[];
 }
 
+export interface PluginCoverageItem {
+  id: string;
+  name: string;
+  type: string;
+  state:
+    | "ready"
+    | "disabled_by_policy"
+    | "unsupported_telemetry"
+    | "unavailable_dependency"
+    | "invalid_plugin";
+  reason: string;
+  next_action: string;
+  enabled: boolean;
+  valid: boolean;
+  supported_link_types?: string[];
+  input_kinds?: string[];
+  detector_id?: string;
+  calibration_level?: string;
+  replacement?: string;
+  limitations?: string[];
+}
+
+export interface PluginCoverage {
+  schema_version: string;
+  items: PluginCoverageItem[];
+  summary: Record<string, number>;
+  limitations: string[];
+  capabilities: Record<
+    string,
+    {
+      available: boolean;
+      state: string;
+      reason: string;
+      next_action: string;
+    }
+  >;
+}
+
 export interface CalibrationReportSummary {
   report_path: string;
   digest: string;
@@ -547,6 +618,7 @@ export interface CalibrationReportSummary {
   backend_selection: string;
   passed: boolean;
   awarded_level: "UNCALIBRATED" | "CORPUS_VALIDATED" | "FIELD_CALIBRATED";
+  trust_basis?: "bootstrap_corpus" | "field_evidence" | "corpus" | "uncalibrated";
   failures: string[];
   field_failures: string[];
   runner_peak_memory_bytes?: number;
@@ -659,6 +731,8 @@ export interface AIConversation {
   created_at: number;
   updated_at: number;
   archived: boolean;
+  parent_conversation_id?: string | null;
+  branched_from_message_id?: string | null;
   messages?: AIMessage[];
 }
 
@@ -698,7 +772,13 @@ export interface AIRun {
     | "NEEDS_SCOPE"
     | "FAILED"
     | "REJECTED"
+    | "CANCELLED"
+    | "INTERRUPTED"
     | string;
+  user_message_id?: string | null;
+  client_request_id?: string | null;
+  parent_run_id?: string | null;
+  operation?: OperationEnvelope;
   final_text?: string | null;
   error?: string | null;
   scope: AIContextScope;
@@ -719,6 +799,24 @@ export interface AIRun {
   inferred_claims?: number;
   blocked_claims?: number;
   numeric_accuracy?: number;
+  answer?: {
+    version: number;
+    narrative?: string;
+    citations?: AICitation[];
+    limitations?: string[];
+    completeness?: "complete" | "partial" | "not_applicable" | string;
+    requested_scope?: AIContextScope;
+    effective_scope?: AIContextScope;
+    tool_results?: Array<{
+      tool: string;
+      effective_scope: AIContextScope;
+      complete: boolean;
+      truncated: boolean;
+      total?: number | null;
+      limitations: string[];
+    }>;
+    validation?: JsonObject;
+  };
 }
 
 export interface AIProviderStatus {
@@ -731,11 +829,11 @@ export interface AIProviderStatus {
   configured?: boolean;
   credential_configured?: boolean;
   requires_credential?: boolean;
-  supports_tools?: boolean;
+  supports_tools?: boolean | null;
   supports_research?: boolean;
   base_url?: string;
   description?: string;
-  agentic_ready?: boolean;
+  agentic_ready?: boolean | null;
   capability_probe?: string;
   native_tool_calls?: boolean;
   latency_ms?: number;

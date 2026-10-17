@@ -647,7 +647,11 @@ class ForensicsEngine:
                      case_id: str = None, analysis_id: str = None,
                      conversation_source: str = None) -> ForensicReport:
         """Full offline PCAP analysis. Results written to SQLite."""
-        backend = backend_policy.replay_backend(backend)
+        from core.operations.capabilities import CapabilityRegistry
+        backend = backend_policy.replay_backend(
+            backend,
+            runtime_capabilities=CapabilityRegistry(data_dir=str(self.data_dir)).flags(),
+        )
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"PCAP file not found: {file_path}")
         if mode not in {"auto", "memory", "streaming"}:
@@ -1889,7 +1893,7 @@ class ForensicsEngine:
             "avg_packet_size": flow.avg_packet_size(), "duration": flow.duration(),
             "interarrival_mean": mean, "interarrival_std": stddev,
             "packet_size_variance": flow.packet_size_variance(), "l7_metadata": flow.l7_metadata,
-            "source": self._source,
+            "source": self._source, "capture_interface": "offline",
         }
         if self._batch_flow_persistence:
             self._pending_flow_rows.append(flow_row)
@@ -2128,6 +2132,8 @@ class ForensicsEngine:
             timestamp=carved.timestamp,
             data=carved.data,
             source=self._source,
+            capture_session_id=self._conversation_source,
+            capture_interface="offline",
         )
         
         # Optionally write to disk
@@ -2204,5 +2210,7 @@ class ForensicsEngine:
                         timestamp=time.time(),
                         vt_results=carved.vt_results,
                         data=carved_data if len(carved_data) < 1024*1024 else None,
-                        source=self._source
+                        source=self._source,
+                        capture_session_id=self._conversation_source,
+                        capture_interface="offline",
                     )

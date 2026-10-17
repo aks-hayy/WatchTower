@@ -116,10 +116,15 @@ class MeshAuthority:
     def server_credentials(self) -> Tuple[bytes, bytes, bytes]:
         return self.server_key_path.read_bytes(), self.server_cert_path.read_bytes(), self.ca_cert_path.read_bytes()
 
-    def sign_csr(self, csr_pem: bytes, node_id: str) -> bytes:
+    @staticmethod
+    def validate_csr(csr_pem: bytes):
         csr = x509.load_pem_x509_csr(csr_pem)
         if not csr.is_signature_valid:
             raise ValueError("Invalid mesh enrollment CSR")
+        return csr
+
+    def sign_csr(self, csr_pem: bytes, node_id: str) -> bytes:
+        csr = self.validate_csr(csr_pem)
         ca_key = serialization.load_pem_private_key(self.ca_key_path.read_bytes(), password=None)
         ca_cert = x509.load_pem_x509_certificate(self.ca_cert_path.read_bytes())
         now = datetime.now(timezone.utc)

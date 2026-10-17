@@ -13,6 +13,7 @@ from sqlalchemy import or_
 
 from core.intelligence.evidence import CaptureEvidence, ip_scope
 from core.intelligence.local_assets import LocalAssetProfiler
+from core.storage.database import _apply_time_window
 from core.storage.models import CaptureSession, Entity, Flow
 
 
@@ -227,10 +228,19 @@ class EndpointIdentityReindexer:
         self._enrichment = EnrichmentReindexer(db)
         self.inventory_factory = inventory_factory
 
-    def _groups(self, source: Optional[str], interface: Optional[str], session_id: Optional[str]):
+    def _groups(self, source: Optional[str], interface: Optional[str], session_id: Optional[str],
+                sensor_node_id: Optional[str] = None, target_ips=None,
+                time_start: Optional[float] = None, time_end: Optional[float] = None):
         groups: Dict[tuple, list] = {}
         with self.db.session_scope() as session:
-            rows = self._enrichment._flow_query(session, source, interface, session_id).all()
+            query = self._enrichment._flow_query(session, source, interface, session_id)
+            if sensor_node_id:
+                query = query.filter(Flow.sensor_node_id == sensor_node_id)
+            targets = [str(value) for value in (target_ips or ()) if value]
+            if targets:
+                query = query.filter(or_(Flow.src_ip.in_(targets), Flow.dst_ip.in_(targets)))
+            query = _apply_time_window(query, Flow.start_time, Flow.last_seen, time_start, time_end)
+            rows = query.all()
             for row in rows:
                 key = (row.source, row.capture_interface, row.capture_session_id)
                 groups.setdefault(key, []).append(self._enrichment._flow_dict(row))
@@ -249,9 +259,12 @@ class EndpointIdentityReindexer:
             records.extend(record.to_dict() for record in resolver.resolve(source, interface, session_id))
         return records
 
-    def _observation_groups(self, source, interface, session_id):
+    def _observation_groups(self, source, interface, session_id, sensor_node_id=None,
+                            target_ips=None, time_start=None, time_end=None):
         values = self.db.get_identity_observations(
-            source=source, interface=interface, capture_session_id=session_id, limit=5000,
+            source=source, interface=interface, capture_session_id=session_id,
+            sensor_node_id=sensor_node_id, target_ips=target_ips,
+            time_start=time_start, time_end=time_end, limit=5000,
         )
         grouped = {}
         for item in values:
@@ -332,12 +345,18 @@ class EndpointIdentityReindexer:
         return EndpointIdentityResolver.coverage(EndpointIdentityRecord(**record) for record in records)
 
     def status(self, source: Optional[str] = None, interface: Optional[str] = None,
-               session_id: Optional[str] = None) -> Dict[str, Any]:
-        groups = self._groups(source, interface, session_id)
+               session_id: Optional[str] = None, sensor_node_id: Optional[str] = None,
+               target_ips=None, time_start: Optional[float] = None,
+               time_end: Optional[float] = None) -> Dict[str, Any]:
+        groups = self._groups(source, interface, session_id, sensor_node_id, target_ips, time_start, time_end)
         inventory = self.inventory_factory() if self.inventory_factory else None
-        records = self._records(groups, inventory, self._observation_groups(source, interface, session_id))
+        records = self._records(groups, inventory, self._observation_groups(
+            source, interface, session_id, sensor_node_id, target_ips, time_start, time_end,
+        ))
         stored = self.db.get_endpoint_identities(
             source=source, interface=interface, capture_session_id=session_id, limit=10000,
+            sensor_node_id=sensor_node_id, target_ips=target_ips,
+            time_start=time_start, time_end=time_end,
         )
         stored_keys = {
             (row["entity_ip"], row["source"], row.get("capture_interface") or "", row.get("capture_session_id") or "")

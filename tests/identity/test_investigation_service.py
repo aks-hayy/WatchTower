@@ -71,3 +71,51 @@ def test_investigation_without_alerts_states_low_observed_risk(tmp_path):
     assert result.next_actions
     assert "support a low observed risk assessment" in result.summary
     db.close()
+
+
+def test_investigation_does_not_mix_capture_session_evidence(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    ip = "10.20.0.9"
+    db.upsert_entity(
+        ip, hostname="name-from-another-capture", username="other-user",
+        timestamp=10.0, source="live",
+    )
+    db.upsert_flow(
+        src_ip=ip, dst_ip="198.51.100.9", src_port=51000, dst_port=443,
+        protocol="TCP", start_time=100.0, last_seen=110.0,
+        packet_count=3, byte_count=300, source="live",
+        capture_session_id="session-current", capture_interface="Wi-Fi",
+    )
+    db.upsert_flow(
+        src_ip=ip, dst_ip="203.0.113.77", src_port=51001, dst_port=22,
+        protocol="TCP", start_time=200.0, last_seen=210.0,
+        packet_count=99, byte_count=9900, source="live",
+        capture_session_id="session-other", capture_interface="Ethernet",
+    )
+    # Session provenance is already represented by the storage model, but the
+    # investigation path must apply it instead of returning all files for IP.
+    db.insert_carved_file(
+        ip, "current.bin", ".bin", "a" * 64, 3, timestamp=105.0,
+        source="live", capture_session_id="session-current", capture_interface="Wi-Fi",
+    )
+    db.insert_carved_file(
+        ip, "other.bin", ".bin", "b" * 64, 99, timestamp=205.0,
+        source="live", capture_session_id="session-other", capture_interface="Ethernet",
+    )
+
+    result = InvestigationService(db).investigate(
+        ip, source="live", persist=False, interface="Wi-Fi",
+        capture_session_id="session-current", time_start=90.0, time_end=120.0,
+    )
+
+    assert len([item for item in result.evidence if item["evidence_type"] == "flow"]) == 1
+    assert "198.51.100.9" in result.evidence[0]["summary"]
+    assert all("203.0.113.77" not in item["summary"] for item in result.evidence)
+    assert {item["details"].get("filename") for item in result.evidence if item["evidence_type"] == "file"} == {
+        "current.bin",
+    }
+    assert result.asset_profile["outbound_bytes"] == 300
+    assert result.asset_profile["identity_completeness"] == 0.0
+    assert result.confidence < 0.6
+    assert result.limitations
+    db.close()

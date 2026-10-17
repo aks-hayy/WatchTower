@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from getpass import getpass
+import sys
 from typing import Optional
 
 from rich.console import Console
@@ -38,11 +39,22 @@ class AuthModule:
                 return True
             pin = self._new_pin()
             result = self.auth.setup_pin(pin, display_name, client_type="cli")
-            self._store_token(result["token"])
-            self.console.print("[bold green]WatchTower operator authentication configured.[/bold green]")
             self.console.print("[bold yellow]Recovery code (shown once):[/bold yellow]")
             self.console.print(result["recovery_code"])
             self.console.print("[dim]Store this code outside WatchTower. It cannot be displayed again.[/dim]")
+            try:
+                self._store_token(result["token"])
+            except Exception:
+                self.console.print(
+                    "[bold red]PIN is configured, but the CLI session could not be stored "
+                    "in the operating-system credential store.[/bold red]"
+                )
+                self.console.print(
+                    "[yellow]Check that the credential store is available, then run "
+                    "[cyan]tower auth unlock[/cyan] to continue.[/yellow]"
+                )
+                return False
+            self.console.print("[bold green]WatchTower operator authentication configured.[/bold green]")
             return True
         except AuthError as exc:
             self.console.print(f"[bold red]Authentication setup failed:[/bold red] {exc.message}")
@@ -50,6 +62,7 @@ class AuthModule:
 
     def unlock(self) -> bool:
         try:
+            self._require_interactive_terminal("PIN unlock")
             result = self.auth.verify_pin(getpass("WatchTower PIN: "), client_type="cli")
             self._store_token(result["token"])
             expires = result["session"]["expires_at"]
@@ -58,6 +71,16 @@ class AuthModule:
         except (AuthError, RuntimeError) as exc:
             message = exc.message if isinstance(exc, AuthError) else str(exc)
             self.console.print(f"[bold red]Unlock failed:[/bold red] {message}")
+            return False
+        except Exception:
+            self.console.print(
+                "[bold red]PIN was accepted, but the CLI session could not be stored "
+                "in the operating-system credential store.[/bold red]"
+            )
+            self.console.print(
+                "[yellow]Check that the credential store is available, then retry "
+                "[cyan]tower auth unlock[/cyan].[/yellow]"
+            )
             return False
 
     def lock(self, all_sessions: bool = False) -> None:
@@ -93,6 +116,7 @@ class AuthModule:
         if not token:
             return False
         try:
+            self._require_interactive_terminal("PIN confirmation")
             result = self.auth.set_enabled(enabled, token, getpass("Confirm WatchTower PIN: "))
             self.console.print(
                 f"[green]Application authentication {'enabled' if enabled else 'disabled'}.[/green]"
@@ -110,6 +134,7 @@ class AuthModule:
 
     def recovery_reset(self, os_admin: bool = False, reason: str = "") -> bool:
         try:
+            self._require_interactive_terminal("Operator recovery")
             new_pin = self._new_pin()
             if os_admin:
                 result = self.auth.reset_as_os_admin(new_pin, reason, context.is_admin, client_type="cli")
@@ -119,10 +144,21 @@ class AuthModule:
                     new_pin,
                     client_type="cli",
                 )
-            self._store_token(result["token"])
-            self.console.print("[green]Operator access recovered and prior sessions revoked.[/green]")
             self.console.print("[bold yellow]New recovery code (shown once):[/bold yellow]")
             self.console.print(result["recovery_code"])
+            try:
+                self._store_token(result["token"])
+            except Exception:
+                self.console.print(
+                    "[bold red]The new PIN and recovery code are set, but the CLI session "
+                    "could not be stored in the operating-system credential store.[/bold red]"
+                )
+                self.console.print(
+                    "[yellow]Store the replacement recovery code securely. Check that the "
+                    "credential store is available, then run [cyan]tower auth unlock[/cyan].[/yellow]"
+                )
+                return False
+            self.console.print("[green]Operator access recovered and prior sessions revoked.[/green]")
             return True
         except AuthError as exc:
             self.console.print(f"[bold red]Recovery failed:[/bold red] {exc.message}")
@@ -154,6 +190,7 @@ class AuthModule:
                 return False
             if exc.code == "step_up_required":
                 try:
+                    self._require_interactive_terminal("PIN re-authentication")
                     self.auth.step_up_pin(token or "", getpass("Re-authenticate with WatchTower PIN: "))
                     return True
                 except AuthError as step_exc:
@@ -167,7 +204,14 @@ class AuthModule:
         return self._token()
 
     def _store_token(self, token: str) -> None:
-        self.credentials.set(CLI_CREDENTIAL_REFERENCE, token)
+        try:
+            self.credentials.set(CLI_CREDENTIAL_REFERENCE, token)
+        except Exception:
+            try:
+                self.auth.lock(token, reason="credential_store_failure")
+            except Exception:
+                pass
+            raise
 
     def _token(self) -> Optional[str]:
         try:
@@ -177,11 +221,26 @@ class AuthModule:
 
     @staticmethod
     def _new_pin() -> str:
+        AuthModule._require_interactive_terminal("PIN setup")
         first = getpass("New WatchTower PIN (6+ characters): ")
         second = getpass("Confirm PIN: ")
         if first != second:
             raise AuthError("pin_mismatch", "The PIN confirmation did not match", 422)
         return first
+
+    @staticmethod
+    def _require_interactive_terminal(action: str) -> None:
+        try:
+            interactive = bool(sys.stdin and sys.stdin.isatty())
+        except (AttributeError, OSError):
+            interactive = False
+        if not interactive:
+            raise AuthError(
+                "interactive_terminal_required",
+                f"{action} requires an interactive terminal. Run 'tower ui' for guided setup "
+                "or retry the command from a terminal.",
+                409,
+            )
 
     @staticmethod
     def _when(timestamp: float) -> str:

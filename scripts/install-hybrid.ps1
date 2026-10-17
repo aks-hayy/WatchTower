@@ -41,10 +41,10 @@ function Require-DockerDesktop {
     Resolve-DockerDesktop
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         if (-not $InstallPrerequisites) {
-            throw "Docker Desktop is required. Install and start it, or rerun with -InstallPrerequisites."
+            throw "Docker Desktop is required for hybrid mode. Install and start it, or use .\install.ps1 -Mode native for a Docker-free Windows install."
         }
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            throw "Docker Desktop is required and winget is unavailable. Install Docker Desktop, start it, then rerun this command."
+            throw "Docker Desktop is required for hybrid mode and winget is unavailable. Install Docker Desktop, or use .\install.ps1 -Mode native for a Docker-free Windows install."
         }
         Step "Installing Docker Desktop"
         & winget install --id Docker.DockerDesktop --exact --silent --accept-package-agreements --accept-source-agreements

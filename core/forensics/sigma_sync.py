@@ -17,6 +17,7 @@ import httpx
 import yaml
 
 from core.forensics.sigma_engine import validate_rule
+from core.forensics.sigma_paths import default_sigma_builtin_dir, default_sigma_data_dir
 
 
 DEFAULT_REPOSITORY = "https://github.com/SigmaHQ/sigma.git"
@@ -37,8 +38,8 @@ class SyncManifest:
 
 
 class SigmaCorpusManager:
-    def __init__(self, data_dir="data/sigma", repository=DEFAULT_REPOSITORY):
-        self.root = Path(data_dir)
+    def __init__(self, data_dir=None, repository=DEFAULT_REPOSITORY):
+        self.root = Path(data_dir) if data_dir is not None else default_sigma_data_dir()
         self.repository = repository
         self.active = self.root / "active"
         self.previous = self.root / "previous"
@@ -179,11 +180,11 @@ class SigmaRuleManager:
 
     def __init__(
         self,
-        builtin_dir="core/forensics/plugins/sigma",
-        data_dir="data/sigma",
+        builtin_dir=None,
+        data_dir=None,
     ):
-        self.builtin = Path(builtin_dir)
-        self.root = Path(data_dir)
+        self.builtin = Path(builtin_dir) if builtin_dir is not None else default_sigma_builtin_dir()
+        self.root = Path(data_dir) if data_dir is not None else default_sigma_data_dir()
         self.custom = self.root / "custom"
         self.managed = self.root / "active"
 

@@ -22,7 +22,7 @@ import {
   Crosshair,
   Loader2,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type {
   Alert,
@@ -35,6 +35,9 @@ import type {
   TopologyNode,
 } from "@/types/watchtower";
 import { useSensorScope } from "@/components/useSensorScope";
+import { resolveOverviewEvidenceState, resolveOverviewPosture } from "@/lib/overview-state";
+import { captureControlDisabled } from "@/lib/capture-control";
+import { describeServiceStatus } from "@/lib/service-status";
 
 export const Route = createFileRoute("/")({
   loader: async () => fetchDashboard(),
@@ -63,24 +66,42 @@ function CommandCenter() {
   const [data, setData] = useState(initialData);
   const { selectedNodeId } = useSensorScope();
   const { health, stats, timeline, protocols, ports, alerts, entities, topology, pipeline } = data;
+  const serviceStatus = describeServiceStatus(health);
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>(data.interfaces);
   const [adaptersOpen, setAdaptersOpen] = useState(false);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [captureBusy, setCaptureBusy] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const clock = useClock();
 
-  useEffect(() => {
-    void Promise.all([
-      fetchDashboard({ data: { node: selectedNodeId } }),
-      selectedNodeId ? Promise.resolve([]) : fetchInterfaces(),
-      fetchTopology({ data: { node: selectedNodeId } }),
-    ]).then(([next, nextInterfaces, nextTopology]) => {
+  const refreshOverview = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const [next, nextInterfaces, nextTopology] = await Promise.all([
+        fetchDashboard({ data: { node: selectedNodeId } }),
+        selectedNodeId ? Promise.resolve([]) : fetchInterfaces(),
+        fetchTopology({ data: { node: selectedNodeId } }),
+      ]);
       setData({ ...next, interfaces: nextInterfaces, topology: nextTopology });
       setInterfaces(nextInterfaces);
       setSelectedNode(null);
-    });
+    } finally {
+      setRefreshing(false);
+    }
   }, [selectedNodeId]);
+
+  useEffect(() => {
+    void refreshOverview().catch((cause) => {
+      setCaptureError(cause instanceof Error ? cause.message : "Dashboard refresh failed");
+    });
+  }, [refreshOverview]);
+
+  const refreshOverviewFromControl = () => {
+    void refreshOverview().catch((cause) => {
+      setCaptureError(cause instanceof Error ? cause.message : "Dashboard refresh failed");
+    });
+  };
 
   const timelineData = timeline.map((t: TimelinePoint) => ({
     ...t,
@@ -93,30 +114,13 @@ function CommandCenter() {
   const totalAlerts =
     stats.alerts.critical + stats.alerts.high + stats.alerts.medium + stats.alerts.low;
   const maxPriority = Math.max(0, ...entities.map((entity) => entity.priority_score));
-  const risk =
-    maxPriority >= 80
-      ? {
-          level: "ELEVATED",
-          color: "text-severity-critical",
-          bg: "bg-severity-critical/10",
-          border: "border-severity-critical/40",
-        }
-      : maxPriority >= 50
-        ? {
-            level: "GUARDED",
-            color: "text-severity-high",
-            bg: "bg-severity-high/10",
-            border: "border-severity-high/40",
-          }
-        : maxPriority >= 20
-          ? {
-              level: "WATCH",
-              color: "text-severity-medium",
-              bg: "bg-severity-medium/10",
-              border: "border-severity-medium/40",
-            }
-          : { level: "NOMINAL", color: "text-ok", bg: "bg-ok/10", border: "border-ok/40" };
+  const overviewState = resolveOverviewEvidenceState({ ...data, interfaces });
+  const noEvidence = ["no-data", "starting", "collecting"].includes(overviewState);
+  const risk = resolveOverviewPosture(overviewState, entities.length, maxPriority);
   const topEntities = [...entities].sort((a, b) => b.risk_score - a.risk_score).slice(0, 6);
+  const captureReadyCount = interfaces.filter(
+    (iface) => iface.status === "up" && iface.backends.length > 0 && !iface.unavailable_reason,
+  ).length;
 
   const toggleCapture = async (id: string, capturing: boolean) => {
     setCaptureBusy(id);
@@ -165,10 +169,9 @@ function CommandCenter() {
 
   return (
     <div className="flex flex-col min-h-screen">
-      {health.status !== "ok" && (
+      {serviceStatus.bannerText && (
         <div className="border-b border-severity-high/40 bg-severity-high/10 px-6 py-2 mono text-[11px] text-severity-high">
-          CONTROL PLANE {health.status.toUpperCase()} ·{" "}
-          {health.message || `database ${health.database}, daemon ${health.daemon}`}
+          {serviceStatus.bannerText}
         </div>
       )}
       {(pipeline.stale_analytics ||
@@ -207,64 +210,148 @@ function CommandCenter() {
         </div>
       </header>
 
+      <section
+        role="status"
+        aria-live="polite"
+        className={`border-b px-6 py-3 ${noEvidence ? "border-border bg-surface" : "border-signal/20 bg-signal/[0.03]"}`}
+      >
+        {overviewState === "no-data" ? (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="mono text-[11px] uppercase tracking-wider text-foreground">
+                NO CAPTURE DATA
+              </div>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {health.daemon === "offline"
+                  ? "Choose an available adapter to start capture. WatchTower will start its local service if needed; your OS may ask for permission."
+                  : captureReadyCount > 0
+                    ? "Choose an available adapter and start capture to populate this dashboard."
+                    : "No capture-ready adapter is available. Check source availability and permissions on the Capture page."}
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              {captureReadyCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAdaptersOpen(true);
+                    document.getElementById("capture-adapters")?.scrollIntoView({
+                      behavior: "smooth",
+                      block: "nearest",
+                    });
+                  }}
+                  className="border border-signal/40 px-3 py-2 mono text-[10px] uppercase tracking-wider text-signal hover:bg-signal/10"
+                >
+                  Open capture adapters
+                </button>
+              )}
+              <a
+                href="/capture"
+                className="mono text-[10px] uppercase tracking-wider text-signal hover:text-foreground"
+              >
+                Capture setup ↗
+              </a>
+            </div>
+          </div>
+        ) : overviewState === "starting" ? (
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">
+              <span className="mono text-foreground">CAPTURE STARTING</span> · No observations are
+              available yet.
+            </p>
+            <RefreshButton refreshing={refreshing} onClick={refreshOverviewFromControl} />
+          </div>
+        ) : overviewState === "collecting" ? (
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-muted-foreground">
+              <span className="mono text-foreground">CAPTURE ACTIVE</span> · Waiting for the first
+              observations in this view.
+            </p>
+            <RefreshButton refreshing={refreshing} onClick={refreshOverviewFromControl} />
+          </div>
+        ) : overviewState === "history" ? (
+          <p className="text-sm text-muted-foreground">
+            <span className="mono text-foreground">STORED HISTORY</span> · Capture is not active;
+            the posture below reflects saved observations.
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            <span className="mono text-foreground">LIVE MONITORING</span> · Current observations and
+            posture are shown below.
+          </p>
+        )}
+      </section>
+
       <div className="grid grid-cols-12 gap-px bg-border">
         {/* LEFT RAIL — Watchlist */}
         <div className="col-span-12 lg:col-span-3 bg-background">
           <div className="border-b border-border px-4 py-3 flex items-center justify-between">
             <div>
               <div className="section-label">/ WATCHLIST</div>
-              <div className="text-sm text-foreground tracking-tight">
-                Stored High-Risk Entities
-              </div>
+              <div className="text-sm text-foreground tracking-tight">Top Observed Endpoints</div>
             </div>
             <Target className="h-3.5 w-3.5 text-muted-foreground" />
           </div>
           <div className="divide-y divide-border">
-            {topEntities.map((e: Entity, idx: number) => (
-              <div key={e.ip} className="px-4 py-3 data-row cursor-pointer group">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="mono text-[10px] text-muted-foreground w-4">
-                        {String(idx + 1).padStart(2, "0")}
-                      </span>
-                      <span className="mono text-[12px] text-signal truncate">{e.ip}</span>
+            {topEntities.length > 0 ? (
+              topEntities.map((e: Entity, idx: number) => (
+                <div key={e.ip} className="px-4 py-3 data-row cursor-pointer group">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="mono text-[10px] text-muted-foreground w-4">
+                          {String(idx + 1).padStart(2, "0")}
+                        </span>
+                        <span className="mono text-[12px] text-signal truncate">{e.ip}</span>
+                      </div>
+                      <div className="ml-6 mt-0.5 text-[11px] text-foreground/80 truncate">
+                        {e.hostname || "—"}
+                      </div>
+                      <div className="ml-6 mt-0.5 mono text-[10px] uppercase tracking-wider text-muted-foreground truncate">
+                        {e.os} · {e.identity_source}
+                      </div>
                     </div>
-                    <div className="ml-6 mt-0.5 text-[11px] text-foreground/80 truncate">
-                      {e.hostname || "—"}
-                    </div>
-                    <div className="ml-6 mt-0.5 mono text-[10px] uppercase tracking-wider text-muted-foreground truncate">
-                      {e.os} · {e.identity_source}
+                    <div className="text-right shrink-0">
+                      <div
+                        className={`numeral text-lg ${e.risk_score >= 80 ? "text-severity-critical" : e.risk_score >= 50 ? "text-severity-high" : e.risk_score >= 20 ? "text-severity-medium" : "text-signal"}`}
+                      >
+                        {e.risk_score.toFixed(0)}
+                      </div>
+                      <div className="mono text-[9px] uppercase text-muted-foreground">
+                        priority
+                      </div>
                     </div>
                   </div>
-                  <div className="text-right shrink-0">
-                    <div
-                      className={`numeral text-lg ${e.risk_score >= 80 ? "text-severity-critical" : e.risk_score >= 50 ? "text-severity-high" : e.risk_score >= 20 ? "text-severity-medium" : "text-signal"}`}
-                    >
-                      {e.risk_score.toFixed(0)}
-                    </div>
-                    <div className="mono text-[9px] uppercase text-muted-foreground">priority</div>
-                  </div>
+                  <RiskBar score={e.risk_score} />
                 </div>
-                <RiskBar score={e.risk_score} />
-              </div>
-            ))}
+              ))
+            ) : (
+              <EmptyState>
+                {noEvidence
+                  ? "No endpoints observed in this view yet."
+                  : "No scored endpoints are available in this view."}
+              </EmptyState>
+            )}
           </div>
 
           <div className="border-t border-border px-4 py-3">
             <div className="section-label mb-2">/ PROTOCOL MIX</div>
             <div className="space-y-1.5">
-              {protocols.slice(0, 5).map((p: ProtocolEntry) => (
-                <div key={p.protocol}>
-                  <div className="flex justify-between mono text-[11px]">
-                    <span className="text-foreground">{p.protocol}</span>
-                    <span className="text-muted-foreground">{p.percentage}%</span>
+              {protocols.length > 0 ? (
+                protocols.slice(0, 5).map((p: ProtocolEntry) => (
+                  <div key={p.protocol}>
+                    <div className="flex justify-between mono text-[11px]">
+                      <span className="text-foreground">{p.protocol}</span>
+                      <span className="text-muted-foreground">{p.percentage}%</span>
+                    </div>
+                    <div className="mt-1 h-[3px] bg-border">
+                      <div className="h-full bg-signal" style={{ width: `${p.percentage}%` }} />
+                    </div>
                   </div>
-                  <div className="mt-1 h-[3px] bg-border">
-                    <div className="h-full bg-signal" style={{ width: `${p.percentage}%` }} />
-                  </div>
-                </div>
-              ))}
+                ))
+              ) : (
+                <EmptyState compact>No protocol observations are available yet.</EmptyState>
+              )}
             </div>
           </div>
         </div>
@@ -275,12 +362,15 @@ function CommandCenter() {
             <div>
               <div className="section-label">/ TOPOLOGY VIEWPORT</div>
               <div className="text-sm text-foreground tracking-tight">
-                Stored Traffic Graph — {topology.nodes.length} nodes
+                Traffic connections — {topology.nodes.length} nodes
               </div>
             </div>
             <div className="flex items-center gap-4 mono text-[10px] uppercase tracking-wider text-muted-foreground">
               <span className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-ok pulse-dot" /> tracking
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${activeCount > 0 ? "bg-ok pulse-dot" : "bg-muted-foreground"}`}
+                />
+                {activeCount > 0 ? "monitoring" : "not live"}
               </span>
               <Crosshair className="h-3.5 w-3.5" />
             </div>
@@ -385,6 +475,19 @@ function CommandCenter() {
               </text>
             </svg>
 
+            {visibleNodes.length === 0 && (
+              <div className="absolute inset-0 grid place-items-center px-6 text-center">
+                <div className="max-w-sm border border-border bg-background/90 px-5 py-4">
+                  <div className="section-label">NO CONNECTIONS TO MAP</div>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {noEvidence
+                      ? "Connection details will appear after packets are observed."
+                      : "No connection nodes are available in the stored observations."}
+                  </p>
+                </div>
+              </div>
+            )}
+
             {/* HUD overlay */}
             <div className="pointer-events-none absolute top-2 right-3 mono text-[9px] uppercase tracking-wider text-signal/70">
               SOURCE {stats.source}
@@ -408,40 +511,46 @@ function CommandCenter() {
                 <span className="ml-1 mono text-[10px] uppercase text-muted-foreground">pkt</span>
               </div>
             </div>
-            <ResponsiveContainer width="100%" height={130}>
-              <AreaChart data={timelineData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="sig" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#38bdf8" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <XAxis
-                  dataKey="time"
-                  tick={{ fill: "#6b7787", fontSize: 9, fontFamily: "IBM Plex Mono" }}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <YAxis hide />
-                <Tooltip
-                  contentStyle={{
-                    background: "#10151c",
-                    border: "1px solid #1e2a38",
-                    borderRadius: 3,
-                    color: "#cfd6e0",
-                    fontFamily: "IBM Plex Mono",
-                    fontSize: 11,
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="packets_per_sec"
-                  stroke="#38bdf8"
-                  fill="url(#sig)"
-                  strokeWidth={1.5}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            {timelineData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={130}>
+                <AreaChart data={timelineData} margin={{ top: 4, right: 0, left: 0, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="sig" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.4} />
+                      <stop offset="100%" stopColor="#38bdf8" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <XAxis
+                    dataKey="time"
+                    tick={{ fill: "#6b7787", fontSize: 9, fontFamily: "IBM Plex Mono" }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <YAxis hide />
+                  <Tooltip
+                    contentStyle={{
+                      background: "#10151c",
+                      border: "1px solid #1e2a38",
+                      borderRadius: 3,
+                      color: "#cfd6e0",
+                      fontFamily: "IBM Plex Mono",
+                      fontSize: 11,
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="packets_per_sec"
+                    stroke="#38bdf8"
+                    fill="url(#sig)"
+                    strokeWidth={1.5}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            ) : (
+              <EmptyState compact>
+                No packet observations are available in this time window.
+              </EmptyState>
+            )}
           </div>
         </div>
 
@@ -454,7 +563,9 @@ function CommandCenter() {
             </div>
             <div className={`mt-1 numeral text-2xl ${risk.color}`}>{risk.level}</div>
             <div className="mt-0.5 mono text-[10px] uppercase tracking-wider text-muted-foreground">
-              peak priority {maxPriority.toFixed(0)} / 100
+              {entities.length > 0
+                ? `peak priority ${maxPriority.toFixed(0)} / 100`
+                : "no scored endpoints"}
             </div>
           </div>
 
@@ -482,39 +593,43 @@ function CommandCenter() {
               </a>
             </div>
             <div className="divide-y divide-border">
-              {alerts.slice(0, 8).map((alert: Alert) => (
-                <a key={alert.id} href="/alerts" className="block px-4 py-2.5 data-row">
-                  <div className="flex items-start gap-2">
-                    <span
-                      className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
-                        alert.severity === "CRITICAL"
-                          ? "bg-severity-critical"
-                          : alert.severity === "HIGH"
-                            ? "bg-severity-high"
-                            : alert.severity === "MEDIUM"
-                              ? "bg-severity-medium"
-                              : "bg-severity-low"
-                      }`}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[12px] text-foreground truncate">{alert.type}</span>
-                        <SeverityBadge severity={alert.severity} />
-                      </div>
-                      <div className="mono text-[10px] text-muted-foreground truncate mt-0.5">
-                        {alert.src_ip} → {alert.dst_ip}
+              {alerts.length > 0 ? (
+                alerts.slice(0, 8).map((alert: Alert) => (
+                  <a key={alert.id} href="/alerts" className="block px-4 py-2.5 data-row">
+                    <div className="flex items-start gap-2">
+                      <span
+                        className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${
+                          alert.severity === "CRITICAL"
+                            ? "bg-severity-critical"
+                            : alert.severity === "HIGH"
+                              ? "bg-severity-high"
+                              : alert.severity === "MEDIUM"
+                                ? "bg-severity-medium"
+                                : "bg-severity-low"
+                        }`}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[12px] text-foreground truncate">{alert.type}</span>
+                          <SeverityBadge severity={alert.severity} />
+                        </div>
+                        <div className="mono text-[10px] text-muted-foreground truncate mt-0.5">
+                          {alert.src_ip} → {alert.dst_ip}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </a>
-              ))}
+                  </a>
+                ))
+              ) : (
+                <EmptyState>No stored alerts are available in this view.</EmptyState>
+              )}
             </div>
           </div>
         </div>
       </div>
 
       {/* Adapters — bottom drawer */}
-      <div className="border-t border-border bg-surface/60">
+      <div id="capture-adapters" className="border-t border-border bg-surface/60">
         <button
           onClick={() => setAdaptersOpen(!adaptersOpen)}
           className="w-full flex items-center justify-between px-6 py-2.5 hover:bg-signal/[0.03] transition-colors"
@@ -538,63 +653,99 @@ function CommandCenter() {
               </div>
             )}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-px bg-border">
-              {interfaces.map((iface) => (
-                <div key={iface.id} className="bg-background p-4">
-                  <div className="flex items-start justify-between">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Circle
-                          className={`h-2 w-2 shrink-0 ${iface.status === "up" ? "fill-ok text-ok" : "fill-muted-foreground text-muted-foreground"}`}
-                        />
-                        <span className="text-[13px] text-foreground truncate tracking-tight">
-                          {iface.name}
-                        </span>
-                      </div>
-                      <div className="mt-0.5 mono text-[10px] text-muted-foreground truncate">
-                        {iface.ipv4 ?? iface.mac}
-                      </div>
-                      <div className="mt-1 mono text-[10px] uppercase tracking-wider">
-                        <span className={iface.capturing ? "text-ok" : "text-muted-foreground"}>
-                          {iface.capturing ? "● CAPTURING" : "○ IDLE"}
-                        </span>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => toggleCapture(iface.id, iface.capturing)}
-                      disabled={
-                        captureBusy === iface.id ||
-                        iface.status !== "up" ||
-                        health.daemon !== "online"
-                      }
-                      title={
-                        health.daemon !== "online"
-                          ? "Start the WatchTower daemon first"
-                          : iface.capturing
-                            ? "Stop capture"
-                            : "Start capture"
-                      }
-                      className={`shrink-0 grid h-7 w-7 place-items-center border transition-colors ${
-                        iface.capturing
-                          ? "border-severity-critical/40 text-severity-critical hover:bg-severity-critical/10"
-                          : "border-signal/40 text-signal hover:bg-signal/10"
-                      } disabled:cursor-not-allowed disabled:opacity-30`}
-                    >
-                      {captureBusy === iface.id ? (
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                      ) : iface.capturing ? (
-                        <Square className="h-3 w-3" strokeWidth={2} />
-                      ) : (
-                        <Play className="h-3 w-3" strokeWidth={2} />
-                      )}
-                    </button>
-                  </div>
+              {interfaces.length === 0 ? (
+                <div className="col-span-full bg-background">
+                  <EmptyState>
+                    No capture sources were returned. Check source availability on the Capture page.
+                  </EmptyState>
                 </div>
-              ))}
+              ) : (
+                interfaces.map((iface) => (
+                  <div key={iface.id} className="bg-background p-4">
+                    <div className="flex items-start justify-between">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <Circle
+                            className={`h-2 w-2 shrink-0 ${iface.status === "up" ? "fill-ok text-ok" : "fill-muted-foreground text-muted-foreground"}`}
+                          />
+                          <span className="text-[13px] text-foreground truncate tracking-tight">
+                            {iface.name}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 mono text-[10px] text-muted-foreground truncate">
+                          {iface.ipv4 ?? iface.mac}
+                        </div>
+                        <div className="mt-1 mono text-[10px] uppercase tracking-wider">
+                          <span className={iface.capturing ? "text-ok" : "text-muted-foreground"}>
+                            {iface.capturing ? "● CAPTURING" : "○ IDLE"}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => toggleCapture(iface.id, iface.capturing)}
+                        disabled={captureControlDisabled({
+                          busy: captureBusy === iface.id,
+                          capturing: iface.capturing,
+                          interfaceUp: iface.status === "up",
+                          backendAvailable: iface.backends.length > 0 && !iface.unavailable_reason,
+                        })}
+                        title={
+                          iface.capturing
+                            ? "Stop capture"
+                            : health.daemon === "offline"
+                              ? "Start capture; WatchTower may start its service and request OS permission"
+                              : "Start capture"
+                        }
+                        aria-label={`${iface.capturing ? "Stop" : "Start"} capture on ${iface.name}`}
+                        className={`shrink-0 grid h-7 w-7 place-items-center border transition-colors ${
+                          iface.capturing
+                            ? "border-severity-critical/40 text-severity-critical hover:bg-severity-critical/10"
+                            : "border-signal/40 text-signal hover:bg-signal/10"
+                        } disabled:cursor-not-allowed disabled:opacity-30`}
+                      >
+                        {captureBusy === iface.id ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : iface.capturing ? (
+                          <Square className="h-3 w-3" strokeWidth={2} />
+                        ) : (
+                          <Play className="h-3 w-3" strokeWidth={2} />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         )}
       </div>
     </div>
+  );
+}
+
+function EmptyState({
+  children,
+  compact = false,
+}: {
+  children: React.ReactNode;
+  compact?: boolean;
+}) {
+  return (
+    <p className={`text-sm text-muted-foreground ${compact ? "py-2" : "px-4 py-5"}`}>{children}</p>
+  );
+}
+
+function RefreshButton({ refreshing, onClick }: { refreshing: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={refreshing}
+      className="inline-flex items-center gap-2 border border-border px-3 py-2 mono text-[10px] uppercase tracking-wider text-signal hover:bg-signal/10 disabled:opacity-50"
+    >
+      {refreshing && <Loader2 className="h-3 w-3 animate-spin" />}
+      {refreshing ? "Refreshing" : "Refresh observations"}
+    </button>
   );
 }
 

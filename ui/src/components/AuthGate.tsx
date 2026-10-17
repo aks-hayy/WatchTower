@@ -1,5 +1,14 @@
-import { Fingerprint, KeyRound, Loader2, LockKeyhole, Radar, ShieldCheck } from "lucide-react";
+import {
+  Fingerprint,
+  KeyRound,
+  Loader2,
+  LockKeyhole,
+  Radar,
+  RefreshCw,
+  ShieldCheck,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { applyAuthStatusRefresh } from "@/lib/auth-refresh";
 import {
   disableAuthFirstRun,
   fetchAuthStatus,
@@ -14,7 +23,11 @@ import {
 } from "@/lib/auth";
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
-  const [status, setStatus] = useState<AuthStatus | null>(null);
+  const [refreshState, setRefreshState] = useState<{
+    status: AuthStatus | null;
+    connectionError: string;
+  }>({ status: null, connectionError: "" });
+  const { status, connectionError } = refreshState;
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [pin, setPin] = useState("");
@@ -28,9 +41,13 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const refresh = useCallback(
     () =>
       fetchAuthStatus()
-        .then(setStatus)
+        .then((nextStatus) =>
+          setRefreshState((previous) =>
+            applyAuthStatusRefresh(previous, { ok: true, status: nextStatus }),
+          ),
+        )
         .catch((cause) =>
-          setError(cause instanceof Error ? cause.message : "Authentication unavailable"),
+          setRefreshState((previous) => applyAuthStatusRefresh(previous, { ok: false, cause })),
         ),
     [],
   );
@@ -59,6 +76,35 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   };
 
   if (!status) {
+    if (connectionError) {
+      return (
+        <TrustFrame>
+          <div className="w-full max-w-md border border-severity-high/50 bg-surface">
+            <TrustHeader title="WatchTower is unavailable" subtitle="Local service connection" />
+            <div className="space-y-3 p-4">
+              <p className="text-[13px] leading-relaxed text-muted-foreground">
+                WatchTower could not reach its local service to verify the operator session. Start
+                the service, then try again.
+              </p>
+              <AuthErrorText text={friendlyAuthError(connectionError)} />
+              <button
+                onClick={() => {
+                  setRefreshState((previous) => ({ ...previous, connectionError: "" }));
+                  void refresh();
+                }}
+                className="flex h-9 items-center gap-2 border border-signal px-3 mono text-[10px] uppercase text-signal hover:bg-signal hover:text-primary-foreground"
+              >
+                <RefreshCw className="h-3.5 w-3.5" /> Try again
+              </button>
+              <div className="mono text-[9px] uppercase text-muted-foreground">
+                Next step: run <span className="text-foreground">tower start</span> if the service
+                is stopped.
+              </div>
+            </div>
+          </div>
+        </TrustFrame>
+      );
+    }
     return (
       <TrustFrame>
         <Loader2 className="h-5 w-5 animate-spin text-signal" />
@@ -102,6 +148,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
                   I stored the code
                 </button>
               </div>
+              {connectionError && <AuthErrorText text={friendlyAuthError(connectionError)} />}
               {error && <AuthErrorText text={error} />}
             </div>
           </div>
@@ -124,6 +171,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
             <Field label="Operator name" value={name} onChange={setName} />
             <Field label="PIN" value={pin} onChange={setPin} secret />
             <Field label="Confirm PIN" value={confirmPin} onChange={setConfirmPin} secret />
+            {connectionError && <AuthErrorText text={friendlyAuthError(connectionError)} />}
             {error && <AuthErrorText text={error} />}
             <div className="flex flex-wrap gap-2">
               <button
@@ -231,6 +279,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
               </button>
             </div>
           )}
+          {connectionError && <AuthErrorText text={friendlyAuthError(connectionError)} />}
           {error && <AuthErrorText text={error} />}
           <div className="mono text-[9px] uppercase text-muted-foreground">
             Sessions expire eight hours after authentication. There is no idle timeout.
@@ -239,6 +288,13 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       </div>
     </TrustFrame>
   );
+}
+
+function friendlyAuthError(error: string) {
+  if (/fetch failed|failed to fetch|network|refused|unreachable|load failed/i.test(error)) {
+    return "The local WatchTower service is not reachable.";
+  }
+  return "The local operator session could not be verified. Try again.";
 }
 
 function TrustFrame({ children }: { children: React.ReactNode }) {

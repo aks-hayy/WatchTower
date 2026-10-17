@@ -12,6 +12,7 @@ with_neo4j=0
 with_mesh=0
 linux_sensor=0
 prune=0
+role="controller"
 
 usage() {
   cat <<'EOF'
@@ -23,19 +24,23 @@ Options:
   --with-mesh         Publish the mesh controller listeners
   --linux-sensor      Start the Linux sensor profile
   --prune             Allow Docker system prune for reset
+  --role ROLE         Set controller or offline analysis role
   -h, --help          Show this help
 EOF
 }
 
-for argument in "$@"; do
-  case "$argument" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     -h|--help) usage; exit 0 ;;
-    --with-ollama) with_ollama=1 ;;
-    --with-neo4j) with_neo4j=1 ;;
-    --with-mesh) with_mesh=1 ;;
-    --linux-sensor) linux_sensor=1 ;;
-    --prune) prune=1 ;;
-    *) echo "Unknown option: $argument" >&2; exit 2 ;;
+    --with-ollama) with_ollama=1; shift ;;
+    --with-neo4j) with_neo4j=1; shift ;;
+    --with-mesh) with_mesh=1; shift ;;
+    --linux-sensor) linux_sensor=1; shift ;;
+    --prune) prune=1; shift ;;
+    --role)
+      [[ $# -ge 2 ]] || { echo "--role requires controller or offline." >&2; exit 2; }
+      role="$2"; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -43,6 +48,8 @@ case "$command" in init|build|up|down|status|logs|config|reset) ;; *)
   echo "Usage: scripts/container.sh {init|build|up|down|status|logs|config|reset} [--with-ollama] [--with-neo4j] [--with-mesh] [--linux-sensor]" >&2
   exit 2 ;;
 esac
+
+case "$role" in controller|offline) ;; *) echo "Role must be controller or offline." >&2; exit 2 ;; esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 container_dir="$root/deploy/container"
@@ -69,6 +76,15 @@ ensure_env_value() {
   printf '\n%s=%s\n' "$name" "$value" >> "$env_file"
 }
 
+set_env_value() {
+  local name="$1" value="$2"
+  if grep -q "^${name}=" "$env_file"; then
+    sed -i "s#^${name}=.*#${name}=${value}#" "$env_file"
+  else
+    ensure_env_value "$name" "$value"
+  fi
+}
+
 initialize() {
   mkdir -p "$secret_dir"
   [[ -f "$env_file" ]] || cp "$container_dir/.env.container.example" "$env_file"
@@ -87,13 +103,19 @@ compose=(compose --env-file "$env_file" -f compose.yaml)
 [[ "$linux_sensor" == 1 ]] && compose+=(--profile linux-sensor)
 
 cd "$root"
-if [[ "$command" == init ]]; then initialize; exit 0; fi
+if [[ "$command" == init ]]; then
+  initialize
+  set_env_value WATCHTOWER_DEPLOYMENT_ROLE "$role"
+  echo "Container role: $role"
+  exit 0
+fi
 require_docker
 [[ -f "$env_file" && -f "$master_key" ]] || initialize
 if [[ "$with_neo4j" == 1 ]]; then
   new_secret "$neo4j_key" 36
   ensure_env_value WATCHTOWER_NEO4J_PASSWORD_FILE deploy/container/secrets/watchtower_neo4j_password
 fi
+set_env_value WATCHTOWER_DEPLOYMENT_ROLE "$role"
 
 case "$command" in
   build) docker "${compose[@]}" build ;;

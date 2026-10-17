@@ -33,6 +33,30 @@ class WatchtowerShell(cmd.Cmd):
         from rich.table import Table
         from rich.panel import Panel
         from rich.text import Text
+
+        if not arg:
+            table = Table(title="WatchTower tasks", show_header=True, header_style="bold cyan", expand=True)
+            table.add_column("Task", style="bold white", min_width=18)
+            table.add_column("What it does", style="dim white")
+            table.add_column("Example", style="green")
+            table.add_row("status", "Show service, capture, and sensor health", "status")
+            table.add_row("start / stop", "Start or stop the local platform", "start")
+            table.add_row("ui", "Open the browser dashboard", "ui")
+            table.add_row("flows", "Inspect recent traffic connections", "flows")
+            table.add_row("alerts", "Review recent findings", "alerts")
+            table.add_row("dive", "Investigate an entity in depth", "dive 192.168.1.50")
+            table.add_row("analyze", "Analyze an offline PCAP or log file", "analyze sample.pcap")
+            table.add_row("doctor", "Explain and repair common setup issues", "doctor")
+            console.print(table)
+            console.print(
+                Panel(
+                    "Use 'help <task>' for details. The full command line is available as 'tower <task>'.\n"
+                    "Legacy commands remain available while you migrate to the task-oriented names.",
+                    title="Next step",
+                    border_style="green",
+                )
+            )
+            return
         
         if arg:
             # Detailed help for specific command
@@ -216,7 +240,7 @@ write, capture, and external-provider operations for approval.
         """Manage local analyst providers, research sources, and conversations.
 
 Usage: ai status|providers|research [sources|status]|conversations [list]
-          |credentials set|delete|status [REFERENCE]
+          |credentials set|delete|status [REFERENCE]|cancel RUN_ID|retry RUN_ID
 """
         from core.cli.modules.ai import AIModule
 
@@ -230,6 +254,10 @@ Usage: ai status|providers|research [sources|status]|conversations [list]
                 module.research_sources()
             elif action == "conversations":
                 module.conversations()
+            elif action == "cancel" and len(parts) > 1:
+                module.cancel(parts[1])
+            elif action == "retry" and len(parts) > 1:
+                module.retry(parts[1])
             elif action == "credentials":
                 credential_action = parts[1] if len(parts) > 1 else "status"
                 reference = parts[2] if len(parts) > 2 else None
@@ -312,13 +340,23 @@ Use 'stop' to terminate background engines."""
     def do_plugins(self, arg):
         """List all dynamically loaded protocol parsers and threat detectors.
 
-Usage: plugins [list|test|scaffold detector ...|calibration ...|sigma ...]
+Usage: plugins [list|coverage|test|scaffold detector ...|calibration ...|sigma ...]
 
 Displays a table of all active plugins loaded into the forensic engine."""
         from rich.table import Table
         from core.forensics.plugin_loader import PluginLoader
         
         parts = shlex.split(arg) if arg else []
+        if parts and parts[0] == "coverage":
+            from core.operations.capabilities import CapabilityRegistry
+            from core.operations.coverage import build_coverage_matrix
+
+            inventory = PluginLoader().list_plugins()
+            capabilities = CapabilityRegistry().summary()
+            result = build_coverage_matrix(list(inventory.values()), capabilities)
+            result["capabilities"] = capabilities
+            console.print_json(data=result)
+            return
         if parts and parts[0] in {"calibration", "scaffold"}:
             from core.calibration.service import CalibrationError, CalibrationService
             service = CalibrationService()
@@ -332,13 +370,21 @@ Displays a table of all active plugins loaded into the forensic engine."""
                 if action == "status":
                     detector = next((part for part in parts[2:] if not part.startswith("--")), None)
                     result = service.status(detector)
+                    from core.operations.calibration_presentation import calibration_trust_basis, calibration_trust_label
+                    for item in result["targets"]:
+                        item["trust_basis"] = calibration_trust_basis(
+                            item["calibration_level"], item["attestation_digest"],
+                            stale_reason=item.get("stale_reason", ""),
+                        )
+                        item["trust_label"] = calibration_trust_label(item["calibration_level"], item["trust_basis"])
                     table = Table(title="Detector Calibration Status")
                     table.add_column("Detector", style="cyan")
                     table.add_column("Finding")
                     table.add_column("Trust")
+                    table.add_column("Evidence basis")
                     table.add_column("Cap", justify="right")
                     for item in result["targets"]:
-                        table.add_row(item["detector_id"], item["finding_type"], item["calibration_level"], f"{item['effective_cap']:.1f}")
+                        table.add_row(item["detector_id"], item["finding_type"], item["trust_label"], item["trust_basis"], f"{item['effective_cap']:.1f}")
                     console.print(table)
                 elif action == "run":
                     if len(parts) < 3:
@@ -361,7 +407,10 @@ Displays a table of all active plugins loaded into the forensic engine."""
                         parts[2], parts[parts.index("--reviewer") + 1], parts[parts.index("--reason") + 1],
                     ))
                 elif action == "verify":
-                    console.print_json(data=service.verify())
+                    from core.operations.calibration_presentation import annotate_calibration_verification
+                    from core.cli.ux import calibration_verification_summary
+                    result = annotate_calibration_verification(service.verify(), service.profile_path)
+                    console.print(calibration_verification_summary(result))
                 else:
                     raise CalibrationError(f"Unknown calibration action: {action}")
             except (CalibrationError, IndexError) as exc:
@@ -409,7 +458,8 @@ Displays a table of all active plugins loaded into the forensic engine."""
         table.add_column("Name", style="white")
         table.add_column("Status", style="green")
         table.add_column("Contract")
-        table.add_column("Calibration")
+        table.add_column("Trust evidence")
+        table.add_column("Policy level")
         
         for parser in loader.get_parsers():
             status_str = "[green]Enabled[/green]" if parser.enabled else "[red]Disabled[/red]"
@@ -423,8 +473,11 @@ Displays a table of all active plugins loaded into the forensic engine."""
             manifest = getattr(detector, "manifest", None)
             effective = plugin_health.get(f"BaseDetector:{detector.name}", {})
             calibration = str(effective.get("calibration_level", "UNCALIBRATED")).replace("_", " ").title()
+            from core.operations.calibration_presentation import calibration_trust_summary
+
+            trust_evidence = calibration_trust_summary(effective.get("calibration") or [])
             table.add_row("Detector", detector.name, status_str,
-                          f"v{getattr(manifest, 'contract_version', 1)}", calibration)
+                          f"v{getattr(manifest, 'contract_version', 1)}", trust_evidence, calibration)
             
         from core.forensics.sigma_engine import SigmaEngine
         sigma = SigmaEngine()
@@ -437,7 +490,7 @@ Displays a table of all active plugins loaded into the forensic engine."""
     def do_hunt(self, arg):
         """Run Sigma YAML rules against historical database records.
 
-Usage: hunt [rule_name] [--source SOURCE] [--interface NAME]
+Usage: hunt [rule_name] [--source SOURCE] [--interface NAME] [--session ID] [--node ID]
 
 Runs the Watchtower SigmaEngine to search for threats in historical flow 
 and entity data. Any matched rules will generate new ForensicAlerts.
@@ -457,30 +510,47 @@ If rule_name is provided, only that specific rule is evaluated.
         
         c.print("[cyan]Initializing SigmaEngine...[/cyan]")
         engine = SigmaEngine()
-        if not engine.rules:
-            c.print("[red]No Sigma rules found in core/forensics/plugins/sigma/.[/red]")
-            return
-            
         c.print(f"[cyan]Loaded {len(engine.rules)} Sigma rules. Starting hunt...[/cyan]")
         parts = shlex.split(arg) if arg else []
-        rule_parts, source, interface = [], None, None
+        rule_parts, source, interface, session, node = [], None, None, None, None
+        time_start, time_end = None, None
         cursor = 0
         while cursor < len(parts):
             if parts[cursor] == "--source" and cursor + 1 < len(parts):
                 source = parts[cursor + 1]; cursor += 2
             elif parts[cursor] == "--interface" and cursor + 1 < len(parts):
                 interface = parts[cursor + 1]; cursor += 2
+            elif parts[cursor] == "--session" and cursor + 1 < len(parts):
+                session = parts[cursor + 1]; cursor += 2
+            elif parts[cursor] == "--node" and cursor + 1 < len(parts):
+                node = parts[cursor + 1]; cursor += 2
+            elif parts[cursor] == "--time-start" and cursor + 1 < len(parts):
+                time_start = float(parts[cursor + 1]); cursor += 2
+            elif parts[cursor] == "--time-end" and cursor + 1 < len(parts):
+                time_end = float(parts[cursor + 1]); cursor += 2
             else:
                 rule_parts.append(parts[cursor]); cursor += 1
         rule_name = " ".join(rule_parts) or None
 
-        alerts = engine.run_hunt(source=source, specific_rule=rule_name, interface=interface)
-        
-        if not alerts:
-            c.print("[green]Hunt complete. No Sigma matches found.[/green]")
+        report = engine.run_hunt_report(
+            source=source, specific_rule=rule_name, interface=interface,
+            capture_session_id=session, sensor_node_id=node,
+            time_start=time_start, time_end=time_end,
+        )
+        alerts = report["alerts"]
+        headline = "Hunt complete" if report["complete"] else "Hunt partially complete"
+        if report.get("coverage_status") == "no_compatible_rules":
+            c.print("[yellow]No compatible Sigma rules; no coverage. This is not a clean result.[/yellow]")
             return
-            
-        c.print(f"[bold red]Hunt complete. Found {len(alerts)} Sigma matches.[/bold red]")
+        if not alerts:
+            c.print(f"[yellow]{headline}. No Sigma matches found.[/yellow]")
+            for limitation in report["limitations"]:
+                c.print(f"[yellow]Limitation: {limitation}[/yellow]")
+            return
+
+        c.print(f"[bold red]{headline}. Found {len(alerts)} Sigma matches.[/bold red]")
+        for limitation in report["limitations"]:
+            c.print(f"[yellow]Limitation: {limitation}[/yellow]")
         table = Table(title="Sigma Hunt Results", show_header=True)
         table.add_column("Rule Match", style="red")
         table.add_column("Severity", style="yellow")
@@ -717,6 +787,10 @@ Usage: scoring status|validate|explain IP|recompute [--dry-run]
         else:
             from core.capture_sources import default_registry
             rows = default_registry().list_devices()
+        if arg.strip() == "--json":
+            from core.cli.ux import capture_source_inventory
+            console.print_json(data=capture_source_inventory(rows))
+            return
         for device in rows:
             if isinstance(device, dict):
                 source_type = str(device.get("source_type") or "network")

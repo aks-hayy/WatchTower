@@ -14,6 +14,7 @@ services:
       WATCHTOWER_CAPTURE_BACKEND: rust
       WATCHTOWER_RUST_SENSOR: /opt/watchtower/bin/watchtower-sensor
       WATCHTOWER_HYBRID_BRIDGE: ${WATCHTOWER_HYBRID_BRIDGE:-0}
+      WATCHTOWER_DEPLOYMENT_ROLE: ${WATCHTOWER_DEPLOYMENT_ROLE:-controller}
       WATCHTOWER_OLLAMA_BASE_URL: ${WATCHTOWER_OLLAMA_BASE_URL:-http://ollama:11434}
     volumes:
       - watchtower-state:/var/lib/watchtower

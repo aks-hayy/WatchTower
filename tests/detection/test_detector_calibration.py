@@ -328,6 +328,16 @@ def test_stale_profile_repair_can_only_demote_invalid_trust(tmp_path, monkeypatc
     assert service.verify()["valid"] is True
 
 
+def test_default_calibration_storage_uses_watchtower_runtime_home(tmp_path, monkeypatch):
+    runtime_home = tmp_path / "portable-watchtower"
+    monkeypatch.setenv("WATCHTOWER_HOME", str(runtime_home))
+
+    service = CalibrationService()
+
+    assert service.data_dir == runtime_home / "data"
+    assert service.report_dir == runtime_home / "data" / "calibration" / "reports"
+
+
 def test_calibration_attestations_hash_every_rust_analysis_source():
     service = CalibrationService()
     relative = {

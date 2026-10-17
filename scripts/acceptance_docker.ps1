@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot "acceptance_json.ps1")
 $Project = "watchtower-acceptance-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
 $RunRoot = if ($OutputRoot) { [IO.Path]::GetFullPath($OutputRoot) } else { Join-Path $Root ".acceptance-$Project" }
 $SecretDir = Join-Path $RunRoot "secrets"
@@ -52,6 +53,9 @@ function Set-Check([string]$Name, [bool]$Passed, [string]$Detail) {
 }
 
 function New-State {
+    if ((Test-Path -LiteralPath $SecretDir) -or (Test-Path -LiteralPath $EnvFile)) {
+        throw "Refusing to overwrite existing acceptance secret paths in $RunRoot."
+    }
     New-Item -ItemType Directory -Force -Path $SecretDir | Out-Null
     $bytes = New-Object byte[] 32
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -70,6 +74,23 @@ function New-State {
         "WATCHTOWER_UI_IMAGE=watchtower/ui:$Project",
         "WATCHTOWER_NEO4J_IMAGE=watchtower/neo4j:$Project"
     ) | Set-Content -LiteralPath $EnvFile -Encoding ascii
+}
+
+function Remove-GeneratedSecrets {
+    foreach ($path in @($EnvFile, $SecretDir)) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            if ($path -eq $EnvFile) {
+                Remove-Item -LiteralPath $EnvFile -Force -ErrorAction Stop
+            } else {
+                Remove-Item -LiteralPath $SecretDir -Recurse -Force -ErrorAction Stop
+            }
+        } catch {
+            $Results.status = "failed"
+            $cleanupError = "Could not remove generated acceptance secret path '$path': $($_.Exception.Message)"
+            if ($Results.error) { $Results.error += "; $cleanupError" } else { $Results.error = $cleanupError }
+        }
+    }
 }
 
 function Wait-Healthy([string]$Service, [int]$TimeoutSeconds = 180) {
@@ -106,8 +127,12 @@ try {
     Set-Check "rust_sensor_present" ($LASTEXITCODE -eq 0) "Rust sensor binary exists in controller image"
 
     $doctor = & $Docker compose -p $Project --env-file $EnvFile @ComposeFiles exec -T controller python -W ignore -m core.packet_engine.main doctor --json 2>$null
-    Set-Check "doctor_json" ($LASTEXITCODE -eq 0 -and $doctor) "container doctor returned JSON"
+    $doctorExitCode = $LASTEXITCODE
+    $doctorResult = Get-CommandJsonResult -Output $doctor -ExitCode $doctorExitCode
     $doctor | Set-Content -LiteralPath (Join-Path $RunRoot "doctor.json") -Encoding utf8
+    Set-Check "doctor_json" $doctorResult.IsValid "container doctor JSON validity: $($doctorResult.IsValid); parse error: $($doctorResult.Error)"
+    $doctorStatus = if ($doctorResult.Report -and $doctorResult.Report.status) { [string]$doctorResult.Report.status } else { "unavailable" }
+    Set-Check "doctor_exit" ($doctorResult.ExitCode -eq 0) "container doctor exit code: $($doctorResult.ExitCode); report status: $doctorStatus"
 
     $graph = & $Docker compose -p $Project --env-file $EnvFile @ComposeFiles exec -T controller python -W ignore -m core.packet_engine.main graph status 2>$null
     Set-Check "graph_status" ($LASTEXITCODE -eq 0) "graph status command completed"
@@ -131,7 +156,10 @@ try {
     Invoke-Compose logs --no-color | Set-Content -LiteralPath (Join-Path $RunRoot "logs\compose.log") -Encoding utf8
     $Results.measurements += (& $Docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' "$Project-controller-1" "$Project-ui-1" 2>$null)
     $Results.measurements | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $RunRoot "resources.json") -Encoding utf8
-    $files = Get-ChildItem -LiteralPath $RunRoot -File -Recurse -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -LiteralPath $RunRoot -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+        -not $_.FullName.Equals($EnvFile, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $_.FullName.StartsWith(($SecretDir + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)
+    }
     foreach ($file in $files) {
         $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName
         $Results.hashes += [ordered]@{ path = $file.FullName.Substring($RunRoot.Length + 1); sha256 = $hash.Hash.ToLowerInvariant() }
@@ -152,6 +180,7 @@ finally {
             Invoke-Compose @downArgs
         } catch {}
     }
+    Remove-GeneratedSecrets
     $Results.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
     $Results | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $RunRoot "acceptance.json") -Encoding utf8

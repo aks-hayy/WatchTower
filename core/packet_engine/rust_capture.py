@@ -19,6 +19,7 @@ MAGIC = b"WT01"
 FRAME_EVENTS = 1
 FRAME_HEALTH = 2
 FRAME_PACKET_INDEX = 3
+FRAME_TERMINAL = 4
 PACKET_INDEX_SCHEMA_VERSION = 1
 MAX_FRAME_BYTES = 128 * 1024 * 1024
 MAX_PACKET_INDEX_FRAME_BYTES = 4 * 1024 * 1024
@@ -194,6 +195,28 @@ def read_frame(stream):
             )
         raise ValueError(f"Rust sensor frame exceeds limit: {payload_size}")
     return frame_type, _read_exact(stream, payload_size)
+
+
+def decode_terminal_certificate(payload, *, adapter_event_count):
+    """Validate the Rust live sensor's final, post-flush delivery certificate."""
+    try:
+        certificate = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid Rust sensor terminal certificate") from exc
+    if not isinstance(certificate, dict) or certificate.get("status") != "stopped":
+        raise ValueError("Rust sensor did not certify a stopped capture")
+    for name in ("received_packets", "emitted_events", "flows"):
+        value = certificate.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Invalid Rust sensor terminal counter: {name}")
+    if certificate["emitted_events"] != adapter_event_count:
+        raise ValueError("Rust sensor terminal event count does not match delivered events")
+    if certificate["received_packets"] < certificate["emitted_events"]:
+        raise ValueError("Rust sensor terminal counters are inconsistent")
+    link_type = certificate.get("link_type")
+    if not isinstance(link_type, str) or not link_type or len(link_type) > 32:
+        raise ValueError("Invalid Rust sensor terminal link type")
+    return certificate
 
 
 def decode_event_batch(payload, origin):
@@ -452,12 +475,13 @@ def start_rust_capture(
         raise FileNotFoundError(f"Rust sensor binary not found: {binary}")
     origin = dict(origin or {})
 
-    def notify_readiness(status, message=None):
+    def notify_readiness(status, message=None, **details):
         if readiness_queue is None:
             return
         payload = {"status": status}
         if message:
             payload["message"] = str(message)
+        payload.update(details)
         try:
             readiness_queue.put(payload, timeout=0.2)
         except queue_module.Full:
@@ -466,7 +490,7 @@ def start_rust_capture(
     try:
         process = subprocess.Popen(
             [str(binary), "capture", "--interface", _resolve_device(interface), "--batch", "256"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
             env=_sensor_environment(),
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
@@ -475,6 +499,7 @@ def start_rust_capture(
         raise RuntimeError(f"Rust capture failed to start: {exc}") from exc
 
     frames = queue_module.Queue(maxsize=64)
+    reader_done = threading.Event()
 
     def reader():
         try:
@@ -484,6 +509,8 @@ def start_rust_capture(
             frames.put(EOFError("Rust sensor closed its capture stream"))
         except Exception as exc:
             frames.put(exc)
+        finally:
+            reader_done.set()
 
     threading.Thread(target=reader, daemon=True).start()
     ready = False
@@ -513,14 +540,29 @@ def start_rust_capture(
             message = str(health.get("message") or "Rust capture sensor failed to open")
             notify_readiness("error", message)
             raise RuntimeError(message)
+        if health.get("link_type"):
+            origin["link_type"] = str(health["link_type"])
         ready = True
-        notify_readiness("ready")
+        notify_readiness("ready", link_type=origin.get("link_type"))
         threading.Thread(target=_stderr_relay, args=(process.stderr,), daemon=True).start()
 
-        while process.poll() is None and not (stop_event and stop_event.is_set()):
+        stop_sent = False
+        terminal_received = False
+        delivered_events = 0
+        while not (reader_done.is_set() and frames.empty()):
+            if stop_event and stop_event.is_set() and not stop_sent and process.poll() is None:
+                try:
+                    process.stdin.write(b"STOP\n")
+                    process.stdin.flush()
+                    stop_sent = True
+                except (BrokenPipeError, OSError):
+                    break
             try:
                 item = frames.get(timeout=0.2)
             except queue_module.Empty:
+                if stop_sent and not terminal_received and process.poll() is None:
+                    # Keep waiting for the bounded pcap timeout + final flush.
+                    continue
                 continue
             if isinstance(item, Exception):
                 if isinstance(item, EOFError):
@@ -529,6 +571,7 @@ def start_rust_capture(
             frame_type, payload = item
             if frame_type == FRAME_EVENTS:
                 events = decode_event_batch(payload, origin)
+                delivered_events += len(events)
                 if metrics is not None:
                     metrics["received_packets"].value += len(events)
                 for event in events:
@@ -543,6 +586,21 @@ def start_rust_capture(
                             metrics["queue_full_events"].value += 1
             elif frame_type == FRAME_HEALTH:
                 json.loads(payload.decode("utf-8"))
+            elif frame_type == FRAME_TERMINAL:
+                certificate = decode_terminal_certificate(
+                    payload, adapter_event_count=delivered_events
+                )
+                exit_code = process.wait(timeout=3)
+                if exit_code != 0:
+                    raise RuntimeError(f"Rust capture sensor exited with code {exit_code}")
+                if metrics is not None:
+                    metrics["sensor_terminal_received"].value = 1
+                    metrics["sensor_received_packets"].value = certificate["received_packets"]
+                    metrics["sensor_emitted_events"].value = certificate["emitted_events"]
+                    metrics["sensor_flow_count"].value = certificate["flows"]
+                    metrics["sensor_exit_code"].value = exit_code
+                terminal_received = True
+                break
     except Exception as exc:
         if not ready:
             notify_readiness("error", exc)

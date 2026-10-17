@@ -121,12 +121,27 @@ class LocalAssetProfiler:
         self.db = db
 
     def build(self, ip: str, source: Optional[str] = None, persist: bool = True,
-              sensor_node_id: Optional[str] = None) -> LocalAssetProfile:
-        entity = self.db.get_entity(ip) or {"ip": ip}
+              sensor_node_id: Optional[str] = None, interface: Optional[str] = None,
+              capture_session_id: Optional[str] = None, time_start: Optional[float] = None,
+              time_end: Optional[float] = None) -> LocalAssetProfile:
+        scope_restricted = any(value is not None for value in (
+            source, interface, capture_session_id, time_start, time_end, sensor_node_id,
+        ))
+        profile_is_capture_specific = any(value is not None for value in (
+            interface, capture_session_id, time_start, time_end, sensor_node_id,
+        ))
+        # Entity is a lifetime projection without capture/interface/time provenance.
+        # It must not enrich a profile whose evidence has a narrower scope.
+        entity = (self.db.get_entity(ip) if not scope_restricted else None) or {"ip": ip}
         effective_source = source or entity.get("source") or "live"
         flow_kwargs = {"source": source, "limit": 5000}
-        if sensor_node_id:
-            flow_kwargs["sensor_node_id"] = sensor_node_id
+        for key, value in (
+            ("interface", interface), ("capture_session_id", capture_session_id),
+            ("time_start", time_start), ("time_end", time_end),
+            ("sensor_node_id", sensor_node_id),
+        ):
+            if value is not None:
+                flow_kwargs[key] = value
         flows = self.db.get_entity_flows(ip, **flow_kwargs)
         scope, subnet = classify_ip(ip)
         evidence = CaptureEvidence(flows)
@@ -214,11 +229,11 @@ class LocalAssetProfiler:
             insights=insights,
         )
 
-        if persist:
+        if persist and not profile_is_capture_specific:
             self.db.upsert_asset_profile(profile.to_dict())
             # A public peer responding on port 443 is an observed service, not
             # a proven device role.  Do not turn that into canonical identity.
-            if scope != "global" or endpoint.get("is_local_endpoint"):
+            if source is None and (scope != "global" or endpoint.get("is_local_endpoint")):
                 self.db.update_entity_asset_role(ip, role)
         return profile
 

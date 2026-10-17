@@ -37,9 +37,13 @@ class PacketEngineConfig:
     silent: bool = False
 
     def __post_init__(self):
+        from core.operations.capabilities import CapabilityRegistry
+
+        capabilities = CapabilityRegistry(data_dir=self.data_dir).probe()
         self.capture_backend = backend_policy.capture_backend(
             source_type=self.source_type,
             requested_backend=self.capture_backend,
+            runtime_capabilities={name: item.available for name, item in capabilities.items()},
         )
 
     def resolve_interface(self) -> str:

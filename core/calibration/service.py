@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import inspect
 import ipaddress
@@ -31,6 +32,7 @@ from core.calibration.corpus import (
 )
 from core.detection.contracts import detector_alert_to_finding
 from core.forensics.plugin_loader import PluginLoader
+from core.runtime_paths import RuntimePaths
 
 
 RUNNER_VERSION = "1.0.0"
@@ -45,6 +47,24 @@ BOOTSTRAP_MIN_POSITIVE_CASES = 100
 BOOTSTRAP_MIN_BENIGN_CASES = 300
 BOOTSTRAP_MIN_PRECISION = 0.95
 BOOTSTRAP_MIN_RECALL = 0.90
+
+
+@contextmanager
+def _pause_tracemalloc_for_replay():
+    """Avoid global allocation tracing on large synthetic PCAP replays.
+
+    Detector state is measured independently with `_deep_size`; tracing every
+    transient Scapy/SQLite allocation made byte-accurate volume fixtures take
+    hours without affecting any calibration gate.
+    """
+    was_tracing = tracemalloc.is_tracing()
+    if was_tracing:
+        tracemalloc.stop()
+    try:
+        yield
+    finally:
+        if was_tracing:
+            tracemalloc.start()
 
 
 class CalibrationError(RuntimeError):
@@ -90,7 +110,9 @@ class CalibrationService:
         bootstrap_path: Optional[Path] = None,
     ):
         self.project_root = Path(project_root).resolve()
-        self.data_dir = Path(data_dir or self.project_root / "data").resolve()
+        self.data_dir = Path(
+            data_dir or RuntimePaths.from_environment(repository_root=self.project_root).data
+        ).resolve()
         self.corpus_dir = Path(corpus_dir or self.project_root / "calibration" / "corpus").resolve()
         self.profile_path = Path(profile_path or self.project_root / "core" / "detection" / "scoring_profiles.yaml").resolve()
         self.bootstrap_path = Path(
@@ -312,7 +334,8 @@ class CalibrationService:
                     modes = ("memory", "streaming") if selected_backend == "python" else ("memory", "streaming")
                     for mode in modes:
                         key = f"{selected_backend}-{mode}"
-                        integrated[key] = self._run_integrated(case, selected_backend, mode)
+                        with _pause_tracemalloc_for_replay():
+                            integrated[key] = self._run_integrated(case, selected_backend, mode)
 
         if integrated:
             baseline_key = "python-memory" if "python-memory" in integrated else sorted(integrated)[0]
@@ -684,6 +707,8 @@ class CalibrationService:
 
     def status(self, detector_id: str = None) -> Dict[str, Any]:
         loader = PluginLoader()
+        from core.detection.scoring import ScoringConfig
+        config = ScoringConfig()
         result = []
         for detector in loader.get_detectors():
             if not bool(getattr(detector, "enabled", True)):
@@ -693,8 +718,6 @@ class CalibrationService:
                 continue
             if manifest.detector_id == "watchtower.sigma":
                 continue
-            from core.detection.scoring import ScoringConfig
-            config = ScoringConfig()
             for finding_type in manifest.finding_types:
                 profile = config.profile_for(manifest.detector_id, finding_type, manifest.version)
                 result.append({

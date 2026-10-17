@@ -9,6 +9,7 @@ from core.detection.scoring import (
     clear_default_scoring_config_cache,
     default_scoring_config,
 )
+from core.detection.operations import ScoringOperations
 from core.forensics.models import ForensicAlert
 from core.storage.database import WatchtowerDB
 
@@ -157,6 +158,110 @@ def test_node_scoped_risk_never_mixes_sensor_vantage_points(tmp_path):
     assert local_assessment["scope"]["id"] == db.local_sensor_node_id()
     assert db.get_risk_snapshot(remote.subject, sensor_node_id="node-a")["sensor_node_id"] == "node-a"
     assert db.get_risk_snapshot(remote.subject, sensor_node_id=db.local_sensor_node_id())["sensor_node_id"] == db.local_sensor_node_id()
+    db.close()
+
+
+def test_detection_findings_apply_target_and_time_filters_before_the_limit(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    common = {
+        "source": "pcap:scope", "capture_interface": "eth0",
+        "capture_session_id": "capture-a", "sensor_node_id": "node-a",
+    }
+    expected_subject = finding(subject="10.0.0.1", target="198.51.100.1", observed_at=100.0, **common)
+    expected_target = finding(subject="10.0.0.9", target="10.0.0.2", observed_at=105.0, **common)
+    wrong_ip = finding(subject="10.0.0.3", target="198.51.100.3", observed_at=103.0, **common)
+    wrong_time = finding(subject="10.0.0.1", target="198.51.100.4", observed_at=200.0, **common)
+    for item in (expected_subject, expected_target, wrong_ip, wrong_time):
+        db.upsert_detection_finding(item)
+
+    rows = db.get_detection_findings(
+        source="pcap:scope", interface="eth0", capture_session_id="capture-a",
+        sensor_node_id="node-a", time_start=99.0, time_end=106.0,
+        target_ips=["10.0.0.1", "10.0.0.2"], limit=10,
+    )
+
+    assert {row["subject"] for row in rows} == {"10.0.0.1", "10.0.0.9"}
+    db.close()
+
+
+def test_ephemeral_risk_assessment_uses_only_findings_in_the_requested_time_window(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    base = {
+        "subject": "10.0.0.1", "source": "pcap:scope", "capture_interface": "eth0",
+        "capture_session_id": "capture-a", "sensor_node_id": "node-a",
+    }
+    in_window = db.upsert_detection_finding(finding(observed_at=100.0, **base))
+    out_of_window = db.upsert_detection_finding(finding(observed_at=200.0, **base, target="198.51.100.2"))
+
+    assessment = db.recompute_risk(
+        "10.0.0.1", source="pcap:scope", interface="eth0", capture_session_id="capture-a",
+        sensor_node_id="node-a", time_start=90.0, time_end=110.0,
+        target_ips=["10.0.0.1"], persist=False,
+    )
+
+    assert [item["finding_id"] for item in assessment["contributors"]] == [in_window["id"]]
+    assert out_of_window["id"] != in_window["id"]
+    assert assessment["scope"]["time_start"] == 90.0
+    assert assessment["scope"]["time_end"] == 110.0
+    db.close()
+
+
+def test_scoped_risk_explanation_does_not_use_global_entity_role_or_baseline():
+    from core.api.service import WatchtowerApiService
+
+    class DB:
+        def __init__(self): self.risk_arguments = None; self.baseline_queries = 0
+        def get_entity(self, ip):
+            return {"ip": ip, "asset_role": "Global-only server role"}
+        def get_feature_baselines(self, **kwargs):
+            self.baseline_queries += 1
+            return [{"maturity": {"mature": True}, "sample_count": 100, "last_sample_at": 999.0}]
+        def recompute_risk(self, *args, **kwargs):
+            self.risk_arguments = kwargs
+            return {"subject": args[0], "priority_score": 0.0}
+
+    db = DB()
+    service = object.__new__(WatchtowerApiService)
+    service.db = db
+    result = service.scoring_risk(
+        "10.0.0.1", source="pcap:scope", interface="eth0", session="capture-a",
+        explain=True, sensor_node_id="node-a", time_start=90.0, time_end=110.0,
+        target_ips=["10.0.0.1"],
+    )
+
+    assert db.risk_arguments["asset_role"] is None
+    assert any("global endpoint role" in item.lower() for item in result["limitations"])
+    assert db.baseline_queries == 0
+    assert result["baseline_maturity"] == {
+        "mature": False, "features": 0, "minimum_sample_count": 0, "last_update": 0.0,
+    }
+
+
+def test_capture_scoped_risk_explanation_also_excludes_global_entity_role():
+    from core.api.service import WatchtowerApiService
+
+    class DB:
+        def __init__(self): self.risk_arguments = None
+        def get_entity(self, ip): return {"asset_role": "Global-only server role"}
+        def get_feature_baselines(self, **kwargs): raise AssertionError("global baseline must not be queried")
+        def recompute_risk(self, *args, **kwargs):
+            self.risk_arguments = kwargs
+            return {"subject": args[0], "priority_score": 0.0}
+
+    db = DB()
+    service = object.__new__(WatchtowerApiService)
+    service.db = db
+    service.scoring_risk("10.0.0.1", source="pcap:scope", explain=True)
+
+    assert db.risk_arguments["asset_role"] is None
+
+
+def test_time_or_target_scoped_risk_cannot_overwrite_persistent_rollup(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="cannot be persisted as rollup snapshots"):
+        db.recompute_risk("10.0.0.1", time_start=90.0, time_end=110.0, persist=True)
+
     db.close()
 
 

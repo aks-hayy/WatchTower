@@ -37,7 +37,8 @@ pub(crate) fn encode_work_item(
     output.extend_from_slice(&batch_sequence.to_be_bytes());
     output.extend_from_slice(&endpoint_count.to_be_bytes());
     output.extend_from_slice(&u16::from(observation.flow_definition.is_some()).to_be_bytes());
-    output.extend_from_slice(&u16::from(observation.conversation_definition.is_some()).to_be_bytes());
+    output
+        .extend_from_slice(&u16::from(observation.conversation_definition.is_some()).to_be_bytes());
     output.extend_from_slice(&1u16.to_be_bytes());
 
     for definition in &observation.endpoint_definitions {
@@ -121,7 +122,8 @@ pub(crate) fn encode_flow_batch(
         output.extend_from_slice(&state.syn_count.to_be_bytes());
         output.extend_from_slice(&state.syn_ack_count.to_be_bytes());
         output.extend_from_slice(&state.rst_count.to_be_bytes());
-        let sample_count = u16::try_from(state.samples.len()).map_err(|_| "too many flow samples")?;
+        let sample_count =
+            u16::try_from(state.samples.len()).map_err(|_| "too many flow samples")?;
         output.extend_from_slice(&sample_count.to_be_bytes());
         for sample in &state.samples {
             output.extend_from_slice(&sample.size.to_be_bytes());
@@ -135,7 +137,8 @@ pub(crate) fn encode_conversation_batch(
     batch_sequence: u32,
     records: &[(u32, ConversationState)],
 ) -> Result<Vec<u8>, String> {
-    let count = u16::try_from(records.len()).map_err(|_| "too many conversation records in one batch")?;
+    let count =
+        u16::try_from(records.len()).map_err(|_| "too many conversation records in one batch")?;
     let mut output = vec![SCHEMA_VERSION];
     output.extend_from_slice(&batch_sequence.to_be_bytes());
     output.extend_from_slice(&count.to_be_bytes());
@@ -164,8 +167,14 @@ mod tests {
     #[test]
     fn work_encoder_emits_definitions_once_and_rejects_raw_mode_disagreement() {
         let event = AnalysisEvent {
-            timestamp: 1.0, src: "10.0.0.1".into(), dst: "10.0.0.2".into(),
-            src_port: 50000, dst_port: 443, protocol: 6, size: 60, tcp_flags: 0x02,
+            timestamp: 1.0,
+            src: "10.0.0.1".into(),
+            dst: "10.0.0.2".into(),
+            src_port: 50000,
+            dst_port: 443,
+            protocol: 6,
+            size: 60,
+            tcp_flags: 0x02,
         };
         let mut state = AnalysisState::new(10, 10);
         let first = state.observe(event.clone()).unwrap();

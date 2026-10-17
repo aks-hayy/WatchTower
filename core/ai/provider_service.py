@@ -40,7 +40,7 @@ class AIProviderService:
                 "base_url": config.base_url,
                 "model": config.model,
                 **self._capabilities.get(name, {
-                    "agentic_ready": False, "native_tool_calls": False,
+                    "agentic_ready": None, "native_tool_calls": False,
                     "tool_protocol": "none", "capability_probe": "not_run",
                 }),
             })
@@ -72,6 +72,7 @@ class AIProviderService:
             raise ProviderUnavailable(f"A credential is required to connect {name}")
         candidate.model = selected
         setattr(self.config, name, candidate)
+        self._capabilities.pop(name, None)
         self.config.save()
         self._write_cache(name, models)
         return {
@@ -88,10 +89,14 @@ class AIProviderService:
         adapter = self.registry.create(name, self.config, self.credentials)
         capability = adapter.probe()
         self._capabilities[name] = capability
+        selected_model = getattr(self.config, name).model
+        discovered_ids = {str(item.get("id") or "") for item in models}
         return {
             "provider": name,
             "available": bool(models),
-            "model": getattr(self.config, name).model,
+            "model_catalog_available": bool(models),
+            "selected_model_available": selected_model in discovered_ids,
+            "model": selected_model,
             "models": models,
             "capability": capability,
             "agentic_ready": bool(capability.get("agentic_ready")),
@@ -138,6 +143,7 @@ class AIProviderService:
             raise ProviderUnavailable(f"Model {model!r} is not available for {name}")
         config = getattr(self.config, name)
         config.model = model
+        self._capabilities.pop(name, None)
         self.config.save()
         return {"provider": name, "model": model, "status": "selected"}
 

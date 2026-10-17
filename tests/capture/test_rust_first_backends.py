@@ -16,6 +16,7 @@ from core.packet_engine.config import PacketEngineConfig
 
 
 def test_packet_engine_config_uses_policy_for_defaults_and_environment(monkeypatch):
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: True)
     monkeypatch.delenv("WATCHTOWER_CAPTURE_BACKEND", raising=False)
     assert PacketEngineConfig().capture_backend == "rust"
 
@@ -59,6 +60,7 @@ def test_cli_start_path_uses_rust_when_backend_is_omitted(monkeypatch):
         selected["background"] = background
 
     monkeypatch.delenv("WATCHTOWER_CAPTURE_BACKEND", raising=False)
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: True)
     monkeypatch.setattr(main_module.sys, "argv", ["tower", "start", "-i", "Ethernet"])
     monkeypatch.setattr(main_module.DaemonManager, "ensure_running", lambda *args, **kwargs: True)
     monkeypatch.setattr(auth_module, "AuthModule", FakeAuthModule)
@@ -398,7 +400,7 @@ def test_capture_session_projection_exposes_only_reported_backend_version():
 def test_backend_version_uses_engine_report_and_never_backend_name(monkeypatch):
     import core.packet_engine.backend_provenance as provenance
 
-    monkeypatch.setattr(provenance, "rust_sensor_version", lambda: "2.0.0")
+    monkeypatch.setattr(provenance, "_rust_sensor_version", lambda: "2.0.0")
 
     assert provenance.reported_backend_version("rust") == "2.0.0"
     assert provenance.reported_backend_version("python")
@@ -439,6 +441,7 @@ def test_scoring_rebuild_uses_rust_replay_policy_when_no_backend_is_requested(
             seen.append(kwargs["backend"])
 
     monkeypatch.delenv("WATCHTOWER_CAPTURE_BACKEND", raising=False)
+    monkeypatch.setattr("core.packet_engine.rust_capture.rust_sensor_available", lambda: True)
     monkeypatch.setattr(engine_module, "ForensicsEngine", Engine)
 
     ScoringOperations(Database()).rebuild_available_pcaps()

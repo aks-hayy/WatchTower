@@ -7,14 +7,20 @@ mod analysis_wire;
 mod wire;
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 4] = b"WT01";
 const FRAME_EVENTS: u8 = 1;
 const FRAME_HEALTH: u8 = 2;
 const FRAME_PACKET_INDEX: u8 = 3;
+const FRAME_TERMINAL: u8 = 4;
 const FRAME_ANALYSIS_HELLO: u8 = 0x04;
 const FRAME_ANALYSIS_WORK: u8 = 0x05;
 const FRAME_ANALYSIS_FLOW: u8 = 0x06;
@@ -32,15 +38,31 @@ const ANALYSIS_CAPABILITY_V1: u64 = (1u64 << 0x04)
 const PACKET_INDEX_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FlowKey { src: String, dst: String, src_port: u16, dst_port: u16, protocol: u8 }
+struct FlowKey {
+    src: String,
+    dst: String,
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+}
 
 #[derive(Default)]
-struct FlowStats { packets: u64, bytes: u64 }
+struct FlowStats {
+    packets: u64,
+    bytes: u64,
+}
 
 #[derive(Clone, Debug)]
 struct Event {
-    timestamp: f64, src: String, dst: String, src_port: u16, dst_port: u16,
-    protocol: u8, size: u32, flags: u16, raw: Vec<u8>,
+    timestamp: f64,
+    src: String,
+    dst: String,
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+    size: u32,
+    flags: u16,
+    raw: Vec<u8>,
 }
 
 struct SelectorPacketView<'a> {
@@ -79,7 +101,10 @@ struct CapturedFrame {
     raw: Vec<u8>,
 }
 
-enum Source { Live(Capture<pcap::Active>), Offline(Capture<Offline>) }
+enum Source {
+    Live(Capture<pcap::Active>),
+    Offline(Capture<Offline>),
+}
 
 impl Source {
     fn datalink(&self) -> Linktype {
@@ -109,7 +134,10 @@ impl Source {
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|item| item == name).and_then(|index| args.get(index + 1)).cloned()
+    args.iter()
+        .position(|item| item == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }
 
 fn open_source(args: &[String]) -> Result<Source, String> {
@@ -139,6 +167,7 @@ fn link_type_name(datalink: Linktype) -> String {
     match datalink {
         Linktype::ETHERNET => "ethernet".into(),
         Linktype::RAW | Linktype::IPV4 | Linktype::IPV6 => "raw-ip".into(),
+        Linktype::NULL | Linktype::LOOP => "loopback-ip".into(),
         _ => format!("dlt-{}", datalink.0),
     }
 }
@@ -147,25 +176,62 @@ fn supported_link_type(datalink: Linktype) -> Result<&'static str, String> {
     match datalink {
         Linktype::ETHERNET => Ok("ethernet"),
         Linktype::RAW | Linktype::IPV4 | Linktype::IPV6 => Ok("raw-ip"),
+        Linktype::NULL | Linktype::LOOP => Ok("loopback-ip"),
         _ => Err(format!("unsupported pcap link type {}", datalink.0)),
     }
 }
 
-fn decode_packet(timestamp: f64, raw: Vec<u8>, datalink: Linktype) -> Option<Event> {
-    let (mut offset, mut ethertype) = if datalink == Linktype::ETHERNET {
-        if raw.len() < 14 { return None; }
-        (14usize, u16::from_be_bytes([raw[12], raw[13]]))
-    } else {
-        let version = raw.first().copied()? >> 4;
-        let ethertype = match (datalink, version) {
-            (Linktype::IPV4, 4) | (Linktype::RAW, 4) => 0x0800,
-            (Linktype::IPV6, 6) | (Linktype::RAW, 6) => 0x86dd,
+fn raw_ip_view(raw: &[u8], datalink: Linktype) -> Option<(usize, u16)> {
+    if matches!(datalink, Linktype::NULL | Linktype::LOOP) {
+        if raw.len() < 5 {
+            return None;
+        }
+        let family_bytes: [u8; 4] = raw[..4].try_into().ok()?;
+        let families = if datalink == Linktype::NULL {
+            [
+                u32::from_ne_bytes(family_bytes),
+                u32::from_le_bytes(family_bytes),
+                u32::from_be_bytes(family_bytes),
+            ]
+        } else {
+            [u32::from_be_bytes(family_bytes), 0, 0]
+        };
+        let version = raw[4] >> 4;
+        let ethertype = match version {
+            4 if families.contains(&2) => 0x0800,
+            6 if families
+                .iter()
+                .any(|family| matches!(family, 10 | 23 | 24 | 26 | 28 | 30)) =>
+            {
+                0x86dd
+            }
             _ => return None,
         };
-        (0usize, ethertype)
+        return Some((4, ethertype));
+    }
+
+    let version = raw.first().copied()? >> 4;
+    let ethertype = match (datalink, version) {
+        (Linktype::IPV4, 4) | (Linktype::RAW, 4) => 0x0800,
+        (Linktype::IPV6, 6) | (Linktype::RAW, 6) => 0x86dd,
+        _ => return None,
+    };
+    Some((0, ethertype))
+}
+
+fn decode_packet(timestamp: f64, raw: Vec<u8>, datalink: Linktype) -> Option<Event> {
+    let (mut offset, mut ethertype) = if datalink == Linktype::ETHERNET {
+        if raw.len() < 14 {
+            return None;
+        }
+        (14usize, u16::from_be_bytes([raw[12], raw[13]]))
+    } else {
+        raw_ip_view(&raw, datalink)?
     };
     while datalink == Linktype::ETHERNET && matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
-        if raw.len() < offset + 4 { return None; }
+        if raw.len() < offset + 4 {
+            return None;
+        }
         ethertype = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]);
         offset += 4;
     }
@@ -184,27 +250,33 @@ fn decode_packet(timestamp: f64, raw: Vec<u8>, datalink: Linktype) -> Option<Eve
     let (src_port, dst_port, flags) =
         decode_transport(&raw, transport_offset, packet_end, protocol);
     Some(Event {
-        timestamp, src, dst, src_port, dst_port, protocol,
-        size: raw.len().min(u32::MAX as usize) as u32, flags, raw,
+        timestamp,
+        src,
+        dst,
+        src_port,
+        dst_port,
+        protocol,
+        size: raw.len().min(u32::MAX as usize) as u32,
+        flags,
+        raw,
     })
 }
 
 fn selector_packet_view(event: &Event, datalink: Linktype) -> Option<SelectorPacketView<'_>> {
     let raw = &event.raw;
     let (mut offset, mut ethertype, link_class) = if datalink == Linktype::ETHERNET {
-        if raw.len() < 14 { return None; }
+        if raw.len() < 14 {
+            return None;
+        }
         (14usize, u16::from_be_bytes([raw[12], raw[13]]), 1u8)
     } else {
-        let version = raw.first().copied()? >> 4;
-        let ethertype = match version {
-            4 => 0x0800,
-            6 => 0x86dd,
-            _ => return None,
-        };
-        (0usize, ethertype, 2u8)
+        let (offset, ethertype) = raw_ip_view(raw, datalink)?;
+        (offset, ethertype, 2u8)
     };
     while datalink == Linktype::ETHERNET && matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
-        if raw.len() < offset + 4 { return None; }
+        if raw.len() < offset + 4 {
+            return None;
+        }
         ethertype = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]);
         offset += 4;
     }
@@ -222,8 +294,11 @@ fn selector_packet_view(event: &Event, datalink: Linktype) -> Option<SelectorPac
     let payload_offset = match protocol {
         6 if packet_end >= transport_offset + 20 => {
             let header = usize::from((raw[transport_offset + 12] >> 4) & 0x0f) * 4;
-            if header < 20 || transport_offset + header > packet_end { packet_end }
-            else { transport_offset + header }
+            if header < 20 || transport_offset + header > packet_end {
+                packet_end
+            } else {
+                transport_offset + header
+            }
         }
         17 if packet_end >= transport_offset + 8 => transport_offset + 8,
         1 | 58 if packet_end >= transport_offset + 8 => transport_offset + 8,
@@ -238,41 +313,61 @@ fn selector_packet_view(event: &Event, datalink: Linktype) -> Option<SelectorPac
         tcp_flags: event.flags,
         icmp_type: if matches!(protocol, 1 | 58) && transport_offset < packet_end {
             Some(raw[transport_offset])
-        } else { None },
+        } else {
+            None
+        },
         payload: &raw[payload_offset.min(packet_end)..packet_end],
         frame: raw,
     })
 }
 
 fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
-fn selector_clause_matches(
-    clause: &wire::SelectorClause,
-    packet: &SelectorPacketView<'_>,
-) -> bool {
+fn selector_clause_matches(clause: &wire::SelectorClause, packet: &SelectorPacketView<'_>) -> bool {
     use wire::SelectorClause::*;
     match clause {
         Always => true,
         LinkClassIn(values) => values.contains(&packet.link_class),
         EtherTypeIn(values) => values.contains(&packet.ethertype),
         IpProtocolIn(values) => values.contains(&packet.ip_protocol),
-        EitherPortIn(values) => values.contains(&packet.src_port) || values.contains(&packet.dst_port),
+        EitherPortIn(values) => {
+            values.contains(&packet.src_port) || values.contains(&packet.dst_port)
+        }
         SourcePortIn(values) => values.contains(&packet.src_port),
         DestinationPortIn(values) => values.contains(&packet.dst_port),
-        TcpFlags { required, forbidden } => {
+        TcpFlags {
+            required,
+            forbidden,
+        } => {
             packet.ip_protocol == 6
                 && packet.tcp_flags & required == *required
                 && packet.tcp_flags & forbidden == 0
         }
-        IcmpTypeIn(values) => packet.icmp_type.is_some_and(|value| values.contains(&value)),
+        IcmpTypeIn(values) => packet
+            .icmp_type
+            .is_some_and(|value| values.contains(&value)),
         PayloadMinimumLength(length) => packet.payload.len() >= *length as usize,
         PayloadPrefixIn(values) => values.iter().any(|value| packet.payload.starts_with(value)),
-        PayloadContainsAny(values) => values.iter().any(|value| contains_slice(packet.payload, value)),
-        PayloadByteMask { offset, mask, expected } => packet.payload.get(*offset as usize)
+        PayloadContainsAny(values) => values
+            .iter()
+            .any(|value| contains_slice(packet.payload, value)),
+        PayloadByteMask {
+            offset,
+            mask,
+            expected,
+        } => packet
+            .payload
+            .get(*offset as usize)
             .is_some_and(|value| value & mask == *expected),
-        PayloadDiversity { sample, minimum_distinct } => {
+        PayloadDiversity {
+            sample,
+            minimum_distinct,
+        } => {
             let mut seen = [false; 256];
             let mut count = 0u16;
             for value in packet.payload.iter().take(*sample as usize) {
@@ -283,10 +378,17 @@ fn selector_clause_matches(
             }
             count >= *minimum_distinct
         }
-        FrameWindowContainsAny { start, end, literals } => {
+        FrameWindowContainsAny {
+            start,
+            end,
+            literals,
+        } => {
             let start = (*start as usize).min(packet.frame.len());
             let end = (*end as usize).min(packet.frame.len());
-            start <= end && literals.iter().any(|value| contains_slice(&packet.frame[start..end], value))
+            start <= end
+                && literals
+                    .iter()
+                    .any(|value| contains_slice(&packet.frame[start..end], value))
         }
     }
 }
@@ -295,11 +397,17 @@ fn select_candidate(plan: &wire::AnalysisPlan, event: &Event, datalink: Linktype
     if plan.selector_programs.is_empty() {
         return (2, 0);
     }
-    let Some(packet) = selector_packet_view(event, datalink) else { return (0, 0); };
+    let Some(packet) = selector_packet_view(event, datalink) else {
+        return (0, 0);
+    };
     let mut mode = 0u8;
     let mut matched = 0u64;
     for program in &plan.selector_programs {
-        if program.clauses.iter().all(|clause| selector_clause_matches(clause, &packet)) {
+        if program
+            .clauses
+            .iter()
+            .all(|clause| selector_clause_matches(clause, &packet))
+        {
             mode = mode.max(program.candidate_mode);
             matched |= 1u64 << program.program_id;
         }
@@ -311,8 +419,18 @@ fn decode_arp(raw: &[u8], offset: usize) -> Option<(String, String, u8, usize)> 
     if raw.len() < offset + 28 || raw[offset + 4] != 6 || raw[offset + 5] != 4 {
         return None;
     }
-    let src = Ipv4Addr::new(raw[offset + 14], raw[offset + 15], raw[offset + 16], raw[offset + 17]);
-    let dst = Ipv4Addr::new(raw[offset + 24], raw[offset + 25], raw[offset + 26], raw[offset + 27]);
+    let src = Ipv4Addr::new(
+        raw[offset + 14],
+        raw[offset + 15],
+        raw[offset + 16],
+        raw[offset + 17],
+    );
+    let dst = Ipv4Addr::new(
+        raw[offset + 24],
+        raw[offset + 25],
+        raw[offset + 26],
+        raw[offset + 27],
+    );
     Some((src.to_string(), dst.to_string(), 254, raw.len()))
 }
 
@@ -337,7 +455,9 @@ fn decode_ipv4(
     if total_len < header_len {
         return Err("malformed_ipv4_length");
     }
-    let packet_end = offset.checked_add(total_len).ok_or("malformed_ipv4_length")?;
+    let packet_end = offset
+        .checked_add(total_len)
+        .ok_or("malformed_ipv4_length")?;
     if packet_end > raw.len() {
         return Err("truncated_ipv4");
     }
@@ -345,8 +465,18 @@ fn decode_ipv4(
     if fragment & 0x3fff != 0 {
         return Err("fragmented_ipv4");
     }
-    let src = Ipv4Addr::new(raw[offset + 12], raw[offset + 13], raw[offset + 14], raw[offset + 15]);
-    let dst = Ipv4Addr::new(raw[offset + 16], raw[offset + 17], raw[offset + 18], raw[offset + 19]);
+    let src = Ipv4Addr::new(
+        raw[offset + 12],
+        raw[offset + 13],
+        raw[offset + 14],
+        raw[offset + 15],
+    );
+    let dst = Ipv4Addr::new(
+        raw[offset + 16],
+        raw[offset + 17],
+        raw[offset + 18],
+        raw[offset + 19],
+    );
     Ok((
         src.to_string(),
         dst.to_string(),
@@ -390,9 +520,7 @@ fn decode_ipv6(
                 }
                 let length = (raw[cursor + 1] as usize + 1) * 8;
                 next = raw[cursor];
-                cursor = cursor
-                    .checked_add(length)
-                    .ok_or("malformed_ipv6_length")?;
+                cursor = cursor.checked_add(length).ok_or("malformed_ipv6_length")?;
             }
             44 => {
                 if packet_end < cursor + 8 {
@@ -411,9 +539,7 @@ fn decode_ipv6(
                 }
                 let length = (raw[cursor + 1] as usize + 2) * 4;
                 next = raw[cursor];
-                cursor = cursor
-                    .checked_add(length)
-                    .ok_or("malformed_ipv6_length")?;
+                cursor = cursor.checked_add(length).ok_or("malformed_ipv6_length")?;
             }
             _ => break,
         }
@@ -470,12 +596,7 @@ fn transport_failure_reason(
     None
 }
 
-fn decode_transport(
-    raw: &[u8],
-    offset: usize,
-    packet_end: usize,
-    protocol: u8,
-) -> (u16, u16, u16) {
+fn decode_transport(raw: &[u8], offset: usize, packet_end: usize, protocol: u8) -> (u16, u16, u16) {
     if packet_end < offset + 4 || raw.len() < offset + 4 {
         return (0, 0, 0);
     }
@@ -486,7 +607,11 @@ fn decode_transport(
     } else {
         0
     };
-    if protocol == 6 || protocol == 17 { (src_port, dst_port, flags) } else { (0, 0, 0) }
+    if protocol == 6 || protocol == 17 {
+        (src_port, dst_port, flags)
+    } else {
+        (0, 0, 0)
+    }
 }
 
 fn decode_failure_reason(raw: &[u8], datalink: Linktype) -> String {
@@ -508,14 +633,27 @@ fn decode_failure_reason(raw: &[u8], datalink: Linktype) -> String {
             0x86dd => "malformed_ipv6",
             0x0806 => "malformed_arp",
             _ => "unsupported_ethertype",
-        }.into();
+        }
+        .into();
     }
     if matches!(datalink, Linktype::RAW | Linktype::IPV4 | Linktype::IPV6) {
         return if raw.is_empty() {
             "truncated_ip"
         } else {
             "malformed_ip"
-        }.into();
+        }
+        .into();
+    }
+    if matches!(datalink, Linktype::NULL | Linktype::LOOP) {
+        if raw.len() < 5 {
+            return "truncated_loopback_header".into();
+        }
+        return if raw_ip_view(raw, datalink).is_some() {
+            "malformed_ip"
+        } else {
+            "unsupported_loopback_family"
+        }
+        .into();
     }
     "unsupported_link_type".into()
 }
@@ -527,13 +665,7 @@ fn truncated_transport_reason(raw: &[u8], datalink: Linktype) -> Option<&'static
         }
         (14usize, u16::from_be_bytes([raw[12], raw[13]]))
     } else {
-        let version = raw.first().copied()? >> 4;
-        let ethertype = match (datalink, version) {
-            (Linktype::IPV4, 4) | (Linktype::RAW, 4) => 0x0800,
-            (Linktype::IPV6, 6) | (Linktype::RAW, 6) => 0x86dd,
-            _ => return None,
-        };
-        (0usize, ethertype)
+        raw_ip_view(raw, datalink)?
     };
     while datalink == Linktype::ETHERNET && matches!(ethertype, 0x8100 | 0x88a8 | 0x9100) {
         if raw.len() < offset + 4 {
@@ -630,21 +762,26 @@ fn packet_index_record(
 
 fn sha256(input: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
     let mut state = [
-        0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
     ];
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut padded = input.to_vec();
@@ -672,18 +809,16 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         }
         let mut work = state;
         for index in 0..64 {
-            let sum1 = work[4].rotate_right(6)
-                ^ work[4].rotate_right(11)
-                ^ work[4].rotate_right(25);
+            let sum1 =
+                work[4].rotate_right(6) ^ work[4].rotate_right(11) ^ work[4].rotate_right(25);
             let choice = (work[4] & work[5]) ^ ((!work[4]) & work[6]);
             let temp1 = work[7]
                 .wrapping_add(sum1)
                 .wrapping_add(choice)
                 .wrapping_add(K[index])
                 .wrapping_add(words[index]);
-            let sum0 = work[0].rotate_right(2)
-                ^ work[0].rotate_right(13)
-                ^ work[0].rotate_right(22);
+            let sum0 =
+                work[0].rotate_right(2) ^ work[0].rotate_right(13) ^ work[0].rotate_right(22);
             let majority = (work[0] & work[1]) ^ (work[0] & work[2]) ^ (work[1] & work[2]);
             let temp2 = sum0.wrapping_add(majority);
             work = [
@@ -773,17 +908,28 @@ fn encode_events(events: &[Event]) -> Vec<u8> {
     payload.extend_from_slice(&(events.len() as u16).to_be_bytes());
     for event in events {
         payload.extend_from_slice(&event.timestamp.to_be_bytes());
-        payload.push(event.src.len().min(255) as u8); payload.extend_from_slice(event.src.as_bytes());
-        payload.push(event.dst.len().min(255) as u8); payload.extend_from_slice(event.dst.as_bytes());
+        payload.push(event.src.len().min(255) as u8);
+        payload.extend_from_slice(event.src.as_bytes());
+        payload.push(event.dst.len().min(255) as u8);
+        payload.extend_from_slice(event.dst.as_bytes());
         payload.extend_from_slice(&event.src_port.to_be_bytes());
-        payload.extend_from_slice(&event.dst_port.to_be_bytes()); payload.push(event.protocol);
-        payload.extend_from_slice(&event.size.to_be_bytes()); payload.extend_from_slice(&event.flags.to_be_bytes());
-        payload.extend_from_slice(&(event.raw.len() as u32).to_be_bytes()); payload.extend_from_slice(&event.raw);
+        payload.extend_from_slice(&event.dst_port.to_be_bytes());
+        payload.push(event.protocol);
+        payload.extend_from_slice(&event.size.to_be_bytes());
+        payload.extend_from_slice(&event.flags.to_be_bytes());
+        payload.extend_from_slice(&(event.raw.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&event.raw);
     }
     payload
 }
 
-fn encode_health(received: u64, emitted: u64, flows: usize, started: Instant, link_type: &str) -> Vec<u8> {
+fn encode_health(
+    received: u64,
+    emitted: u64,
+    flows: usize,
+    started: Instant,
+    link_type: &str,
+) -> Vec<u8> {
     format!("{{\"status\":\"ready\",\"link_type\":\"{link_type}\",\"received_packets\":{received},\"emitted_packets\":{emitted},\"flows\":{flows},\"uptime_ms\":{}}}", started.elapsed().as_millis()).into_bytes()
 }
 
@@ -828,7 +974,9 @@ fn run_packet_index(
 fn read_analysis_plan() -> Result<wire::AnalysisPlan, String> {
     let mut input = io::stdin().lock();
     let mut header = [0u8; 10];
-    input.read_exact(&mut header).map_err(|error| format!("analysis plan header: {error}"))?;
+    input
+        .read_exact(&mut header)
+        .map_err(|error| format!("analysis plan header: {error}"))?;
     if &header[..4] != MAGIC || header[4] != 1 || header[5] != FRAME_ANALYSIS_PLAN {
         return Err("first analysis input frame must be a WT01 analysis plan".into());
     }
@@ -837,7 +985,9 @@ fn read_analysis_plan() -> Result<wire::AnalysisPlan, String> {
         return Err("analysis plan frame exceeds 1048576 bytes".into());
     }
     let mut payload = vec![0u8; size];
-    input.read_exact(&mut payload).map_err(|error| format!("analysis plan payload: {error}"))?;
+    input
+        .read_exact(&mut payload)
+        .map_err(|error| format!("analysis plan payload: {error}"))?;
     wire::decode_analysis_plan(&payload)
 }
 
@@ -912,7 +1062,9 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
                 break;
             }
         };
-        packet_ordinal = packet_ordinal.checked_add(1).ok_or("packet ordinal overflow")?;
+        packet_ordinal = packet_ordinal
+            .checked_add(1)
+            .ok_or("packet ordinal overflow")?;
         let index = packet_index_record(
             packet_ordinal,
             frame.timestamp,
@@ -921,28 +1073,35 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
             datalink,
         );
         let decoded = decode_packet(frame.timestamp, frame.raw, datalink);
-        read_decode_ns = read_decode_ns.saturating_add(
-            read_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-        );
+        read_decode_ns = read_decode_ns
+            .saturating_add(read_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         index_batch.push(index);
         if index_batch.len() >= 4096 {
             let payload = encode_packet_index(&index_batch);
             let write_started = Instant::now();
             write_frame_to(&mut writer, FRAME_ANALYSIS_PACKET_INDEX, &payload)
                 .map_err(|error| error.to_string())?;
-            blocked_write_ns = blocked_write_ns.saturating_add(
-                write_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-            );
+            blocked_write_ns =
+                blocked_write_ns.saturating_add(
+                    write_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                );
             digests[0] = update_frame_digest(digests[0], &payload);
             index_batch.clear();
         }
-        let Some(event) = decoded else { continue; };
-        first_timestamp = Some(first_timestamp.map_or(event.timestamp, |value| value.min(event.timestamp)));
-        last_timestamp = Some(last_timestamp.map_or(event.timestamp, |value| value.max(event.timestamp)));
+        let Some(event) = decoded else {
+            continue;
+        };
+        first_timestamp =
+            Some(first_timestamp.map_or(event.timestamp, |value| value.min(event.timestamp)));
+        last_timestamp =
+            Some(last_timestamp.map_or(event.timestamp, |value| value.max(event.timestamp)));
         let candidate_started = Instant::now();
         let (mut candidate_mode, matched_programs) = select_candidate(&plan, &event, datalink);
         candidate_match_ns = candidate_match_ns.saturating_add(
-            candidate_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            candidate_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
         );
         let aggregate_started = Instant::now();
         let analysis_event = analysis::AnalysisEvent {
@@ -964,13 +1123,16 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
             }
         };
         aggregate_ns = aggregate_ns.saturating_add(
-            aggregate_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            aggregate_started
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
         );
-        if candidate_mode == 0 && (
-            !observation.endpoint_definitions.is_empty()
+        if candidate_mode == 0
+            && (!observation.endpoint_definitions.is_empty()
                 || observation.flow_definition.is_some()
-                || observation.conversation_definition.is_some()
-        ) {
+                || observation.conversation_definition.is_some())
+        {
             candidate_mode = 1;
         }
         if candidate_mode == 0 {
@@ -983,7 +1145,9 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
         conversation_high = conversation_high.max(state.active_conversation_count() as u32);
         resume_high = resume_high.max(state.resume_conversation_count() as u32);
         sample_bytes_high = sample_bytes_high.max(state.sample_bytes());
-        sequence = sequence.checked_add(1).ok_or("analysis sequence overflow")?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or("analysis sequence overflow")?;
         let payload = analysis_wire::encode_work_item(
             sequence,
             packet_ordinal,
@@ -996,9 +1160,8 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
         let write_started = Instant::now();
         write_frame_to(&mut writer, FRAME_ANALYSIS_WORK, &payload)
             .map_err(|error| error.to_string())?;
-        blocked_write_ns = blocked_write_ns.saturating_add(
-            write_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-        );
+        blocked_write_ns = blocked_write_ns
+            .saturating_add(write_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         digests[1] = update_frame_digest(digests[1], &payload);
     }
 
@@ -1010,7 +1173,9 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
     }
     let flow_records = state.directional_flow_records();
     for records in flow_records.chunks(4096) {
-        sequence = sequence.checked_add(1).ok_or("analysis sequence overflow")?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or("analysis sequence overflow")?;
         let payload = analysis_wire::encode_flow_batch(sequence, records)?;
         write_frame_to(&mut writer, FRAME_ANALYSIS_FLOW, &payload)
             .map_err(|error| error.to_string())?;
@@ -1018,7 +1183,9 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
     }
     let conversation_records = state.conversation_records();
     for records in conversation_records.chunks(4096) {
-        sequence = sequence.checked_add(1).ok_or("analysis sequence overflow")?;
+        sequence = sequence
+            .checked_add(1)
+            .ok_or("analysis sequence overflow")?;
         let payload = analysis_wire::encode_conversation_batch(sequence, records)?;
         write_frame_to(&mut writer, FRAME_ANALYSIS_CONVERSATION, &payload)
             .map_err(|error| error.to_string())?;
@@ -1045,7 +1212,12 @@ fn run_analysis(args: &[String]) -> Result<(), String> {
         first_decoded_timestamp: first_timestamp,
         last_decoded_timestamp: last_timestamp,
         digests,
-        timers_ns: [read_decode_ns, candidate_match_ns, aggregate_ns, blocked_write_ns],
+        timers_ns: [
+            read_decode_ns,
+            candidate_match_ns,
+            aggregate_ns,
+            blocked_write_ns,
+        ],
         high_waters: [endpoint_high, flow_high, conversation_high, resume_high],
         sample_bytes_high_water: sample_bytes_high,
     };
@@ -1072,8 +1244,12 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_analysis(args);
     }
     let benchmark = command == Some("benchmark");
+    let live_capture = command == Some("capture");
     let index = command == Some("index");
-    let batch_size = arg_value(args, "--batch").and_then(|value| value.parse().ok()).unwrap_or(256usize).clamp(1, 4096);
+    let batch_size = arg_value(args, "--batch")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256usize)
+        .clamp(1, 4096);
     let mut source = open_source(args)?;
     let datalink = source.datalink();
     if index {
@@ -1086,19 +1262,52 @@ fn run(args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let mut last_health = Instant::now();
     if !benchmark {
-        write_frame(FRAME_HEALTH, &encode_health(0, 0, 0, started, link_type)).map_err(|error| error.to_string())?;
+        write_frame(FRAME_HEALTH, &encode_health(0, 0, 0, started, link_type))
+            .map_err(|error| error.to_string())?;
     }
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    if live_capture {
+        let stop_requested = Arc::clone(&stop_requested);
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            let mut command = String::new();
+            while reader.read_line(&mut command).unwrap_or(0) > 0 {
+                if command.trim().eq_ignore_ascii_case("STOP") {
+                    stop_requested.store(true, Ordering::Release);
+                    break;
+                }
+                command.clear();
+            }
+        });
+    }
+    let mut last_batch_flush = Instant::now();
     loop {
+        if live_capture && stop_requested.load(Ordering::Acquire) {
+            break;
+        }
         match source.next_packet() {
             Ok(Some(frame)) => {
                 received += 1;
                 if let Some(event) = decode_packet(frame.timestamp, frame.raw, datalink) {
-                    let key = FlowKey { src: event.src.clone(), dst: event.dst.clone(), src_port: event.src_port, dst_port: event.dst_port, protocol: event.protocol };
-                    let stats = flows.entry(key).or_default(); stats.packets += 1; stats.bytes += u64::from(event.size);
+                    let key = FlowKey {
+                        src: event.src.clone(),
+                        dst: event.dst.clone(),
+                        src_port: event.src_port,
+                        dst_port: event.dst_port,
+                        protocol: event.protocol,
+                    };
+                    let stats = flows.entry(key).or_default();
+                    stats.packets += 1;
+                    stats.bytes += u64::from(event.size);
                     batch.push(event);
                     if batch.len() >= batch_size {
-                        if !benchmark { write_frame(FRAME_EVENTS, &encode_events(&batch)).map_err(|error| error.to_string())?; }
-                        emitted += batch.len() as u64; batch.clear();
+                        if !benchmark {
+                            write_frame(FRAME_EVENTS, &encode_events(&batch))
+                                .map_err(|error| error.to_string())?;
+                        }
+                        emitted += batch.len() as u64;
+                        batch.clear();
                     }
                 }
             }
@@ -1106,20 +1315,51 @@ fn run(args: &[String]) -> Result<(), String> {
             Err(PcapError::NoMorePackets) => break,
             Err(error) => return Err(error.to_string()),
         }
+        if live_capture
+            && !batch.is_empty()
+            && last_batch_flush.elapsed() >= Duration::from_millis(250)
+        {
+            write_frame(FRAME_EVENTS, &encode_events(&batch)).map_err(|error| error.to_string())?;
+            emitted += batch.len() as u64;
+            batch.clear();
+            last_batch_flush = Instant::now();
+        }
         if !benchmark && last_health.elapsed() >= Duration::from_secs(1) {
-            write_frame(FRAME_HEALTH, &encode_health(received, emitted, flows.len(), started, link_type)).map_err(|error| error.to_string())?;
+            write_frame(
+                FRAME_HEALTH,
+                &encode_health(received, emitted, flows.len(), started, link_type),
+            )
+            .map_err(|error| error.to_string())?;
             last_health = Instant::now();
         }
     }
     if !batch.is_empty() {
-        if !benchmark { write_frame(FRAME_EVENTS, &encode_events(&batch)).map_err(|error| error.to_string())?; }
+        if !benchmark {
+            write_frame(FRAME_EVENTS, &encode_events(&batch)).map_err(|error| error.to_string())?;
+        }
         emitted += batch.len() as u64;
     }
     if benchmark {
         let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
-        println!("packets={received} events={emitted} flows={} seconds={elapsed:.6} pps={:.0}", flows.len(), received as f64 / elapsed);
+        println!(
+            "packets={received} events={emitted} flows={} seconds={elapsed:.6} pps={:.0}",
+            flows.len(),
+            received as f64 / elapsed
+        );
     } else {
-        write_frame(FRAME_HEALTH, &encode_health(received, emitted, flows.len(), started, link_type)).map_err(|error| error.to_string())?;
+        write_frame(
+            FRAME_HEALTH,
+            &encode_health(received, emitted, flows.len(), started, link_type),
+        )
+        .map_err(|error| error.to_string())?;
+        if live_capture {
+            let certificate = format!(
+                "{{\"status\":\"stopped\",\"received_packets\":{received},\"emitted_events\":{emitted},\"flows\":{},\"link_type\":\"{link_type}\"}}",
+                flows.len()
+            );
+            write_frame(FRAME_TERMINAL, certificate.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -1127,7 +1367,10 @@ fn run(args: &[String]) -> Result<(), String> {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if let Err(error) = run(&args) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         eprintln!("watchtower-sensor error at {now}: {error}");
         std::process::exit(1);
     }
@@ -1182,7 +1425,9 @@ mod tests {
     fn decodes_vlan_ipv4_tcp() {
         let packet = ipv4_tcp_packet(true);
         let event = decode_packet(1.0, packet, Linktype::ETHERNET).unwrap();
-        assert_eq!(event.src, "10.0.0.1"); assert_eq!(event.dst_port, 443); assert_eq!(event.flags, 0x12);
+        assert_eq!(event.src, "10.0.0.1");
+        assert_eq!(event.dst_port, 443);
+        assert_eq!(event.flags, 0x12);
     }
     #[test]
     fn rejects_truncated_frames() {
@@ -1203,6 +1448,46 @@ mod tests {
         let event = decode_packet(1.0, packet, Linktype::IPV4).unwrap();
         assert_eq!(event.src, "10.0.0.1");
         assert_eq!(event.dst_port, 53);
+    }
+
+    #[test]
+    fn decodes_null_loopback_ipv4_udp_and_packet_index() {
+        let mut packet = vec![0u8; 32];
+        packet[..4].copy_from_slice(&2u32.to_ne_bytes());
+        packet[4] = 0x45;
+        packet[6..8].copy_from_slice(&28u16.to_be_bytes());
+        packet[13] = 17;
+        packet[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        packet[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        packet[24..26].copy_from_slice(&53000u16.to_be_bytes());
+        packet[26..28].copy_from_slice(&55439u16.to_be_bytes());
+        packet[28..30].copy_from_slice(&8u16.to_be_bytes());
+
+        let event = decode_packet(1.0, packet.clone(), Linktype::NULL).unwrap();
+        assert_eq!(event.src, "127.0.0.1");
+        assert_eq!(event.dst, "127.0.0.1");
+        assert_eq!(event.protocol, 17);
+        assert_eq!(event.src_port, 53000);
+        assert_eq!(event.dst_port, 55439);
+        let selector = selector_packet_view(&event, Linktype::NULL).unwrap();
+        assert_eq!(selector.link_class, 2);
+        assert_eq!(selector.ethertype, 0x0800);
+        assert_eq!(selector.ip_protocol, 17);
+
+        let mut network_order_packet = packet.clone();
+        network_order_packet[..4].copy_from_slice(&2u32.to_be_bytes());
+        assert!(decode_packet(1.0, network_order_packet, Linktype::LOOP).is_some());
+
+        let mut unsupported_family_packet = packet.clone();
+        unsupported_family_packet[..4].copy_from_slice(&99u32.to_ne_bytes());
+        assert!(decode_packet(1.0, unsupported_family_packet, Linktype::NULL).is_none());
+
+        let record =
+            packet_index_record(1, 1.0, packet.clone(), packet.len() as u32, Linktype::NULL);
+        assert!(record.decoded);
+        assert_eq!(record.link_type, "loopback-ip");
+        assert_eq!(record.src, "127.0.0.1");
+        assert_eq!(record.dst_port, Some(55439));
     }
 
     #[test]
@@ -1341,12 +1626,10 @@ mod tests {
         fragmented_ipv6[0] = 0x60;
         fragmented_ipv6[4..6].copy_from_slice(&28u16.to_be_bytes());
         fragmented_ipv6[6] = 44;
-        fragmented_ipv6[8..24].copy_from_slice(&[
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ]);
-        fragmented_ipv6[24..40].copy_from_slice(&[
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-        ]);
+        fragmented_ipv6[8..24]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        fragmented_ipv6[24..40]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         fragmented_ipv6[40] = 6;
         fragmented_ipv6[42..44].copy_from_slice(&8u16.to_be_bytes());
         fragmented_ipv6[48..50].copy_from_slice(&12345u16.to_be_bytes());
@@ -1369,13 +1652,7 @@ mod tests {
             (malformed_ipv6_fragment, Linktype::IPV6),
             (truncated_ipv6_payload, Linktype::IPV6),
         ] {
-            let record = packet_index_record(
-                11,
-                12.5,
-                raw.clone(),
-                raw.len() as u32,
-                datalink,
-            );
+            let record = packet_index_record(11, 12.5, raw.clone(), raw.len() as u32, datalink);
             assert!(!record.decoded, "{}", record.decode_reason);
             assert_eq!(record.src_port, None);
             assert_eq!(record.dst_port, None);

@@ -13,6 +13,7 @@ from typing import Dict, Optional
 
 from core.backend_policy import backend_policy
 from core.detection.scoring import ScoringConfig
+from core.operations.capabilities import CapabilityRegistry
 class ScoringOperations:
     def __init__(self, db):
         self.db = db
@@ -170,7 +171,9 @@ class ScoringOperations:
             stable_source = f"pcap:{digest}:{path.name}"
             ForensicsEngine(db=self.db, data_dir=str(self.db.data_dir), silent=True).analyze_pcap(
                 str(path), source_name=stable_source, mode="auto",
-                backend=backend_policy.replay_backend(),
+                backend=backend_policy.replay_backend(
+                    runtime_capabilities=CapabilityRegistry(data_dir=str(self.db.data_dir)).flags(),
+                ),
             )
             analyzed.append({"path": str(path), "sha256": digest, "source": stable_source})
         return {"reanalyzed": analyzed, "missing": missing}

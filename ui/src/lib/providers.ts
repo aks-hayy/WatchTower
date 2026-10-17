@@ -4,7 +4,7 @@ import type { AIProviderStatus } from "@/types/watchtower";
 export interface ProviderModel {
   id: string;
   label: string;
-  supports_tools: boolean;
+  supports_tools?: boolean | null;
   provider: string;
   local: boolean;
 }

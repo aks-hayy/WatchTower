@@ -18,9 +18,10 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 WORKDIR /src
 COPY requirements/container.lock ./requirements/container.lock
 RUN python -m pip install --upgrade "pip==25.2" && python -m pip install -r requirements/container.lock
+RUN python -m pip install "setuptools==84.0.0"
 COPY pyproject.toml README.md LICENSE ./
 COPY core ./core
-RUN python -m pip install --no-deps .
+RUN python -m pip install --no-build-isolation --no-deps .
 
 FROM python:3.12-slim-bookworm AS controller
 LABEL org.opencontainers.image.title="WatchTower Controller" \

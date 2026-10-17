@@ -46,14 +46,28 @@ pub(crate) enum SelectorClause {
     EitherPortIn(Vec<u16>),
     SourcePortIn(Vec<u16>),
     DestinationPortIn(Vec<u16>),
-    TcpFlags { required: u16, forbidden: u16 },
+    TcpFlags {
+        required: u16,
+        forbidden: u16,
+    },
     IcmpTypeIn(Vec<u8>),
     PayloadMinimumLength(u32),
     PayloadPrefixIn(Vec<Vec<u8>>),
     PayloadContainsAny(Vec<Vec<u8>>),
-    PayloadByteMask { offset: u16, mask: u8, expected: u8 },
-    PayloadDiversity { sample: u16, minimum_distinct: u16 },
-    FrameWindowContainsAny { start: u16, end: u16, literals: Vec<Vec<u8>> },
+    PayloadByteMask {
+        offset: u16,
+        mask: u8,
+        expected: u8,
+    },
+    PayloadDiversity {
+        sample: u16,
+        minimum_distinct: u16,
+    },
+    FrameWindowContainsAny {
+        start: u16,
+        end: u16,
+        literals: Vec<Vec<u8>>,
+    },
 }
 
 pub(crate) struct AnalysisEnd {
@@ -75,11 +89,18 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(payload: &'a [u8]) -> Self { Self { payload, offset: 0 } }
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
 
     fn take(&mut self, size: usize, label: &str) -> Result<&'a [u8], String> {
-        let end = self.offset.checked_add(size).ok_or_else(|| format!("truncated {label}"))?;
-        if end > self.payload.len() { return Err(format!("truncated {label}")); }
+        let end = self
+            .offset
+            .checked_add(size)
+            .ok_or_else(|| format!("truncated {label}"))?;
+        if end > self.payload.len() {
+            return Err(format!("truncated {label}"));
+        }
         let result = &self.payload[self.offset..end];
         self.offset = end;
         Ok(result)
@@ -90,27 +111,41 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self, label: &str) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(self.take(2, label)?.try_into().expect("two bytes")))
+        Ok(u16::from_be_bytes(
+            self.take(2, label)?.try_into().expect("two bytes"),
+        ))
     }
 
     fn u32(&mut self, label: &str) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(self.take(4, label)?.try_into().expect("four bytes")))
+        Ok(u32::from_be_bytes(
+            self.take(4, label)?.try_into().expect("four bytes"),
+        ))
     }
 
     fn u64(&mut self, label: &str) -> Result<u64, String> {
-        Ok(u64::from_be_bytes(self.take(8, label)?.try_into().expect("eight bytes")))
+        Ok(u64::from_be_bytes(
+            self.take(8, label)?.try_into().expect("eight bytes"),
+        ))
     }
 
     fn ascii8(&mut self, maximum: u8, label: &str) -> Result<String, String> {
         let length = self.u8(&format!("{label} length"))?;
-        if length > maximum { return Err(format!("{label} exceeds {maximum} bytes")); }
+        if length > maximum {
+            return Err(format!("{label} exceeds {maximum} bytes"));
+        }
         let value = self.take(length as usize, label)?;
-        if !value.is_ascii() { return Err(format!("{label} is not ASCII")); }
+        if !value.is_ascii() {
+            return Err(format!("{label} is not ASCII"));
+        }
         Ok(String::from_utf8(value.to_vec()).expect("validated ASCII"))
     }
 
     fn finish(&self) -> Result<(), String> {
-        if self.offset == self.payload.len() { Ok(()) } else { Err("trailing bytes in analysis payload".into()) }
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err("trailing bytes in analysis payload".into())
+        }
     }
 }
 
@@ -145,7 +180,12 @@ fn read_u16_values(
     maximum_count: u16,
 ) -> Result<Vec<u16>, String> {
     let count = reader.u16(&format!("{label} count"))?;
-    in_range(count as u64, 1, maximum_count as u64, &format!("{label} count"))?;
+    in_range(
+        count as u64,
+        1,
+        maximum_count as u64,
+        &format!("{label} count"),
+    )?;
     (0..count).map(|_| reader.u16(label)).collect()
 }
 
@@ -183,7 +223,10 @@ fn decode_selector_clause(reader: &mut Reader<'_>) -> Result<SelectorClause, Str
             if minimum_distinct > sample {
                 return Err("payload diversity minimum exceeds sample".into());
             }
-            SelectorClause::PayloadDiversity { sample, minimum_distinct }
+            SelectorClause::PayloadDiversity {
+                sample,
+                minimum_distinct,
+            }
         }
         15 => {
             let start = reader.u16("frame window start")?;
@@ -203,32 +246,73 @@ fn decode_selector_clause(reader: &mut Reader<'_>) -> Result<SelectorClause, Str
 
 /// Decodes and validates the schema-1 plan before a child starts analysis.
 pub(crate) fn decode_analysis_plan(payload: &[u8]) -> Result<AnalysisPlan, String> {
-    if payload.len() > MAX_PLAN_BYTES { return Err("analysis plan exceeds 1048576 bytes".into()); }
+    if payload.len() > MAX_PLAN_BYTES {
+        return Err("analysis plan exceeds 1048576 bytes".into());
+    }
     let mut reader = Reader::new(payload);
     let schema = reader.u8("analysis plan schema")?;
-    if schema != SCHEMA_VERSION { return Err(format!("unsupported analysis plan schema {schema}")); }
-    let plan_sha256: [u8; 32] = reader.take(32, "plan digest")?.try_into().expect("32 bytes");
-    let semantic_plugin_sha256: [u8; 32] = reader.take(32, "semantic plugin digest")?.try_into().expect("32 bytes");
+    if schema != SCHEMA_VERSION {
+        return Err(format!("unsupported analysis plan schema {schema}"));
+    }
+    let plan_sha256: [u8; 32] = reader
+        .take(32, "plan digest")?
+        .try_into()
+        .expect("32 bytes");
+    let semantic_plugin_sha256: [u8; 32] = reader
+        .take(32, "semantic plugin digest")?
+        .try_into()
+        .expect("32 bytes");
     let execution_mode = reader.u8("execution mode")?;
-    if !matches!(execution_mode, 1 | 2) { return Err("unsupported execution mode".into()); }
+    if !matches!(execution_mode, 1 | 2) {
+        return Err("unsupported execution mode".into());
+    }
     let analysis_mode = reader.u8("analysis mode")?;
-    if !matches!(analysis_mode, 1 | 2) { return Err("unsupported analysis mode".into()); }
+    if !matches!(analysis_mode, 1 | 2) {
+        return Err("unsupported analysis mode".into());
+    }
     let flags = reader.u16("flags")?;
-    if flags & !KNOWN_FLAGS != 0 { return Err("unknown analysis plan flags".into()); }
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err("unknown analysis plan flags".into());
+    }
     let target_batch_bytes = reader.u32("target batch bytes")?;
-    in_range(target_batch_bytes as u64, 1, 8 * 1024 * 1024, "target batch bytes")?;
+    in_range(
+        target_batch_bytes as u64,
+        1,
+        8 * 1024 * 1024,
+        "target batch bytes",
+    )?;
     let max_active_conversations = reader.u32("max active conversations")?;
-    in_range(max_active_conversations as u64, 1, 100_000, "max active conversations")?;
+    in_range(
+        max_active_conversations as u64,
+        1,
+        100_000,
+        "max active conversations",
+    )?;
     let max_resume_conversations = reader.u32("max resume conversations")?;
-    in_range(max_resume_conversations as u64, 1, 100_000, "max resume conversations")?;
+    in_range(
+        max_resume_conversations as u64,
+        1,
+        100_000,
+        "max resume conversations",
+    )?;
     let max_directional_flows = reader.u32("max directional flows")?;
-    in_range(max_directional_flows as u64, 1, 220_000, "max directional flows")?;
+    in_range(
+        max_directional_flows as u64,
+        1,
+        220_000,
+        "max directional flows",
+    )?;
     let max_endpoints = reader.u32("max endpoints")?;
     in_range(max_endpoints as u64, 1, 440_000, "max endpoints")?;
     let max_flow_samples = reader.u16("max flow samples")?;
     in_range(max_flow_samples as u64, 1, 500, "max flow samples")?;
     let max_flow_sample_bytes = reader.u64("max flow sample bytes")?;
-    in_range(max_flow_sample_bytes, 1, 268_435_456, "max flow sample bytes")?;
+    in_range(
+        max_flow_sample_bytes,
+        1,
+        268_435_456,
+        "max flow sample bytes",
+    )?;
     let max_stream_segments = reader.u32("max stream segments")?;
     in_range(max_stream_segments as u64, 1, 10_000, "max stream segments")?;
     let max_stream_bytes = reader.u64("max stream bytes")?;
@@ -256,25 +340,54 @@ pub(crate) fn decode_analysis_plan(payload: &[u8]) -> Result<AnalysisPlan, Strin
         for _ in 0..clause_count {
             clauses.push(decode_selector_clause(&mut reader)?);
         }
-        selector_programs.push(SelectorProgram { program_id, candidate_mode, clauses });
+        selector_programs.push(SelectorProgram {
+            program_id,
+            candidate_mode,
+            clauses,
+        });
     }
     reader.finish()?;
 
     // Structural errors intentionally win over a digest mismatch so the
     // coordinator receives an actionable compatibility failure.
-    if super::sha256(&payload[33..]) != plan_sha256 { return Err("analysis plan digest mismatch".into()); }
+    if super::sha256(&payload[33..]) != plan_sha256 {
+        return Err("analysis plan digest mismatch".into());
+    }
     Ok(AnalysisPlan {
-        plan_sha256, semantic_plugin_sha256, execution_mode, analysis_mode, flags,
-        target_batch_bytes, max_active_conversations, max_resume_conversations,
-        max_directional_flows, max_endpoints, max_flow_samples, max_flow_sample_bytes,
-        max_stream_segments, max_stream_bytes, source, session_id, interface,
-        sensor_node_id, selector_programs,
+        plan_sha256,
+        semantic_plugin_sha256,
+        execution_mode,
+        analysis_mode,
+        flags,
+        target_batch_bytes,
+        max_active_conversations,
+        max_resume_conversations,
+        max_directional_flows,
+        max_endpoints,
+        max_flow_samples,
+        max_flow_sample_bytes,
+        max_stream_segments,
+        max_stream_bytes,
+        source,
+        session_id,
+        interface,
+        sensor_node_id,
+        selector_programs,
     })
 }
 
-fn push_ascii8(payload: &mut Vec<u8>, value: &str, maximum: usize, label: &str) -> Result<(), String> {
-    if !value.is_ascii() { return Err(format!("{label} is not ASCII")); }
-    if value.len() > maximum { return Err(format!("{label} exceeds {maximum} bytes")); }
+fn push_ascii8(
+    payload: &mut Vec<u8>,
+    value: &str,
+    maximum: usize,
+    label: &str,
+) -> Result<(), String> {
+    if !value.is_ascii() {
+        return Err(format!("{label} is not ASCII"));
+    }
+    if value.len() > maximum {
+        return Err(format!("{label} exceeds {maximum} bytes"));
+    }
     payload.push(value.len() as u8);
     payload.extend_from_slice(value.as_bytes());
     Ok(())
@@ -293,7 +406,12 @@ pub(crate) fn encode_analysis_hello(
     payload.extend_from_slice(&plan.plan_sha256);
     push_ascii8(&mut payload, sensor_version, 32, "sensor version")?;
     payload.extend_from_slice(&pcap_datalink.to_be_bytes());
-    push_ascii8(&mut payload, normalized_link_type, 32, "normalized link type")?;
+    push_ascii8(
+        &mut payload,
+        normalized_link_type,
+        32,
+        "normalized link type",
+    )?;
     payload.extend_from_slice(&capability_bits.to_be_bytes());
     Ok(payload)
 }
@@ -302,8 +420,12 @@ pub(crate) fn encode_analysis_end(end: &AnalysisEnd) -> Result<Vec<u8>, String> 
     if !matches!(end.terminal_status, 1 | 2 | 3) {
         return Err("unsupported analysis terminal status".into());
     }
-    if end.first_decoded_timestamp.is_some_and(|value| !value.is_finite())
-        || end.last_decoded_timestamp.is_some_and(|value| !value.is_finite())
+    if end
+        .first_decoded_timestamp
+        .is_some_and(|value| !value.is_finite())
+        || end
+            .last_decoded_timestamp
+            .is_some_and(|value| !value.is_finite())
     {
         return Err("analysis terminal timestamp must be finite".into());
     }
@@ -339,7 +461,9 @@ pub(crate) fn test_plan_payload() -> Vec<u8> {
     payload.extend_from_slice(&[1, 1]);
     payload.extend_from_slice(&0x0009u16.to_be_bytes());
     payload.extend_from_slice(&(1024 * 1024u32).to_be_bytes());
-    for value in [100_000u32, 100_000, 220_000, 440_000] { payload.extend_from_slice(&value.to_be_bytes()); }
+    for value in [100_000u32, 100_000, 220_000, 440_000] {
+        payload.extend_from_slice(&value.to_be_bytes());
+    }
     payload.extend_from_slice(&500u16.to_be_bytes());
     payload.extend_from_slice(&268_435_456u64.to_be_bytes());
     payload.extend_from_slice(&10_000u32.to_be_bytes());

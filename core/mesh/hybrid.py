@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import uuid
 from typing import Any
 
@@ -11,6 +12,21 @@ from core.mesh.service import MeshControllerService
 
 def hybrid_enabled() -> bool:
     return os.environ.get("WATCHTOWER_HYBRID_BRIDGE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _queue_command(controller: MeshControllerService, node_id: str, action: str,
+                   arguments: dict[str, Any], requested_by: str, idempotency_key: str) -> dict[str, Any]:
+    """Call both current and legacy controller seams without dropping safety metadata."""
+    try:
+        parameters = inspect.signature(controller.queue_command).parameters.values()
+        accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        accepts_key = accepts_kwargs or any(parameter.name == "idempotency_key" for parameter in parameters)
+    except (TypeError, ValueError):
+        accepts_key = True
+    kwargs = {"requested_by": requested_by}
+    if accepts_key:
+        kwargs["idempotency_key"] = idempotency_key
+    return controller.queue_command(node_id, action, arguments, **kwargs)
 
 
 def capture_node(db) -> dict[str, Any]:
@@ -49,7 +65,8 @@ def start_capture(db, interface: str, backend: str | None = None, source_type: s
             names = ", ".join(str(item.get("name") or item.get("device_id")) for item in available) or "none"
             raise RuntimeError(f"Choose a capture interface with -i. Available sensor interfaces: {names}")
         interface = str(available[0].get("device_id") or available[0].get("name") or "")
-    return MeshControllerService(db).queue_command(
+    return _queue_command(
+        MeshControllerService(db),
         str(node["id"]),
         "capture.start",
         {"interface": interface, "source_type": source_type, **({"backend": backend} if backend else {})},
@@ -73,7 +90,8 @@ def stop_capture(db, interface: str | None = None) -> list[dict[str, Any]]:
         return []
     controller = MeshControllerService(db)
     return [
-        controller.queue_command(
+        _queue_command(
+            controller,
             str(node["id"]), "capture.stop", {"interface": item}, requested_by="hybrid-controller-cli",
             idempotency_key=f"capture.stop:{node['id']}:{item}:{uuid.uuid4().hex}",
         )

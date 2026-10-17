@@ -164,6 +164,8 @@ function Ensure-WindowsBuildTools {
 }
 
 try {
+    . (Join-Path $PSScriptRoot "watchtower_process_guard.ps1")
+    Assert-WatchTowerStoppedForSetup -RepositoryRoot $Root
     Set-Location $Root
     Write-Host "WatchTower 2.0 setup" -ForegroundColor Cyan
     Write-Host "Repository: $Root"
@@ -176,7 +178,13 @@ try {
     if (-not $SkipRust) {
         Ensure-Tool "cargo" "Rustlang.Rustup" "Rust stable" "Install Rust stable with rustup."
         Ensure-WindowsBuildTools
-        Ensure-NpcapRuntime
+    }
+
+    # Npcap is required for live capture even when the operator intentionally
+    # skips the Rust sensor and uses the Python/Scapy backend on Windows.
+    Ensure-NpcapRuntime
+
+    if (-not $SkipRust) {
         $NpcapSdk = Ensure-NpcapSdk
     }
 
@@ -192,9 +200,10 @@ try {
         Invoke-Checked { & python -m venv .venv } "Could not create the Python virtual environment."
     }
     $Python = Join-Path $Root ".venv\Scripts\python.exe"
-    Invoke-Checked { & $Python -m pip install --upgrade pip } "pip upgrade failed."
+    $RuntimeConstraints = Join-Path $Root "requirements\runtime.lock"
+    Invoke-Checked { & $Python -m pip install -c $RuntimeConstraints setuptools } "Installing the locked Python build backend failed."
     $InstallTarget = if ($Development) { ".[dev]" } else { "." }
-    Invoke-Checked { & $Python -m pip install -c (Join-Path $Root "requirements\runtime.lock") -e $InstallTarget } "WatchTower Python installation failed."
+    Invoke-Checked { & $Python -m pip install --no-build-isolation -c $RuntimeConstraints -e $InstallTarget } "WatchTower Python installation failed."
 
     if (-not $SkipRust) {
         Step "Building the Rust capture and replay engine"
@@ -271,7 +280,7 @@ neo4j:
 
     if (-not $SkipDiagnostics) {
         Step "Running installation diagnostics"
-        Invoke-Tower @("doctor")
+        Invoke-Tower @("doctor", "--install-check")
     }
 
     Write-Host "`nWatchTower setup completed." -ForegroundColor Green

@@ -10,44 +10,44 @@ detectors:
     findings:
       credential.cleartext.ftp:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: cdfaf79aca3ce7533fc77ea3bfee62c80efaad6e80170d7f05ceb7184153bf37
+        attestation_digest: 82d33c12a22734db6b63566dec0862ca23f7e3f8d4b2e6a0c5d8f460364f1fb3
   watchtower.application.abuse:
     version: 2.1.0
     max_contribution: 60
     findings:
       credential.cleartext.generic:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 6556ca1fbac8e99aac5fa2891a0473eb21bb6c9340a4d5082aecf518b5eeeb88
+        attestation_digest: f1893a3726414a8476cd1b0ab3e4319a8a99e08557afdb6dae7f1a5dcf8183c2
       auth.failure_burst:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 4e0b70f009977be11ce2f48a5f6672c080fbd83c9ba65aa83e99ec4e86d0e41d
+        attestation_digest: 387b3127c97498199a983826ac1b45419d32eee7e23b360906bfa1296571a3d4
       icmp.tunnel.suspected:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 1cfc5220158bfd724f7554305fe280c70f4e50edf46c5508e9a0a0287acd19ce
+        attestation_digest: edfd38065ae445a04d6dae18d4f75987a39b7e08e85620c7d0af6d52f5d7b8b6
       tls.protocol_mismatch:
         calibration_level: FIELD_CALIBRATED
         max_contribution: 20
-        attestation_digest: beedc885eac0d4ad3a2347a1e78a4c0b7c40ca20d508e4abb4e82b75fcd67b8c
+        attestation_digest: 33c5130cb58db75bc21d6c275975f1e96261c284cc347b14fd2671da080f9148
       protocol.nonstandard_service:
         calibration_level: FIELD_CALIBRATED
         max_contribution: 20
-        attestation_digest: f8ca6be37dbfb219984249f850e305504bc5b96ffafc8d6d97a828a6a6a4bb19
+        attestation_digest: ee759ecd0b4fd8ef6261fb609c4ffadd469a6a236f81aa216c2abd754ed001bf
   watchtower.lan.trust:
     version: 2.0.0
     max_contribution: 60
     findings:
       network.arp.binding_conflict:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 12aaf7523708b8f5f3a4b49c58e5838d529180ac6a95f3ccef5bd4e0001d2c8c
+        attestation_digest: 4494e81f41e5064afa1fb4e72d9f624bbe4d5e291c648263305dd9e3f0c01a4c
       network.ndp.binding_conflict:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 69d876c35c217aaad5c5f400afe413023bedbaab9dcd7f1653377ac9a39760b3
+        attestation_digest: f114a1dc92f95fc1b0914ae06b4c20b6280b29d1f1ef02844e6ece4b756bdeb0
       network.dhcp.untrusted_server:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 4fc5f0247e5c19f2e8991793a6b4d50c05532b39e80e6d6d246eaec426d5922c
+        attestation_digest: e234fc39884ce7893cef3c2c0618ef95bbd4ec418a48c6cba79f7d25efa64364
       network.ipv6.untrusted_router:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 6c878c0ebfc544ef942762455b02fcc1df46fa94c709ede1d4ed5bdeba269aa1
+        attestation_digest: 018622f746145e52f70794f6e56263385ace7392458da03901ae8d7a12f4ae4f
   watchtower.recon:
     version: 2.0.0
     max_contribution: 60
@@ -64,10 +64,10 @@ detectors:
     findings:
       ot.modbus.unauthorized_write:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 17e89f257e83eaf036810c8170ce97b030dcfab352e2ae79840781dae2129154
+        attestation_digest: dca5ceb4c7a691870ac57b587c83a91fbfc83eb3933aca712604b77aabcd7f41
       credential.cleartext.mqtt:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 7e3852a0dc557c1f146b6dd29aa20e16c7fc16294e38e4ede04016024477004e
+        attestation_digest: 4fc22cf55d4a9e760418dd3ffc13500d6641a49910c14c8dc16e30b40b200b07
   watchtower.tls.protocol:
     version: 2.0.0
     max_contribution: 20
@@ -80,7 +80,7 @@ detectors:
     findings:
       file.executable_transfer:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 7623b1da17d69ac0a2ca41b92e0eb3fc5f9952b8dce1c6b4fcfd275c24d7faf4
+        attestation_digest: 17f78921d71338d1fab916fcbfa04af57cf4928077413d3aa844b8b30a6e221f
   watchtower.behavior.beacon:
     version: 2.0.0
     max_contribution: 55
@@ -93,7 +93,7 @@ detectors:
     findings:
       dns.tunnel.suspected:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: a980ea8df1cdfdc56cb3cc92a9101903dd8516aa75d97a0a6955623c57ab62ac
+        attestation_digest: bfc54cc729f6b7af24cc93b0ee304b8d680d466a3db87e1a12d028319737ca1c
   watchtower.exfiltration:
     version: 2.0.0
     max_contribution: 60
@@ -106,22 +106,22 @@ detectors:
     findings:
       recon.port_scan:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 657f33b54c0d0a5c25a67d45fe456ab4bf714af513ffa36ce1c30b318388c8fd
+        attestation_digest: f1f657a728944009fab20af5c0da1c9e1303929b4c3152c66b9966788aef9af7
       recon.host_scan:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 1757a227f1e33f46e75c2415132549779bd3ee4d9f19f3a9039ac2f343c1e772
+        attestation_digest: dab6c39760c61d131ce8e83265b29c9da6694d4c343a0003e35b8a9bb1b9580a
       recon.syn_flood:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 5c6fcbf725c6f78a21aa01613ec8fd0b17a73bc82f6edcf2cb2f75ffab1cb68a
+        attestation_digest: fe71e147e39fdf6e1e747ce6ff543b2ce8fe3f99b9f8e574225350667324aa9e
       lateral.admin_fanout:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: debccfbc2d9cc364211bbe13cf0795fe767bb40c64b7e5805876a9a7b2551e71
+        attestation_digest: 8dd2a22b09da1748e706144b6bebae53a66f5e1e84dffbff2e3f0eb89dc3a4c5
       exfil.volume_anomaly:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: d86f90287826cba0906f7262b8514494e29dbcfac54895df03571b7af9679934
+        attestation_digest: 73f73b4fd40fdf8634618b9b8767a4884bc19febfec3d08b17b207e13fb94965
       behavior.beacon.suspected:
         calibration_level: FIELD_CALIBRATED
-        attestation_digest: 0f1f62b6c356967b008a200570d95cf9f23a8c9cef4561eac5a77270a2c49064
+        attestation_digest: fb81cdac61a334d08165a9aa7c5c691baaf923b5d3bb6affd693216fd70408f6
   watchtower.sigma:
     version: 2.0.0
     max_contribution: 70

@@ -1,5 +1,6 @@
 """Default network-interface capture source."""
 
+import os
 from typing import Iterable
 
 import psutil
@@ -55,13 +56,42 @@ class NetworkInterfaceSource(CaptureSource):
             addresses.append(str(iface.ip))
 
         interface_stats = psutil.net_if_stats().get(name)
-        available = interface_stats is None or interface_stats.isup
+        available = interface_stats is not None and interface_stats.isup
         unavailable_reason = ""
-        if interface_stats is not None and not interface_stats.isup:
+        if interface_stats is None:
+            unavailable_reason = (
+                f"The operating system could not confirm that network interface {name!r} is active. "
+                "Select an interface reported as available."
+            )
+        elif not interface_stats.isup:
             unavailable_reason = (
                 f"Network interface {name!r} is disconnected or disabled. "
                 "Connect or enable it before starting capture."
             )
+
+        capture_runtime_available = True
+        capture_runtime_reason = ""
+        if os.name == "nt":
+            try:
+                from core.operations.capabilities import CapabilityRegistry
+
+                capture_runtime_available, capture_runtime_reason = CapabilityRegistry._npcap()
+            except Exception as exc:
+                capture_runtime_available = False
+                capture_runtime_reason = f"Npcap readiness could not be checked: {exc}"
+
+        backends = ["python"] if capture_runtime_available else []
+        if capture_runtime_available:
+            try:
+                from core.packet_engine.rust_capture import rust_sensor_available
+
+                if rust_sensor_available():
+                    backends.append("rust")
+            except (ImportError, OSError):
+                pass
+        elif available:
+            available = False
+            unavailable_reason = capture_runtime_reason or "Live capture runtime is unavailable"
 
         return CaptureDevice(
             source_type="network",
@@ -69,7 +99,7 @@ class NetworkInterfaceSource(CaptureSource):
             name=name,
             description=str(getattr(iface, "description", "") or ""),
             addresses=addresses,
-            backends=["python", "rust"],
+            backends=backends,
             available=available,
             unavailable_reason=unavailable_reason,
         )

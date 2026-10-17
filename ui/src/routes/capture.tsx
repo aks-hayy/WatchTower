@@ -7,17 +7,19 @@ import {
   fetchPipelineHealth,
   fetchSessions,
   queueMeshNodeCommand,
-  startEngine,
   stopEngine,
 } from "@/lib/api.functions";
 import type {
   CaptureSession,
   HealthStatus,
   NetworkInterface,
+  OperationEnvelope,
   PipelineHealth,
 } from "@/types/watchtower";
 import { useSensorScope } from "@/components/useSensorScope";
 import { captureStartBackend, selectCaptureBackend } from "@/lib/capture-backend";
+import { captureControlDisabled } from "@/lib/capture-control";
+import { describeServiceStatus } from "@/lib/service-status";
 
 export const Route = createFileRoute("/capture")({
   head: () => ({ meta: [{ title: "Capture Operations - Watchtower" }] }),
@@ -55,10 +57,12 @@ function CapturePage() {
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>(initial.interfaces);
   const [sessions, setSessions] = useState<CaptureSession[]>(initial.sessions);
   const [health, setHealth] = useState<HealthStatus>(initial.health);
+  const servicePresentation = describeServiceStatus(health);
   const [pipeline, setPipeline] = useState<PipelineHealth>(initial.pipeline);
   const [backends, setBackends] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageKind, setMessageKind] = useState<"success" | "error">("success");
 
   const refresh = async (clearMessage = false) => {
     const [localInterfaces, nextSessions, nextHealth, nextPipeline] = await Promise.all([
@@ -119,7 +123,10 @@ function CapturePage() {
   };
 
   useEffect(() => {
-    void refresh(true);
+    // Scope changes should refresh the source list without erasing the
+    // command result. Clearing here races with capture start/stop feedback
+    // because the sensor scope query can settle just after the command.
+    void refresh();
     // refresh is intentionally scoped to the global sensor transition.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [captureNodeId, delegatedCapture, selectedNodeId, nodes]);
@@ -127,24 +134,29 @@ function CapturePage() {
   const toggle = async (item: NetworkInterface) => {
     setBusy(item.id);
     setMessage(null);
+    setMessageKind("success");
     try {
+      let operation: OperationEnvelope | undefined;
       if (item.capturing) {
         if (delegatedCapture && captureNodeId) {
-          await queueMeshNodeCommand({
+          const result = await queueMeshNodeCommand({
             data: {
               node_id: captureNodeId,
               action: "capture.stop",
               arguments: { interface: item.id },
             },
           });
+          operation = toOperationEnvelope(result.operation);
         } else {
-          await stopEngine({ data: { interface_id: item.id } });
+          const result = await stopEngine({ data: { interface_id: item.id } });
+          throwOnMutationFailure(result);
+          operation = toOperationEnvelope(result.operation);
         }
       } else {
         const selectedBackend = captureStartBackend(item, backends[item.id]);
         if (selectedBackend === null) throw new Error("No supported capture backend is available");
         if (delegatedCapture && captureNodeId) {
-          await queueMeshNodeCommand({
+          const result = await queueMeshNodeCommand({
             data: {
               node_id: captureNodeId,
               action: "capture.start",
@@ -155,26 +167,32 @@ function CapturePage() {
               },
             },
           });
+          operation = toOperationEnvelope(result.operation);
         } else {
-          await startEngine({
-            data: {
-              interface_id: item.id,
-              backend: selectedBackend,
-              source_type: item.source_type,
-            },
+          const result = await requestCaptureCommand("/api/v1/capture/start", {
+            interface: item.id,
+            backend: selectedBackend,
+            source_type: item.source_type,
           });
+          operation = toOperationEnvelope(result.operation);
         }
       }
-      setMessage(
-        `${item.name}: capture ${delegatedCapture ? "command queued" : item.capturing ? "draining" : "started"}`,
-      );
+      const completionMessage = delegatedCapture
+        ? `${item.name}: the sensor command was queued. It will appear as Monitoring when the sensor checks in.`
+        : item.capturing
+          ? `${item.name}: capture is stopping and stored activity will remain available.`
+          : `${item.name}: monitoring started.`;
       await refresh();
+      const nextAction = operation?.next_actions?.[0];
+      setMessage(nextAction ? `${completionMessage} ${nextAction}` : completionMessage);
       if (delegatedCapture) {
         window.setTimeout(() => void refresh(), 6000);
       }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Capture action failed");
+      const friendlyMessage = formatCaptureError(error);
       await refresh().catch(() => undefined);
+      setMessageKind("error");
+      setMessage(friendlyMessage);
     } finally {
       setBusy(null);
     }
@@ -186,11 +204,11 @@ function CapturePage() {
         <span className="section-label section-label-accent">CAP</span>
         <span className="mono text-[11px] uppercase text-foreground">/ Capture Operations</span>
         <span
-          className={`ml-auto mono text-[10px] uppercase ${delegatedCapture ? "text-ok" : health.daemon === "online" ? "text-ok" : "text-severity-high"}`}
+          className={`ml-auto mono text-[10px] uppercase ${delegatedCapture || health.daemon === "online" ? "text-ok" : !servicePresentation.nativeDaemonApplicable ? "text-muted-foreground" : "text-severity-high"}`}
         >
           {delegatedCapture
             ? `sensor ${captureTarget?.status || "connecting"}`
-            : `daemon ${health.daemon}`}
+            : servicePresentation.nativeDaemonLabel}
         </span>
         <button
           onClick={() => refresh(true)}
@@ -203,13 +221,26 @@ function CapturePage() {
 
       <div className="space-y-5 p-4 md:p-6">
         {message && (
-          <div className="border border-signal/30 bg-signal/5 px-4 py-3 mono text-[11px] text-signal">
+          <div
+            role={messageKind === "error" ? "alert" : "status"}
+            aria-live="polite"
+            className={`rounded-md border px-4 py-3 text-[12px] ${messageKind === "error" ? "border-severity-high/40 bg-severity-high/10 text-severity-high" : "border-signal/30 bg-signal/5 text-signal"}`}
+          >
             {message}
           </div>
         )}
         {delegatedCapture && (
           <div className="border border-signal/30 bg-signal/5 px-4 py-3 mono text-[11px] text-signal">
             CAPTURE TARGET / {captureTarget?.name || "Native Sensor"}
+          </div>
+        )}
+        {!delegatedCapture && health.daemon === "offline" && (
+          <div
+            role="status"
+            className="border border-border bg-surface px-4 py-3 text-[12px] text-muted-foreground"
+          >
+            Starting capture will start the WatchTower service if needed. Your operating system may
+            ask for permission.
           </div>
         )}
         {!delegatedCapture && !selectedNodeId && bridgeNodes.length > 1 && (
@@ -289,11 +320,12 @@ function CapturePage() {
                 </select>
                 <button
                   onClick={() => toggle(item)}
-                  disabled={
-                    busy === item.id ||
-                    item.status !== "up" ||
-                    (!item.capturing && !selectCaptureBackend(item))
-                  }
+                  disabled={captureControlDisabled({
+                    busy: busy === item.id,
+                    capturing: item.capturing,
+                    interfaceUp: item.status === "up",
+                    backendAvailable: Boolean(selectCaptureBackend(item)),
+                  })}
                   className={`flex h-8 min-w-24 items-center justify-center gap-2 border px-3 mono text-[10px] uppercase disabled:opacity-30 ${item.capturing ? "border-severity-critical/50 text-severity-critical" : "border-signal/50 text-signal"}`}
                 >
                   {busy === item.id ? (
@@ -354,4 +386,67 @@ function CapturePage() {
       </div>
     </div>
   );
+}
+
+function throwOnMutationFailure(result: Record<string, unknown>) {
+  if (result.ok === false) {
+    throw new Error(String(result.error || "The capture command was rejected."));
+  }
+}
+
+async function requestCaptureCommand(path: string, body: Record<string, unknown>) {
+  const response = await fetch(path, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!response.ok) {
+    const error = payload?.error as Record<string, unknown> | undefined;
+    throw new Error(String(error?.message || `WatchTower API returned HTTP ${response.status}`));
+  }
+  return payload || {};
+}
+
+function toOperationEnvelope(value: unknown): OperationEnvelope | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const operation = value as Record<string, unknown>;
+  if (
+    typeof operation.operation_id !== "string" ||
+    typeof operation.state !== "string" ||
+    typeof operation.summary !== "string"
+  ) {
+    return undefined;
+  }
+  const scope = operation.effective_scope;
+  return {
+    operation_id: operation.operation_id,
+    state: operation.state,
+    summary: operation.summary,
+    next_actions: Array.isArray(operation.next_actions)
+      ? operation.next_actions.filter((item): item is string => typeof item === "string")
+      : [],
+    effective_scope:
+      scope && typeof scope === "object" && !Array.isArray(scope)
+        ? (scope as OperationEnvelope["effective_scope"])
+        : {},
+    completeness:
+      typeof operation.completeness === "string" ? operation.completeness : "not_applicable",
+  };
+}
+
+function formatCaptureError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : "Capture could not start.";
+  const message = raw.replace(/^WatchTower API returned HTTP \d+:?\s*/i, "").trim();
+  if (/daemon|service|engine/i.test(message)) {
+    return "WatchTower is not ready to capture. Start the service, then retry this adapter.";
+  }
+  if (/backend|npcap|permission|privilege|access/i.test(message)) {
+    return "WatchTower could not access this adapter. Check the capture driver and permissions, then retry.";
+  }
+  if (/no supported capture backend/i.test(message)) {
+    return "This adapter has no supported capture backend. Choose another active adapter.";
+  }
+  return message || "Capture could not start. Run the setup check and retry.";
 }

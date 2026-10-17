@@ -1,10 +1,13 @@
 import json
+from io import StringIO
 
 import pytest
 from fastapi.testclient import TestClient
+from rich.console import Console
 
 from core.api.server import create_app
 from core.auth import AuthError, OperatorAuthService, SESSION_LIFETIME_SECONDS
+from core.cli.modules.auth import AuthModule
 from core.storage.database import WatchtowerDB
 from core.storage.models import OperatorSession, SecurityAuditEvent
 
@@ -40,6 +43,11 @@ class Clock:
 
     def __call__(self):
         return self.value
+
+
+class InteractiveStdin:
+    def isatty(self):
+        return True
 
 
 def test_operator_session_has_only_an_eight_hour_absolute_expiry(tmp_path):
@@ -195,4 +203,98 @@ def test_disabled_first_run_can_later_establish_pin_and_reenable(tmp_path):
     assert enabled["recovery_code"]
     unlocked = auth.verify_pin("824691")
     assert unlocked["status"]["state"] == "unlocked"
+    db.close()
+
+
+def test_cli_setup_explains_unlock_recovery_when_secure_session_storage_fails(tmp_path, monkeypatch):
+    class BrokenCredentialStore:
+        def set(self, _reference, _secret):
+            raise OSError("host credential store unavailable")
+
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    output = StringIO()
+    module = AuthModule(
+        console=Console(file=output, force_terminal=False),
+        db=db,
+        credentials=BrokenCredentialStore(),
+    )
+    monkeypatch.setattr(AuthModule, "_new_pin", staticmethod(lambda: "824691"))
+
+    completed = module.setup()
+
+    assert completed is False
+    assert "PIN is configured" in output.getvalue()
+    assert "Recovery code (shown once)" in output.getvalue()
+    assert "tower auth unlock" in output.getvalue()
+    assert "host credential store unavailable" not in output.getvalue()
+    assert "Traceback" not in output.getvalue()
+    assert module.auth.status()["state"] == "locked"
+    assert db._get_session().query(OperatorSession).filter_by(
+        revoke_reason="credential_store_failure"
+    ).count() == 1
+    assert module.auth.verify_pin("824691")["status"]["state"] == "unlocked"
+    db.close()
+
+
+def test_cli_unlock_reports_secure_session_storage_failure_without_traceback(tmp_path, monkeypatch):
+    class BrokenCredentialStore:
+        def set(self, _reference, _secret):
+            raise OSError("host credential store unavailable")
+
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    auth = OperatorAuthService(db)
+    auth.setup_pin("824691")
+    output = StringIO()
+    module = AuthModule(
+        console=Console(file=output, force_terminal=False),
+        db=db,
+        credentials=BrokenCredentialStore(),
+    )
+    monkeypatch.setattr("core.cli.modules.auth.sys.stdin", InteractiveStdin())
+    monkeypatch.setattr("core.cli.modules.auth.getpass", lambda _prompt: "824691")
+
+    completed = module.unlock()
+
+    assert completed is False
+    assert "PIN was accepted" in output.getvalue()
+    assert "operating-system credential store" in output.getvalue()
+    assert "host credential store unavailable" not in output.getvalue()
+    assert "Traceback" not in output.getvalue()
+    assert auth.status()["state"] == "locked"
+    assert db._get_session().query(OperatorSession).filter_by(
+        revoke_reason="credential_store_failure"
+    ).count() == 1
+    db.close()
+
+
+def test_cli_recovery_reset_shows_replacement_code_when_session_storage_fails(tmp_path, monkeypatch):
+    class BrokenCredentialStore:
+        def set(self, _reference, _secret):
+            raise OSError("host credential store unavailable")
+
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    auth = OperatorAuthService(db)
+    setup = auth.setup_pin("824691")
+    output = StringIO()
+    module = AuthModule(
+        console=Console(file=output, force_terminal=False),
+        db=db,
+        credentials=BrokenCredentialStore(),
+    )
+    monkeypatch.setattr("core.cli.modules.auth.sys.stdin", InteractiveStdin())
+    monkeypatch.setattr(AuthModule, "_new_pin", staticmethod(lambda: "739182"))
+    monkeypatch.setattr("core.cli.modules.auth.getpass", lambda _prompt: setup["recovery_code"])
+
+    completed = module.recovery_reset()
+
+    assert completed is False
+    assert "New recovery code (shown once)" in output.getvalue()
+    assert "tower auth unlock" in output.getvalue()
+    assert "host credential store unavailable" not in output.getvalue()
+    assert "Traceback" not in output.getvalue()
+    assert auth.status()["state"] == "locked"
+    assert db._get_session().query(OperatorSession).filter_by(
+        revoke_reason="credential_store_failure"
+    ).count() == 1
+    assert auth.verify_pin("739182")["status"]["state"] == "unlocked"
     db.close()
