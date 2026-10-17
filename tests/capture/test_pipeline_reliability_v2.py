@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from core.api.server import create_app
 from core.daemon.client import DaemonClient
+from core.daemon.server import _sensor_completion_is_valid
 from core.detection.contracts import DetectionFindingV2
 from core.packet_engine.conversations import ConversationTracker
 from core.packet_engine.flow_worker import build_snapshot
@@ -183,6 +184,24 @@ def test_capture_completion_distinguishes_complete_and_partial(tmp_path):
         assert rows["partial"]["pending_packets"] == 3
     finally:
         db.close()
+
+
+def test_rust_capture_requires_terminal_certificate_and_zero_drops():
+    complete = {
+        "sensor_terminal_received": 1,
+        "sensor_exit_code": 0,
+        "sensor_emitted_events": 3,
+        "received_packets": 3,
+        "dropped_packets": 0,
+    }
+
+    assert _sensor_completion_is_valid("rust", complete)
+    assert not _sensor_completion_is_valid("rust", {**complete, "sensor_terminal_received": 0})
+    assert not _sensor_completion_is_valid("rust", {**complete, "sensor_exit_code": -15})
+    assert not _sensor_completion_is_valid("rust", {**complete, "sensor_emitted_events": 2})
+    assert not _sensor_completion_is_valid("rust", {**complete, "dropped_packets": 1})
+    assert _sensor_completion_is_valid("python", {})
+    assert not _sensor_completion_is_valid("python", {"dropped_packets": 1})
 
 
 def test_legacy_stopped_session_is_migrated_to_explicit_partial(tmp_path):

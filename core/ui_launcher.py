@@ -7,9 +7,13 @@ import socket
 import subprocess
 import sys
 import time
+from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
 from urllib.request import urlopen
 import webbrowser
+
+import psutil
 
 from core.context import context
 
@@ -27,6 +31,35 @@ def _tail(path: Path, lines: int = 20) -> str:
         return ""
 
 
+def _stop_process_tree(process: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Stop a launched service and descendants created by platform shims."""
+    try:
+        root = psutil.Process(process.pid)
+        targets = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        targets = []
+
+    for target in targets:
+        try:
+            target.terminate()
+        except psutil.NoSuchProcess:
+            pass
+
+    _, alive = psutil.wait_procs(targets, timeout=timeout)
+    for target in alive:
+        try:
+            target.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=timeout)
+
+    try:
+        process.wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
 def _http_ready(url: str, contains: str = "") -> bool:
     try:
         with urlopen(url, timeout=0.75) as response:
@@ -37,8 +70,36 @@ def _http_ready(url: str, contains: str = "") -> bool:
 
 
 def _managed_ui_ready(port: int) -> bool:
-    """Recognize the controller/UI started by the hybrid runtime."""
-    return _http_ready(f"http://127.0.0.1:{int(port)}/api/v1/health", '"status"')
+    """Recognize a controller UI whose current page assets are also available."""
+    base_url = f"http://127.0.0.1:{int(port)}"
+    if not _http_ready(f"{base_url}/api/v1/health", '"status"'):
+        return False
+    try:
+        with urlopen(f"{base_url}/ai", timeout=1.5) as response:
+            if not 200 <= response.status < 400:
+                return False
+            html = response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except (HTTPError, URLError, OSError, TimeoutError):
+        return False
+
+    class _LocalAssets(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.paths = set()
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            paths = [attributes.get("src"), attributes.get("href")]
+            for path in paths:
+                if path and urljoin(base_url, path).startswith(f"{base_url}/assets/"):
+                    self.paths.add(urljoin(base_url, path))
+
+    assets = _LocalAssets()
+    assets.feed(html)
+    # An HTML shell without a module entry point is not a usable UI.
+    if not any(path.endswith(".js") or ".js?" in path for path in assets.paths):
+        return False
+    return all(_http_ready(path) for path in assets.paths)
 
 
 def _wait_for_http(url: str, process, log_path: Path, contains: str = "", timeout: float = 20.0) -> None:
@@ -58,13 +119,19 @@ def launch_ui(console, port: int = 4173, api_port: int = 8000, open_browser: boo
     # ``tower > ui`` is often used after ``watchtower.ps1 start``. In that
     # case the managed controller already owns 4173 and there is no reason to
     # create a second standalone API on 8000.
-    if port != api_port and _managed_ui_ready(port):
-        url = f"http://127.0.0.1:{port}"
-        console.print(f"[bold cyan]WatchTower UI[/bold cyan]  {url}")
-        console.print("[dim]Managed controller is already running; reusing it.[/dim]")
-        if open_browser:
-            webbrowser.open(url)
-        return
+    if port != api_port and _port_open(port):
+        if _managed_ui_ready(port):
+            url = f"http://127.0.0.1:{port}"
+            console.print(f"[bold cyan]WatchTower UI[/bold cyan]  {url}")
+            console.print("[dim]Managed controller is already running; reusing it.[/dim]")
+            if open_browser:
+                webbrowser.open(url)
+            return
+        if _http_ready(f"http://127.0.0.1:{int(port)}/api/v1/health", '"status"'):
+            raise RuntimeError(
+                f"A WatchTower service is using port {port}, but its UI bundle is incomplete or stale. "
+                "Restart the service that owns this port, or choose another UI port; it was not stopped."
+            )
 
     ui_dir = Path(context.root_dir) / "ui"
     vite = ui_dir / "node_modules" / ".bin" / ("vite.cmd" if sys.platform == "win32" else "vite")
@@ -164,12 +231,6 @@ def launch_ui(console, port: int = 4173, api_port: int = 8000, open_browser: boo
         console.print("\n[dim]Stopping local UI services...[/dim]")
     finally:
         for process in reversed(owned):
-            if process.poll() is None:
-                process.terminate()
-        for process in reversed(owned):
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            _stop_process_tree(process)
         for handle in log_handles:
             handle.close()

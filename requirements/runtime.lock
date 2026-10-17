@@ -54,6 +54,7 @@ requests==2.34.2
 rich==15.0.0
 scapy==2.7.0
 SQLAlchemy==2.0.51
+setuptools==84.0.0
 starlette==1.6.0
 typing-extensions==4.16.0
 typing-inspection==0.4.3

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 INSTALL_PREREQUISITES=0
 WITH_NEO4J=0
 SKIP_UI=0
@@ -48,6 +48,12 @@ for argument in "$@"; do
     *) echo "Unknown setup option: $argument" >&2; exit 2 ;;
   esac
 done
+
+# Do not replace the virtual environment, UI bundle, or sensor files while a
+# WatchTower process from this checkout may still be using them.
+# shellcheck source=scripts/watchtower_process_guard.sh
+source "$ROOT/scripts/watchtower_process_guard.sh"
+watchtower_assert_stopped "$ROOT"
 
 step() { printf '\n==> %s\n' "$1"; }
 require() { command -v "$1" >/dev/null 2>&1 || { echo "$1 is required. $2" >&2; exit 1; }; }
@@ -181,11 +187,11 @@ if [[ ! -x .venv/bin/python ]]; then
   "$PYTHON_CMD" -m venv .venv
 fi
 PYTHON="$ROOT/.venv/bin/python"
-"$PYTHON" -m pip install --upgrade pip
+"$PYTHON" -m pip install -c requirements/runtime.lock setuptools
 if [[ "$DEVELOPMENT" == 1 ]]; then
-  "$PYTHON" -m pip install -c requirements/runtime.lock -e '.[dev]'
+  "$PYTHON" -m pip install --no-build-isolation -c requirements/runtime.lock -e '.[dev]'
 else
-  "$PYTHON" -m pip install -c requirements/runtime.lock -e .
+  "$PYTHON" -m pip install --no-build-isolation -c requirements/runtime.lock -e .
 fi
 
 if [[ "$SKIP_RUST" == 0 ]]; then

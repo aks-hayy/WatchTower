@@ -1,19 +1,24 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from io import BytesIO
+from threading import Barrier, Event, Lock
 import zipfile
 
 import pytest
 from cryptography.fernet import Fernet
+import grpc
+from sqlalchemy import event
 
-from core.mesh.contracts import TelemetryEnvelope
+from core.mesh.contracts import TelemetryEnvelope, canonical_json_bytes
 from core.mesh.agent import MeshAgent
-from core.mesh.security import new_node_csr
+from core.mesh.proto import JsonMessage, TelemetryMessage
+from core.mesh.security import new_node_csr, token_hash
 from core.mesh.service import MeshControllerService
 from core.mesh.spool import EncryptedMeshSpool
-from core.mesh.transport import MeshGrpcClient, MeshGrpcServer
+from core.mesh.transport import MeshGrpcClient, MeshGrpcServer, V2_SERVICE_NAME
 from core.storage.database import WatchtowerDB
-from core.storage.models import HardwareObservation, MeshCommand
+from core.storage.models import HardwareObservation, MeshCommand, MeshEnrollment
 
 
 def _enroll(service, name="node-one"):
@@ -33,6 +38,79 @@ def test_mesh_enrollment_issues_node_certificate_and_consumes_token(tmp_path):
     assert enrolled["node"]["id"] == "node-test-1"
     assert "BEGIN CERTIFICATE" in enrolled["client_certificate_pem"]
     assert db.get_sensor_node("node-test-1")["capabilities"]["sysmon"]
+    db.close()
+
+
+def test_invalid_mesh_csr_does_not_consume_one_use_enrollment_token(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    token = service.create_enrollment(name="retryable-node", max_uses=1)["token"]
+
+    with pytest.raises(ValueError):
+        service.enroll({"token": token, "node_id": "node-test-2", "csr_pem": "not a certificate"})
+
+    _key, csr = new_node_csr("node-test-2")
+    enrolled = service.enroll({"token": token, "node_id": "node-test-2", "csr_pem": csr.decode("utf-8")})
+
+    assert enrolled["node"]["id"] == "node-test-2"
+    assert "BEGIN CERTIFICATE" in enrolled["client_certificate_pem"]
+    db.close()
+
+
+def test_invalid_mesh_enrollment_token_is_rejected_before_csr_verification(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    _key, csr = new_node_csr("node-test-3")
+    verification_inputs = []
+    monkeypatch.setattr(service.authority, "validate_csr", lambda value: verification_inputs.append(value))
+
+    with pytest.raises(PermissionError, match="Enrollment token"):
+        service.enroll({"token": "not-a-valid-token", "node_id": "node-test-3", "csr_pem": csr.decode("utf-8")})
+
+    assert verification_inputs == []
+    db.close()
+
+
+def test_oversized_mesh_csr_is_rejected_without_consuming_enrollment_token(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    token = service.create_enrollment(name="bounded-csr-node", max_uses=1)["token"]
+
+    with pytest.raises(ValueError, match="CSR exceeds the 16 KiB limit"):
+        service.enroll({"token": token, "node_id": "node-test-4", "csr_pem": "x" * (16 * 1024 + 1)})
+
+    _key, csr = new_node_csr("node-test-4")
+    enrolled = service.enroll({"token": token, "node_id": "node-test-4", "csr_pem": csr.decode("utf-8")})
+    assert enrolled["node"]["id"] == "node-test-4"
+    db.close()
+
+
+def test_one_use_mesh_enrollment_token_is_consumed_by_only_one_concurrent_request(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    token = "one-use-race-token"
+    db.create_mesh_enrollment("one-use-race", token_hash(token), expires_at=4_000_000_000, max_uses=1)
+    start = Barrier(2)
+    at_update = Barrier(2)
+
+    def synchronize_updates(*_args):
+        at_update.wait(timeout=5)
+
+    event.listen(MeshEnrollment, "before_update", synchronize_updates)
+
+    def consume_at_once():
+        start.wait()
+        return db.consume_mesh_enrollment(token_hash(token))
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: consume_at_once(), range(2)))
+    finally:
+        event.remove(MeshEnrollment, "before_update", synchronize_updates)
+
+    assert sum(result is not None for result in results) == 1
     db.close()
 
 
@@ -91,6 +169,37 @@ def test_mesh_receipt_rejects_same_sequence_with_different_payload(tmp_path):
         assert False, "conflicting sequence must be rejected"
     except ValueError as exc:
         assert "sequence_payload_conflict" in str(exc)
+    db.close()
+
+
+def test_mesh_retry_reapplies_health_before_ack_after_transient_apply_failure(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    _enroll(service)
+    envelope = TelemetryEnvelope(
+        "node-test-1", 14, "health", {"health": {"queue_lag_ms": 17.0}}, 100.0,
+    )
+    original_update = db.update_sensor_node_health
+    attempts = 0
+
+    def fail_once(node_id, health, capabilities=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary storage failure")
+        return original_update(node_id, health, capabilities)
+
+    monkeypatch.setattr(db, "update_sensor_node_health", fail_once)
+    with pytest.raises(OSError, match="temporary storage failure"):
+        service.ingest("node-test-1", envelope.to_dict())
+
+    result = service.ingest("node-test-1", envelope.to_dict())
+
+    assert result.get("ack_sequence") == 14
+    assert result.get("applied") == 1
+    assert db.get_sensor_node("node-test-1")["health"]["queue_lag_ms"] == 17.0
+    assert attempts == 2
     db.close()
 
 
@@ -321,6 +430,142 @@ def test_mesh_grpc_enrollment_and_mtls_ingest(tmp_path):
         db.close()
 
 
+def test_mesh_grpc_enrollment_rejects_calls_over_admission_limit(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    server = MeshGrpcServer(service, "127.0.0.1", enrollment_port=0, ingest_port=0)
+    ports = server.start()
+    release_handlers = Event()
+    four_workers_started = Event()
+    worker_lock = Lock()
+    active_workers = 0
+
+    def hold_enrollment(_request):
+        nonlocal active_workers
+        with worker_lock:
+            active_workers += 1
+            if active_workers == 4:
+                four_workers_started.set()
+        if not release_handlers.wait(timeout=10):
+            raise RuntimeError("test did not release blocked enrollment handler")
+        return {"node": {"id": "test-node"}}
+
+    monkeypatch.setattr(service, "enroll", hold_enrollment)
+    channel = grpc.secure_channel(
+        f"127.0.0.1:{ports['enrollment_port']}",
+        grpc.ssl_channel_credentials(root_certificates=service.authority.ca_certificate()),
+    )
+    enroll_call = channel.unary_unary(
+        f"/{V2_SERVICE_NAME}/Enroll",
+        request_serializer=lambda value: MeshGrpcClient._json_message(value).SerializeToString(deterministic=True),
+        response_deserializer=JsonMessage.FromString,
+    )
+    request = {"token": "test", "node_id": "test-node", "csr_pem": "unused"}
+    admitted = []
+    try:
+        admitted = [enroll_call.future(request, timeout=10) for _ in range(32)]
+        assert four_workers_started.wait(timeout=5)
+        overflow = enroll_call.future(request, timeout=5)
+        with pytest.raises(grpc.RpcError) as rejected:
+            overflow.result(timeout=3)
+        assert rejected.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+    finally:
+        release_handlers.set()
+        for pending in admitted:
+            try:
+                pending.result(timeout=5)
+            except grpc.RpcError:
+                pass
+        channel.close()
+        server.stop()
+        db.close()
+
+
+def test_mesh_grpc_ingest_rejects_calls_over_admission_limit(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    service = MeshControllerService(db)
+    service.initialize("127.0.0.1")
+    server = MeshGrpcServer(service, "127.0.0.1", enrollment_port=0, ingest_port=0)
+    ports = server.start()
+    private_key, csr = new_node_csr("node-ingest-limit")
+    token = service.create_enrollment(name="ingest-limit")['token']
+    bootstrap = MeshGrpcClient("127.0.0.1", ports["enrollment_port"], ports["ingest_port"])
+    enrolled = bootstrap.enroll({
+        "token": token, "node_id": "node-ingest-limit", "name": "ingest-limit",
+        "platform": "Linux", "agent_version": "1.0.0", "capabilities": {"telemetry": True},
+        "csr_pem": csr.decode("utf-8"),
+    }, service.authority.ca_certificate())
+    release_handlers = Event()
+    eight_workers_started = Event()
+    worker_lock = Lock()
+    active_workers = 0
+
+    def hold_ingest(_node_id, _payload):
+        nonlocal active_workers
+        with worker_lock:
+            active_workers += 1
+            if active_workers == 8:
+                eight_workers_started.set()
+        if not release_handlers.wait(timeout=10):
+            raise RuntimeError("test did not release blocked ingest handler")
+        return {"accepted": True}
+
+    monkeypatch.setattr(service, "ingest", hold_ingest)
+    channel = grpc.secure_channel(
+        f"127.0.0.1:{ports['ingest_port']}",
+        grpc.ssl_channel_credentials(
+            root_certificates=service.authority.ca_certificate(),
+            private_key=private_key,
+            certificate_chain=enrolled["client_certificate_pem"].encode("utf-8"),
+        ),
+    )
+    ingest_call = channel.unary_unary(
+        f"/{V2_SERVICE_NAME}/Ingest",
+        request_serializer=lambda value: value.SerializeToString(deterministic=True),
+        response_deserializer=JsonMessage.FromString,
+    )
+    payload = {"health": {"captured_at": 100.0}}
+    admitted = []
+    try:
+        for sequence in range(1, 65):
+            envelope = TelemetryEnvelope("node-ingest-limit", sequence, "health", payload, 100.0)
+            admitted.append(ingest_call.future(TelemetryMessage(
+                protocol_version=envelope.protocol_version,
+                node_id=envelope.node_id,
+                sequence=envelope.sequence,
+                envelope_type=envelope.envelope_type,
+                payload_json=canonical_json_bytes(envelope.payload),
+                created_at=envelope.created_at,
+                payload_digest=envelope.payload_digest,
+                digest_algorithm=envelope.digest_algorithm,
+            ), timeout=10))
+        assert eight_workers_started.wait(timeout=5)
+        overflow = ingest_call.future(TelemetryMessage(
+            protocol_version=envelope.protocol_version,
+            node_id=envelope.node_id,
+            sequence=65,
+            envelope_type=envelope.envelope_type,
+            payload_json=canonical_json_bytes(envelope.payload),
+            created_at=envelope.created_at,
+            payload_digest=envelope.payload_digest,
+            digest_algorithm=envelope.digest_algorithm,
+        ), timeout=5)
+        with pytest.raises(grpc.RpcError) as rejected:
+            overflow.result(timeout=3)
+        assert rejected.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+    finally:
+        release_handlers.set()
+        for pending in admitted:
+            try:
+                pending.result(timeout=5)
+            except grpc.RpcError:
+                pass
+        channel.close()
+        server.stop()
+        db.close()
+
+
 def test_mesh_join_package_is_self_contained_and_fingerprint_bound(tmp_path):
     db = WatchtowerDB(data_dir=str(tmp_path))
     service = MeshControllerService(db)
@@ -362,6 +607,11 @@ def test_node_decommission_rejects_commands_and_preserves_node_history(tmp_path)
     service.initialize("127.0.0.1")
     _enroll(service)
     command = service.queue_command("node-test-1", "capture.start", {"interface": "eth0"})
+
+    assert command["status"] == "queued"
+    assert command["operation"]["state"] == "queued"
+    assert command["operation"]["completeness"] == "not_applicable"
+    assert command["operation"]["next_actions"] == ["Wait for the operation to start."]
 
     assert service.revoke("node-test-1", "retired by operator")
     node = db.get_sensor_node("node-test-1")

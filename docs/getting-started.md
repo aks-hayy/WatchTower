@@ -6,21 +6,43 @@ Windows is the primary endpoint-attribution platform because it supports Npcap a
 
 ## Windows installation
 
-For the recommended desktop experience, use the unified installer. It builds
-the controller/UI container, installs the native Rust sensor, and leaves
-capture selection to the UI or companion CLI after startup:
+For the simplest setup, let the installer choose from what is already ready:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
-.\watchtower.ps1 start
 ```
 
-The UI opens at `http://127.0.0.1:4173` and a controller-backed `tower` CLI
-opens alongside it. Operator authentication is shared between them for the
-same eight-hour session.
+It selects hybrid only when the local Docker Desktop, Compose, and Linux engine
+are ready. Otherwise it installs the native single-host edition and explains
+how to choose hybrid explicitly. Automatic mode does not install Docker or
+select a remote Docker context.
 
-Use the focused launch commands when only one surface is needed:
+To force hybrid (controller/UI container plus host Rust sensor) or native mode:
+
+```powershell
+.\install.ps1 -Mode hybrid
+.\install.ps1 -Mode native
+```
+
+For hybrid mode, run `.\watchtower.ps1 start`; the UI opens at
+`http://127.0.0.1:4173` and a controller-backed `tower` CLI opens alongside
+it. Operator authentication is shared between them for the same eight-hour
+session. For native mode, keep `tower ui` running in its terminal and open
+`tower` in a second terminal for the CLI:
+
+```powershell
+.\.venv\Scripts\tower.exe ui
+# In a second PowerShell window:
+.\.venv\Scripts\tower.exe
+```
+
+Both installation paths use the same UI and `tower` CLI. The installer reports
+external requirements such as Npcap and Visual C++ Build Tools before capture
+can start; it does not silently substitute a different capture backend.
+
+Use these focused commands only for hybrid installs. For native installs,
+launch `tower ui` and `tower` directly as shown above:
 
 ```powershell
 .\watchtower.ps1 ui
@@ -92,6 +114,17 @@ tower plugins calibration verify
 ```
 
 `doctor` checks configuration, storage, schema, backend availability, disk space, and runtime health. Optional integrations can report unavailable without preventing local capture or offline analysis.
+
+## Find a command
+
+```text
+tower --help
+tower help --all
+tower <task> --help
+```
+
+The default help keeps common task paths prominent. `tower help --all` shows
+advanced and compatibility commands; existing command names remain available.
 
 ## First capture
 

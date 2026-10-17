@@ -19,6 +19,17 @@ def test_encrypted_file_credential_store_round_trip_and_no_plaintext(tmp_path):
     assert store.get("openai") is None
 
 
+def test_encrypted_file_credential_store_accepts_binary_32_byte_installation_key(tmp_path):
+    key_path = tmp_path / "installation.key"
+    key_path.write_bytes(b"\n" + bytes(range(30)) + b"\t")
+    vault_path = tmp_path / "credentials.vault.json"
+    store = CredentialStore(backend="encrypted_file", key_path=key_path, vault_path=vault_path)
+
+    store.set("provider", "secret")
+
+    assert store.get("provider") == "secret"
+
+
 def test_encrypted_file_credential_store_rejects_missing_or_bad_installation_key(tmp_path):
     store = CredentialStore(backend="container", key_path=tmp_path / "missing.key", vault_path=tmp_path / "vault.json")
     with pytest.raises(CredentialStoreError, match="unavailable"):

@@ -12,6 +12,7 @@ from core.packet_engine.flow_worker import flow_worker
 from core.packet_engine.config import PacketEngineConfig
 from core.packet_engine.persistence import DailyAccumulator
 from core.packet_engine.ipc import get_ipc_key, IPC_PORT
+from core.cli.ux import capture_completion_message, capture_succeeded
 from multiprocessing.connection import Listener, Client
 import scapy.all as scapy
 
@@ -35,8 +36,8 @@ class CaptureModule:
             self.config.interface = options["interface"]
 
     def run(self, background=False):
-        from core.daemon.manager import DaemonManager
-        DaemonManager.ensure_running(silent=True)
+        if not self._ensure_daemon_for_capture():
+            return False
 
         from core.daemon.client import DaemonClient
         client = DaemonClient()
@@ -49,14 +50,17 @@ class CaptureModule:
             interfaces = self._select_interfaces(multi=True)
 
         if not interfaces:
-            return
+            return False
 
         if background:
             client.set_background(True)
 
+        started = 0
+        failures = []
         for iface in interfaces:
             if self._is_running(iface):
                 console.print(f"[yellow]Engine for {iface} is already running.[/yellow]")
+                started += 1
                 continue
 
             console.print(f"[cyan]Starting capture on {iface}...[/cyan]")
@@ -66,19 +70,20 @@ class CaptureModule:
             )
             
             if res.get("status") == "error":
-                console.print(f"[red]Error starting {iface}: {res.get('message')}[/red]")
+                detail = str(res.get("message") or "the adapter rejected the start request")
+                failures.append(f"{iface}: {detail}")
+                console.print(f"[red]Could not start {iface}: {detail}[/red]")
             elif res.get("status") == "started":
+                started += 1
                 console.print(f"[green]Engine started on {res.get('interface', iface)}[/green]")
 
-        if background:
-            console.print("[bold green]\nWATCHTOWER is now running in BACKGROUND MODE.[/bold green]")
-            console.print("[dim]Monitoring will continue even if you close this terminal.[/dim]")
-            console.print("[dim]Use 'tower stop' to terminate background engines.[/dim]")
+        console.print(capture_completion_message(background=background, started=started, failures=failures))
+        return capture_succeeded(started=started, failures=failures)
 
     def background(self):
         """Interactive background mode setup."""
-        from core.daemon.manager import DaemonManager
-        DaemonManager.ensure_running(silent=True)
+        if not self._ensure_daemon_for_capture():
+            return False
         
         from core.daemon.client import DaemonClient
         client = DaemonClient()
@@ -101,6 +106,18 @@ class CaptureModule:
         confirm = console.input("[yellow]Close Watchtower shell now? (y/N): [/yellow]")
         if confirm.lower() == 'y':
             sys.exit(0)
+
+    @staticmethod
+    def _ensure_daemon_for_capture():
+        from core.daemon.manager import DaemonManager
+
+        if DaemonManager.ensure_running(silent=False):
+            return True
+        console.print(
+            "[red]The WatchTower daemon could not be started. If your operating system "
+            "asks for permission, approve it, then retry `tower start`. No capture was started.[/red]"
+        )
+        return False
 
     def stop(self, interface=None):
         from core.daemon.client import DaemonClient

@@ -1,7 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { CheckCircle2, Crosshair, Loader2, ShieldAlert } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Crosshair, Loader2, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import { fetchInterfaces, runSigmaHunt } from "@/lib/api.functions";
+import { describeSigmaCoverage } from "@/lib/sigma-coverage";
 import type { NetworkInterface } from "@/types/watchtower";
 
 export const Route = createFileRoute("/hunt")({
@@ -15,17 +16,30 @@ type HuntResult = {
   persisted: boolean;
   active_rules: number;
   rejected_rules: number;
+  complete?: boolean;
+  limitations?: string[];
+  evaluated_flows?: number;
+  evaluated_identity_observations?: number | null;
+  evaluated_rules?: number;
+  coverage_status?: string;
 };
 
 function HuntPage() {
   const interfaces = Route.useLoaderData();
   const [source, setSource] = useState("live");
   const [captureInterface, setCaptureInterface] = useState("");
+  const [captureSession, setCaptureSession] = useState("");
+  const [timeStart, setTimeStart] = useState("");
+  const [timeEnd, setTimeEnd] = useState("");
+  const [sensorNode, setSensorNode] = useState("");
   const [rule, setRule] = useState("");
   const [persist, setPersist] = useState(true);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<HuntResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const coverage = result
+    ? describeSigmaCoverage(result.coverage_status, result.complete, result.active_rules)
+    : null;
 
   const run = async () => {
     setRunning(true);
@@ -39,6 +53,10 @@ function HuntPage() {
             interface: captureInterface || undefined,
             rule: rule.trim() || undefined,
             persist,
+            capture_session_id: captureSession.trim() || undefined,
+            time_start: timeStart ? Date.parse(timeStart) / 1000 : undefined,
+            time_end: timeEnd ? Date.parse(timeEnd) / 1000 : undefined,
+            sensor_node_id: sensorNode.trim() || undefined,
           },
         }),
       );
@@ -91,6 +109,36 @@ function HuntPage() {
                 </select>
               </label>
               <Field
+                label="CAPTURE SESSION ID"
+                value={captureSession}
+                onChange={setCaptureSession}
+                placeholder="optional exact session"
+              />
+              <Field
+                label="SENSOR NODE ID"
+                value={sensorNode}
+                onChange={setSensorNode}
+                placeholder="optional mesh node"
+              />
+              <label className="block">
+                <span className="section-label">START TIME (LOCAL)</span>
+                <input
+                  type="datetime-local"
+                  value={timeStart}
+                  onChange={(event) => setTimeStart(event.target.value)}
+                  className="mt-2 h-9 w-full border border-border bg-background px-2 mono text-[11px] text-foreground"
+                />
+              </label>
+              <label className="block">
+                <span className="section-label">END TIME (LOCAL)</span>
+                <input
+                  type="datetime-local"
+                  value={timeEnd}
+                  onChange={(event) => setTimeEnd(event.target.value)}
+                  className="mt-2 h-9 w-full border border-border bg-background px-2 mono text-[11px] text-foreground"
+                />
+              </label>
+              <Field
                 label="RULE ID OR TITLE"
                 value={rule}
                 onChange={setRule}
@@ -134,15 +182,44 @@ function HuntPage() {
           {result ? (
             <div className="panel">
               <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-                <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
-                <span className="section-label">/ HUNT COMPLETE</span>
+                {coverage?.state !== "complete" ? (
+                  <AlertTriangle className="h-3.5 w-3.5 text-severity-high" />
+                ) : (
+                  <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
+                )}
+                <span className="section-label">/ {coverage?.label}</span>
               </div>
               <div className="grid grid-cols-2 gap-px bg-border lg:grid-cols-4">
                 <Metric label="MATCHES" value={result.matched} alert={result.matched > 0} />
                 <Metric label="ACTIVE RULES" value={result.active_rules} />
+                <Metric label="RULES EVALUATED" value={result.evaluated_rules ?? "—"} />
                 <Metric label="REJECTED" value={result.rejected_rules} />
                 <Metric label="PERSISTED" value={result.persisted ? "YES" : "NO"} />
               </div>
+              {coverage?.state === "no-coverage" && (
+                <div
+                  role="status"
+                  className="border-t border-severity-high/30 bg-severity-high/5 px-4 py-3 text-[12px] leading-relaxed text-severity-high"
+                >
+                  {coverage.message} Load or select rules that match the available telemetry, then
+                  rerun. Load or select rules that match the available telemetry, then rerun.
+                </div>
+              )}
+              {result.complete === false && (
+                <div
+                  role="status"
+                  className="border-t border-severity-high/30 bg-severity-high/5 px-4 py-3 text-[12px] leading-relaxed text-severity-high"
+                >
+                  <strong>Results may be incomplete.</strong>
+                  <ul className="mt-1 list-inside list-disc">
+                    {(
+                      result.limitations ?? ["A query limit was reached; matches may be missing."]
+                    ).map((limitation) => (
+                      <li key={limitation}>{limitation}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           ) : error ? (
             <div className="border border-severity-critical/40 bg-severity-critical/10 p-4 mono text-[11px] text-severity-critical">

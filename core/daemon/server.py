@@ -30,6 +30,18 @@ logger = setup_logger("WatchtowerDaemon", log_file=os.path.join(context.logs_dir
 RUST_CAPTURE_READY_TIMEOUT_SECONDS = 5.0
 
 
+def _sensor_completion_is_valid(backend, metrics):
+    if metrics.get("dropped_packets", 0):
+        return False
+    if backend != "rust":
+        return True
+    return (
+        bool(metrics.get("sensor_terminal_received"))
+        and metrics.get("sensor_exit_code") == 0
+        and metrics.get("sensor_emitted_events") == metrics.get("received_packets")
+    )
+
+
 class EngineManager:
     def __init__(self):
         self.engines = {}  # interface_name -> dict of procs, queues, events
@@ -165,6 +177,11 @@ class EngineManager:
                 "queue_lag_samples": multiprocessing.Value("Q", 0),
                 "queue_lag_current_ms": multiprocessing.Value("d", 0.0),
                 "queue_lag_max_ms": multiprocessing.Value("d", 0.0),
+                "sensor_terminal_received": multiprocessing.Value("b", 0),
+                "sensor_received_packets": multiprocessing.Value("Q", 0),
+                "sensor_emitted_events": multiprocessing.Value("Q", 0),
+                "sensor_flow_count": multiprocessing.Value("Q", 0),
+                "sensor_exit_code": multiprocessing.Value("i", -999),
             }
             worker_done_event = multiprocessing.Event()
             stop_event = multiprocessing.Event()  # ← clean stop signal for capture
@@ -226,6 +243,8 @@ class EngineManager:
                             or "Rust capture sensor failed to become ready"
                         ),
                     }
+                if readiness.get("link_type"):
+                    origin["link_type"] = str(readiness["link_type"])
 
             worker_proc.start()
             evidence_proc.start()
@@ -241,6 +260,7 @@ class EngineManager:
             session_db.close()
 
             self.engines[interface] = {
+                "backend": backend,
                 "capture_proc": capture_proc,
                 "worker_proc": worker_proc,
                 "packet_queue": packet_queue,
@@ -376,12 +396,15 @@ class EngineManager:
         if evidence_ack:
             session_db.acknowledge_capture_stage(session_id, "evidence")
 
+        sensor_complete = _sensor_completion_is_valid(engine.get("backend"), metrics)
+
         data_complete = (
             worker_ack is not None
             and evidence_ack is not None
             and not control_signal_failed
             and not evidence_signal_failed
             and metrics["pending_packets"] == 0
+            and sensor_complete
         )
         reasons = []
         if capture_forced:
@@ -400,6 +423,10 @@ class EngineManager:
             reasons.append("evidence_signal_failed")
         if metrics["pending_packets"]:
             reasons.append(f"{metrics['pending_packets']}_packets_pending")
+        if metrics.get("dropped_packets", 0):
+            reasons.append(f"{metrics['dropped_packets']}_capture_packets_dropped")
+        if not sensor_complete:
+            reasons.append("rust_sensor_terminal_certificate_missing_or_invalid")
 
         processing_state = "complete" if data_complete else "partial"
         completion_reason = ",".join(reasons) if reasons else "drained_and_acknowledged"

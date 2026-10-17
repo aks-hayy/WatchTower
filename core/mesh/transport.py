@@ -21,6 +21,8 @@ from core.mesh.proto import JsonMessage, TelemetryMessage
 
 SERVICE_NAME = "watchtower.mesh.v1.Mesh"
 V2_SERVICE_NAME = "watchtower.mesh.v2.Mesh"
+ENROLLMENT_MAX_CONCURRENT_RPCS = 32
+INGEST_MAX_CONCURRENT_RPCS = 64
 
 
 def _response(value: Dict[str, Any]) -> bytes:
@@ -47,14 +49,20 @@ class MeshGrpcServer:
                 self._ingest, request_deserializer=decode_message, response_serializer=_response,
             ),
         })
-        self._enrollment_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        self._enrollment_server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=4),
+            maximum_concurrent_rpcs=ENROLLMENT_MAX_CONCURRENT_RPCS,
+        )
         self._enrollment_server.add_generic_rpc_handlers((enroll_handlers, self._v2_enrollment_handlers()))
         enrollment_port = self._enrollment_server.add_secure_port(
             f"{self.host}:{self.enrollment_port}", grpc.ssl_server_credentials(((key, certificate),)),
         )
         if not enrollment_port:
             raise RuntimeError("Unable to bind mesh enrollment listener")
-        self._ingest_server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+        self._ingest_server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=8),
+            maximum_concurrent_rpcs=INGEST_MAX_CONCURRENT_RPCS,
+        )
         self._ingest_server.add_generic_rpc_handlers((ingest_handlers, self._v2_ingest_handlers()))
         ingest_port = self._ingest_server.add_secure_port(
             f"{self.host}:{self.ingest_port}",

@@ -1,13 +1,21 @@
 from hashlib import sha256
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import os
+import subprocess
+import sys
+from threading import Thread
 
 import pytest
 
 import core.forensics.engine as engine_module
 from core.forensics.engine import ForensicsEngine
+from core.cli.modules.forensics import ForensicsModule
+from core.daemon.client import DaemonClient
 from core.investigation.export import CaseExporter
 from core.investigation.service import InvestigationService
 from core.operations.health import HealthService
+from core.operations.capabilities import CapabilityRegistry
 from core.packet_engine.config import PacketEngineConfig
 from core.packet_engine.schemas import FlowAggregate
 from core.storage.database import WatchtowerDB
@@ -42,6 +50,155 @@ def test_health_service_checks_database_schema_and_storage(tmp_path):
     assert checks["database_schema"]["status"] == "pass"
     assert checks["data_directory"]["status"] == "pass"
     db.close()
+
+
+def test_health_service_preserves_capability_recovery_actions(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    monkeypatch.setattr(CapabilityRegistry, "summary", lambda self: {
+        "ollama": {
+            "available": False,
+            "state": "needs_test",
+            "reason": "provider has not been tested",
+            "next_action": "Run tower ai provider test.",
+        },
+    })
+
+    report = HealthService(db).run()
+
+    check = next(item for item in report["checks"] if item["name"] == "capability:ollama")
+    assert check["status"] == "warn"
+    assert check["detail"] == "provider has not been tested"
+    assert check["next_action"] == "Run tower ai provider test."
+    db.close()
+
+
+def test_doctor_json_fails_overall_when_daemon_is_stopped(tmp_path, monkeypatch):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    monkeypatch.setattr(DaemonClient, "get_status", lambda self: {
+        "running": False,
+        "healthy": False,
+        "interfaces": [],
+    })
+    module = ForensicsModule.__new__(ForensicsModule)
+    module.db = db
+
+    report = module.doctor(json_output=True)
+
+    assert report["daemon"]["status"] == "fail"
+    assert report["daemon"]["next_action"] == "Start WatchTower with 'tower start'."
+    assert report["status"] == "fail"
+    db.close()
+
+
+def test_controller_doctor_checks_local_api_and_marks_native_daemon_not_applicable(tmp_path, monkeypatch):
+    class ControllerHealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = json.dumps({
+                "status": "ok",
+                "version": "test",
+                "database": "ok",
+                "daemon": "not_applicable",
+                "deployment_role": "controller",
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), ControllerHealthHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("WATCHTOWER_DEPLOYMENT_ROLE", "controller")
+    monkeypatch.setattr("core.context.context.ui_port", server.server_port)
+    daemon_calls = []
+    monkeypatch.setattr(DaemonClient, "get_status", lambda self: daemon_calls.append(True) or {"running": False})
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    module = ForensicsModule.__new__(ForensicsModule)
+    module.db = db
+
+    try:
+        report = module.doctor(json_output=True)
+    finally:
+        db.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["controller_api"]["status"] == "pass"
+    assert report["daemon"]["status"] == "not_applicable"
+    assert report["daemon"]["state"] == "not_applicable"
+    assert report["status"] != "fail"
+    assert daemon_calls == []
+
+
+def test_doctor_install_check_treats_stopped_daemon_as_expected(tmp_path):
+    environment = os.environ.copy()
+    environment["WATCHTOWER_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "core.packet_engine.main", "doctor", "--install-check", "--json"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["daemon"]["status"] == "warn"
+    assert report["daemon"]["state"] == "not_started"
+    assert "expected during installation" in report["daemon"]["detail"]
+    assert report["daemon"]["next_action"] == "Start WatchTower with 'tower start'."
+    assert report["status"] == "warn"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_exit", "expected_status"),
+    [
+        (["--install-check"], 0, "WARN"),
+        ([], 1, "FAIL"),
+    ],
+)
+def test_doctor_human_mode_returns_health_report_to_cli(
+    tmp_path, arguments, expected_exit, expected_status
+):
+    environment = os.environ.copy()
+    environment["WATCHTOWER_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "core.packet_engine.main", "doctor", *arguments],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+        check=False,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == expected_exit, combined_output
+    assert "Watchtower Operational Health" in combined_output
+    assert expected_status in combined_output
+    assert "Traceback" not in combined_output
+
+
+def test_doctor_exit_code_fails_when_operational_checks_fail(tmp_path):
+    environment = os.environ.copy()
+    environment["WATCHTOWER_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-m", "core.packet_engine.main", "doctor", "--json"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert report["daemon"]["state"] == "stopped"
+    assert report["status"] == "fail"
 
 
 def test_case_export_manifest_hashes_all_evidence_files(tmp_path):

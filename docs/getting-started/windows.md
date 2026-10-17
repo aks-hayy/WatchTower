@@ -1,17 +1,44 @@
 # Windows 11
 
-Open PowerShell in the repository root and run:
+Open PowerShell in the repository root and run the automatic installer:
 
 ```powershell
 .\install.ps1
-.\watchtower.ps1 start
 ```
 
-The installer creates `.venv`, installs the pinned Python runtime, builds the
-Rust sensor, builds the UI container, and checks Docker Desktop. Npcap is a
-separate operator-managed install because its license and driver setup may
-require visible confirmation. Run `tower sources` after installation to see
-the exact capture names.
+It selects hybrid only when the local Docker Desktop, Compose, and Linux
+engine are ready; otherwise it installs the native single-host edition. It
+does not install Docker automatically or select remote Docker contexts. To
+require a specific deployment shape, choose one explicitly:
+
+```powershell
+.\install.ps1 -Mode hybrid
+.\install.ps1 -Mode native
+```
+
+Hybrid mode creates `.venv`, installs the pinned Python runtime, builds the
+Rust sensor and UI container, and checks Docker Desktop. Start its UI and
+companion CLI with `.\watchtower.ps1 start`.
+
+To install without Docker Desktop, use native mode and launch the UI/API:
+
+```powershell
+.\install.ps1 -Mode native
+.\.venv\Scripts\tower.exe ui
+```
+
+Keep that terminal open while using the UI; press Ctrl+C to stop the local
+UI/API. Open a second PowerShell for the interactive CLI:
+
+```powershell
+.\.venv\Scripts\tower.exe
+```
+
+Both installation paths install the Rust sensor. Windows live capture also
+requires Npcap and its SDK, plus Visual C++ Build Tools; setup can install the
+pinned SDK and Npcap driver when prerequisites are enabled. Npcap's license
+requires visible confirmation. Run `tower sources` to see available capture
+names and backends.
 
 Optional integrations:
 
@@ -24,8 +51,7 @@ The installer creates the local Neo4j credential in the ignored runtime
 secrets directory. Set `WATCHTOWER_NEO4J_PASSWORD_FILE` only when supplying
 an operator-managed secret file.
 
-The recommended runtime is the hybrid controller plus native Rust sensor.
-Use the small public lifecycle surface:
+For hybrid mode, use the small public lifecycle surface:
 
 ```powershell
 .\watchtower.ps1 start       # start the runtime and both operator surfaces
@@ -35,5 +61,6 @@ Use the small public lifecycle surface:
 .\watchtower.ps1 uninstall   # remove generated runtime state after confirmation
 ```
 
-Advanced diagnostics and bridge repair remain available through the scripts
-under `scripts/`.
+Hybrid is the recommended multi-node path; native mode avoids the controller
+container on a single Windows host. Advanced diagnostics and bridge repair
+remain available through the scripts under `scripts/`.

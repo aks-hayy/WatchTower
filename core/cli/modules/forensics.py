@@ -65,7 +65,10 @@ class ForensicsModule:
                 return
 
         mode = "auto"
-        backend = backend_policy.replay_backend()
+        from core.operations.capabilities import CapabilityRegistry
+        backend = backend_policy.replay_backend(
+            runtime_capabilities=CapabilityRegistry(data_dir=str(self.db.data_dir)).flags(),
+        )
         for option, allowed in (("--mode", {"auto", "memory", "streaming"}), ("--backend", {"python", "rust"})):
             if option in parts:
                 try:
@@ -132,7 +135,7 @@ class ForensicsModule:
                     f"[bold white]MAC Address:[/bold white] {suspect.mac or 'unknown'}\n"
                     f"[bold white]Host Name:[/bold white] {suspect.hostname or 'unknown'}\n"
                     f"[bold white]User Account:[/bold white] {suspect.user or 'unknown'}\n"
-                    f"[bold white]Full Name:[/bold white] {suspect.full_name or suspect.user or 'unknown'}\n"
+                    f"[bold white]Full Name:[/bold white] {suspect.full_name or 'unknown'}\n"
                     f"[bold white]TLS Profiling:[/bold white] {suspect.ja3_hash or 'None'} [dim]({suspect.tls_library or 'Standard Client'})[/dim]\n"
                     f"[bold white]JA4 Fingerprint:[/bold white] {suspect.ja4_string or 'None'}\n"
                     f"[bold white]Risk Score:[/bold white] [{score_color}]{suspect.risk_score:.1f}[/{score_color}]\n"
@@ -554,23 +557,73 @@ class ForensicsModule:
                 except FileExistsError:
                     console.print("[bold red]Case export failed:[/bold red] that case name already exists.")
 
-    def doctor(self, json_output: bool = False):
-        """Run configuration, database, schema, storage and daemon diagnostics."""
+    def doctor(self, json_output: bool = False, install_check: bool = False):
+        """Run configuration, storage, and deployment-role health diagnostics."""
         import json
-        from core.operations.health import HealthService
+        import os
+        from core.context import context
+        from core.operations.health import HealthService, check_controller_api
+        from core.ux.contracts import DeploymentRole
         from core.daemon.client import DaemonClient
 
         report = HealthService(self.db).run()
-        daemon = DaemonClient().get_status()
-        daemon_status = "pass" if daemon.get("running") and daemon.get("healthy", True) else (
-            "warn" if daemon.get("running") else "fail"
-        )
+        try:
+            deployment = DeploymentRole(os.environ.get("WATCHTOWER_DEPLOYMENT_ROLE", "native"))
+        except ValueError:
+            deployment = DeploymentRole.NATIVE
+
+        if deployment is DeploymentRole.CONTROLLER:
+            controller_check = check_controller_api(context.ui_port)
+            report["checks"].append({
+                "name": controller_check.name,
+                "status": controller_check.status,
+                "detail": controller_check.detail,
+                "next_action": controller_check.next_action,
+            })
+            daemon_status = "not_applicable"
+            daemon_state = "not_applicable"
+            daemon_detail = "The native capture daemon does not run in a controller deployment."
+            daemon_next_action = "Pair a native sensor to enable live capture."
+            daemon = {"running": False, "healthy": False, "interfaces": []}
+        elif deployment is DeploymentRole.OFFLINE:
+            daemon_status = "not_applicable"
+            daemon_state = "not_applicable"
+            daemon_detail = "Live capture is not part of the offline deployment role."
+            daemon_next_action = "Import a capture file to begin analysis."
+            daemon = {"running": False, "healthy": False, "interfaces": []}
+        else:
+            daemon = DaemonClient().get_status()
+            if daemon.get("running") and daemon.get("healthy", True):
+                daemon_status = "pass"
+                daemon_state = "running"
+                daemon_detail = "WatchTower service is running."
+            elif daemon.get("running"):
+                daemon_status = "warn"
+                daemon_state = "unhealthy"
+                daemon_detail = "WatchTower service is running but not healthy."
+            elif install_check:
+                daemon_status = "warn"
+                daemon_state = "not_started"
+                daemon_detail = "WatchTower has not been started yet; this is expected during installation."
+            else:
+                daemon_status = "fail"
+                daemon_state = "stopped"
+                daemon_detail = "WatchTower service is not running."
+            daemon_next_action = "Start WatchTower with 'tower start'." if not daemon.get("running") else ""
+
         report["daemon"] = {
             "status": daemon_status,
+            "state": daemon_state,
+            "detail": daemon_detail,
             "running": bool(daemon.get("running")),
             "healthy": bool(daemon.get("healthy", False)),
             "interfaces": daemon.get("interfaces") or [],
+            "next_action": daemon_next_action,
         }
+        statuses = [check["status"] for check in report["checks"]]
+        if daemon_status != "not_applicable":
+            statuses.append(daemon_status)
+        report["status"] = "fail" if "fail" in statuses else ("warn" if "warn" in statuses else "pass")
         if json_output:
             print(json.dumps(report, sort_keys=True, default=str))
             return report
@@ -578,15 +631,22 @@ class ForensicsModule:
         table.add_column("Check", style="cyan")
         table.add_column("Status")
         table.add_column("Detail")
-        colors = {"pass": "green", "warn": "yellow", "fail": "red"}
+        table.add_column("Next step")
+        colors = {"pass": "green", "warn": "yellow", "fail": "red", "not_applicable": "dim"}
         for check in report["checks"]:
             color = colors.get(check["status"], "white")
-            table.add_row(check["name"], f"[{color}]{check['status'].upper()}[/{color}]", check["detail"])
+            table.add_row(
+                check["name"], f"[{color}]{check['status'].upper()}[/{color}]",
+                check["detail"], check.get("next_action") or "—",
+            )
 
         color = colors[daemon_status]
-        detail = f"interfaces: {', '.join(daemon.get('interfaces') or []) or 'none'}"
-        table.add_row("daemon", f"[{color}]{daemon_status.upper()}[/{color}]", detail)
+        interfaces = f" Interfaces: {', '.join(daemon.get('interfaces') or []) or 'none'}."
+        detail = f"{report['daemon']['detail']}{interfaces}"
+        next_action = report["daemon"]["next_action"] or "—"
+        table.add_row("daemon", f"[{color}]{daemon_status.upper()}[/{color}]", detail, next_action)
         console.print(table)
+        return report
 
     def _identify_stream_type(self, data: bytes) -> str:
         if not data: return "Empty"

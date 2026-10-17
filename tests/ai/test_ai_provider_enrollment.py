@@ -86,3 +86,33 @@ def test_provider_connection_tests_candidate_without_persisting_secret(tmp_path)
     assert credentials.values == {}
     assert db._get_session().query(AIProviderModelCache).count() == 0
     db.close()
+
+
+def test_provider_test_reports_catalog_and_selected_model_availability_separately(tmp_path):
+    db = WatchtowerDB(data_dir=str(tmp_path))
+    config = AIConfig()
+    config.openai.enabled = True
+    config.openai.model = "not-installed"
+    config.save = lambda *_args, **_kwargs: None
+    credentials = MemoryCredentials()
+    credentials.set(config.openai.credential_ref, "sk-test-secret")
+    registry = ProviderRegistry()
+    registry.register(
+        ProviderManifest(
+            name="openai",
+            label="OpenAI API",
+            local=False,
+            requires_credential=True,
+            supports_research=True,
+        ),
+        InspectingOpenAIProvider,
+    )
+    service = AIProviderService(db, config, credentials, registry, clock=lambda: 1000.0)
+
+    result = service.test("openai")
+
+    assert result["available"] is True
+    assert result["model_catalog_available"] is True
+    assert result["selected_model_available"] is False
+    assert result["model"] == "not-installed"
+    db.close()

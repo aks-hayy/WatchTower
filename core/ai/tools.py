@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 import hashlib
+import ipaddress
 import json
 import re
 from pathlib import Path
@@ -20,6 +22,169 @@ from core.investigation.service import InvestigationService
 
 def _scope(scope: ScopedContext) -> Dict[str, Any]:
     return scope.to_dict()
+
+
+def _has_capture_filters(scope: ScopedContext) -> bool:
+    """Whether this context contains at least one filter supported by flow-backed tools."""
+    return bool(
+        scope.source or scope.interface or scope.session_id or scope.node_id or scope.target_ips
+        or scope.time_start is not None or scope.time_end is not None
+    )
+
+
+def _scope_unavailable(name: str, scope: ScopedContext) -> ToolResult:
+    return _result(
+        name, [], [], summary=(
+            "No WatchTower evidence returned: the selected context has no capture filter supported by this tool."
+        ),
+    )
+
+
+def _scoped_findings(service, scope: ScopedContext, **filters):
+    if not _has_capture_filters(scope):
+        return []
+    return service.scoring_findings(
+        source=scope.source, interface=scope.interface, session=scope.session_id,
+        limit=scope.max_records, sensor_node_id=scope.node_id,
+        time_start=scope.time_start, time_end=scope.time_end,
+        target_ips=list(scope.target_ips), **filters,
+    )
+
+
+def _scoped_risk(service, scope: ScopedContext, ip: str):
+    if not _has_capture_filters(scope):
+        return {"error": "scope_unavailable", "message": "Risk analysis requires a capture-filtered evidence scope."}
+    targets = [str(value) for value in scope.target_ips]
+    if targets and str(ip) not in set(targets):
+        return {"error": "out_of_scope", "message": "The requested endpoint is outside the selected target scope."}
+    return service.scoring_risk(
+        ip, scope.source, scope.interface, scope.session_id, explain=True,
+        sensor_node_id=scope.node_id, time_start=scope.time_start,
+        time_end=scope.time_end, target_ips=targets,
+    )
+
+
+def _scoped_endpoint_processes(service, scope: ScopedContext, ip: Optional[str], limit: int):
+    if not _has_capture_filters(scope):
+        return {
+            "observations": [],
+            "scope_limitations": [
+                "The selected case does not provide a process-observation filter; no process records were read."
+            ],
+        }
+    requested_ip = str(ip) if ip else None
+    targets = tuple(str(value) for value in scope.target_ips)
+    if requested_ip and targets and requested_ip not in targets:
+        return {
+            "observations": [],
+            "scope_limitations": [
+                "The requested endpoint is outside the selected target scope; no process records were read."
+            ],
+        }
+    if scope.source or scope.interface or scope.session_id:
+        return {
+            "observations": [],
+            "scope_limitations": [
+                "Endpoint process observations have no source/interface/session provenance and were excluded from capture-scoped results."
+            ],
+        }
+    requested_ips = (requested_ip,) if requested_ip else targets
+    observations = []
+    if requested_ips:
+        for target in requested_ips:
+            remaining = limit - len(observations)
+            if remaining <= 0:
+                break
+            observations.extend(service.endpoint_processes(
+                target, scope.node_id, remaining,
+                time_start=scope.time_start, time_end=scope.time_end,
+            ))
+    else:
+        observations = service.endpoint_processes(
+            None, scope.node_id, limit,
+            time_start=scope.time_start, time_end=scope.time_end,
+        )
+    return {"observations": observations[:limit], "scope_limitations": []}
+
+
+def _scoped_evidence(service, scope: ScopedContext, ip: Optional[str]):
+    if not _has_capture_filters(scope):
+        return {
+            "items": [],
+            "scope_limitations": [
+                "The selected context has no capture filter supported by artifact evidence; no artifacts were read."
+            ],
+        }
+    requested_ip = str(ip) if ip else None
+    targets = tuple(str(value) for value in scope.target_ips)
+    if requested_ip and targets and requested_ip not in targets:
+        return {
+            "items": [],
+            "scope_limitations": [
+                "The requested endpoint is outside the selected target scope; no artifacts were read."
+            ],
+        }
+    entities = (requested_ip,) if requested_ip else targets or (None,)
+    rows = []
+    limitations = []
+    if any((scope.interface, scope.session_id, scope.node_id,
+            scope.time_start is not None, scope.time_end is not None)):
+        limitations.append(
+            "Artifacts lacking the selected interface, session, node, or time provenance are excluded; completeness applies only to artifacts with matching provenance."
+        )
+    for entity in entities:
+        remaining = scope.max_records - len(rows)
+        if remaining <= 0:
+            break
+        rows.extend(service.evidence(
+            scope.source, entity, interface=scope.interface,
+            capture_session_id=scope.session_id, sensor_node_id=scope.node_id,
+            time_start=scope.time_start, time_end=scope.time_end, limit=remaining,
+        ))
+    return {"items": rows[:scope.max_records], "scope_limitations": limitations}
+
+
+def _endpoint_scope_block(scope: ScopedContext, *ips: str) -> Optional[Dict[str, Any]]:
+    if not _has_capture_filters(scope):
+        return {
+            "error": "scope_unavailable",
+            "scope_limitations": [
+                "The selected context has no capture filter supported by endpoint investigation; no endpoint evidence was read."
+            ],
+        }
+    targets = set(str(value) for value in scope.target_ips)
+    if targets and any(str(ip) not in targets for ip in ips):
+        return {
+            "error": "out_of_scope",
+            "scope_limitations": [
+                "A requested endpoint is outside the selected target scope; no endpoint evidence was read."
+            ],
+        }
+    return None
+
+
+def _scoped_lookup(service, scope: ScopedContext, ip: str, *, investigate: bool = False):
+    blocked = _endpoint_scope_block(scope, ip)
+    if blocked:
+        return blocked
+    method = service.investigate if investigate else service.lookup
+    return method(
+        ip, scope.source, scope.node_id, scope.interface, scope.session_id,
+        scope.time_start, scope.time_end,
+    )
+
+
+def _scoped_identity_coverage(service, scope: ScopedContext):
+    if not _has_capture_filters(scope):
+        return {
+            "scope_limitations": [
+                "The selected context has no capture filter supported by identity coverage; no identity records were read."
+            ],
+        }
+    return service.identity_status(
+        scope.source, scope.interface, scope.session_id, scope.node_id,
+        list(scope.target_ips), scope.time_start, scope.time_end,
+    )
 
 
 def _citations(rows: Iterable[Dict], kind: str, scope: ScopedContext, source: str = "watchtower") -> List[EvidenceCitation]:
@@ -52,7 +217,14 @@ def _facts(value: Any, citations: List[EvidenceCitation], scope: ScopedContext, 
     """Extract bounded scalar facts; never persist arbitrary payload excerpts."""
     rows = value if isinstance(value, list) else [value]
     facts: List[EvidenceFact] = []
+    expanded_rows = []
     for row in rows[:500]:
+        if isinstance(row, dict):
+            expanded_rows.append(row)
+            nested_endpoints = row.get("top_endpoints")
+            if isinstance(nested_endpoints, list):
+                expanded_rows.extend(item for item in nested_endpoints[:10] if isinstance(item, dict))
+    for row in expanded_rows[:510]:
         if not isinstance(row, dict):
             continue
         subject = str(row.get("ip") or row.get("entity_ip") or row.get("src_ip") or row.get("indicator") or tool)
@@ -74,12 +246,13 @@ def _facts(value: Any, citations: List[EvidenceCitation], scope: ScopedContext, 
 
 def _result(name: str, value: Any, citations: List[EvidenceCitation], truncated: bool = False, summary: str = "") -> ToolResult:
     safe = redact_value(value)
+    rows = safe.get("items") if isinstance(safe, dict) and isinstance(safe.get("items"), list) else safe
     if not summary:
         # A mapping is one structured result, not one result per field.
-        count = len(value) if isinstance(value, (list, tuple)) else 1
+        count = len(rows) if isinstance(rows, (list, tuple)) else 1
         summary = f"{count} redacted {name} result(s) returned."
     fact_scope = ScopedContext.from_dict(citations[0].scope) if citations and citations[0].scope else ScopedContext()
-    facts = _facts(safe, citations, fact_scope, name)
+    facts = _facts(rows, citations, fact_scope, name)
     return ToolResult(name, safe, citations, truncated, summary=redact_text(summary, 1000), redacted=True, facts=facts)
 
 
@@ -106,7 +279,37 @@ class CallableTool(AITool):
     def execute(self, scope: ScopedContext, **arguments) -> ToolResult:
         value = self.handler(scope, **arguments)
         rows = value if isinstance(value, list) else [value]
-        return _result(self.name, value, _citations([row for row in rows if isinstance(row, dict)], self.citation_kind, scope))
+        result = _result(
+            self.name, value,
+            _citations(
+                [row for row in rows if isinstance(row, dict)]
+                + ([row for row in value.get("items", []) if isinstance(row, dict)]
+                   if isinstance(value, dict) and isinstance(value.get("items"), list) else []),
+                self.citation_kind, scope,
+            ),
+        )
+        if isinstance(value, list) and len(value) >= scope.max_records:
+            result.truncated = True
+            result.complete = False
+            result.limitations.append(
+                f"The {self.name} result reached the {scope.max_records}-record scope limit; additional matching records may exist."
+            )
+        limitations = list(result.limitations)
+        if isinstance(value, dict):
+            limitations.extend(value.get("limitations") or value.get("scope_limitations") or [])
+            lookup = value.get("lookup")
+            if isinstance(lookup, dict):
+                limitations.extend(lookup.get("scope_limitations") or [])
+        result.limitations = list(dict.fromkeys(
+            redact_text(item, 1000) for item in limitations if isinstance(item, str) and item.strip()
+        ))[:32]
+        if result.limitations:
+            result.complete = False
+            result.summary = redact_text(
+                f"{result.summary} Partial result: {len(result.limitations)} evidence limitation(s) were reported.",
+                1000,
+            )
+        return result
 
 
 class FlowTool(ReadOnlyTool):
@@ -120,9 +323,13 @@ class FlowTool(ReadOnlyTool):
         self.db = db
 
     def execute(self, scope, **arguments):
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
         limit = min(max(1, int(arguments.get("limit", scope.max_records))), scope.max_records)
         kwargs = {"source": scope.source, "interface": scope.interface,
-                  "capture_session_id": scope.session_id, "limit": limit}
+                  "capture_session_id": scope.session_id, "limit": limit,
+                  "target_ips": list(scope.target_ips), "time_start": scope.time_start,
+                  "time_end": scope.time_end}
         if scope.node_id:
             kwargs["sensor_node_id"] = scope.node_id
         rows = self.db.get_flows(**kwargs)
@@ -143,9 +350,12 @@ class AlertTool(ReadOnlyTool):
         self.db = db
 
     def execute(self, scope, **arguments):
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
         limit = min(max(1, int(arguments.get("limit", scope.max_records))), scope.max_records)
         kwargs = {"source": scope.source, "limit": limit, "interface": scope.interface,
-                  "capture_session_id": scope.session_id}
+                  "capture_session_id": scope.session_id,
+                  "time_start": scope.time_start, "time_end": scope.time_end}
         if scope.node_id:
             kwargs["sensor_node_id"] = scope.node_id
         rows = self.db.get_alerts(**kwargs)
@@ -159,55 +369,100 @@ class AssetTool(ReadOnlyTool):
     manifest = ToolManifest(
         "assets", "Build a passive, evidence-backed asset profile without persisting changes.",
         {"type": "object", "properties": {"ips": {"type": "array", "items": {"type": "string"}}}},
+        requires_scope=True,
     )
-
-    def __init__(self, db):
-        self.db, self.profiler = db, LocalAssetProfiler(db)
-
-    def execute(self, scope, **arguments):
-        ips = arguments.get("ips") or scope.target_ips
-        if not ips:
-            flow_kwargs = {"source": scope.source, "interface": scope.interface,
-                           "capture_session_id": scope.session_id, "limit": scope.max_records}
-            if scope.node_id:
-                flow_kwargs["sensor_node_id"] = scope.node_id
-            ips = sorted({
-                ip for row in self.db.get_flows(**flow_kwargs)
-                for ip in (row.get("src_ip"), row.get("dst_ip")) if ip
-            })
-        rows = [
-            self.profiler.build(str(ip), source=scope.source, persist=False, sensor_node_id=scope.node_id).to_dict()
-            for ip in list(ips)[:scope.max_records]
-        ]
-        citations = [EvidenceCitation(f"entity:{row['ip']}", scope.source or "watchtower", "Stored passive asset profile",
-                                     kind="watchtower", scope=_scope(scope)) for row in rows]
-        return _result(self.name, rows, citations, summary=f"{len(rows)} passive asset profile(s) built from stored evidence.")
-
-
-class TimelineTool(ReadOnlyTool):
-    manifest = ToolManifest("timeline", "Read bounded traffic timeline statistics for the selected scope.",
-                            {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}}})
 
     def __init__(self, db):
         self.db = db
 
     def execute(self, scope, **arguments):
+        scope_kwargs = {
+            "source": scope.source,
+            "interface": scope.interface,
+            "capture_session_id": scope.session_id,
+            "sensor_node_id": scope.node_id,
+            "time_start": scope.time_start,
+            "time_end": scope.time_end,
+        }
+        scoped_targets = set(scope.target_ips)
+        has_requested_ips = arguments.get("ips") is not None
+        requested = {str(ip) for ip in (arguments.get("ips") or ()) if ip}
+        if has_requested_ips and scoped_targets:
+            requested &= scoped_targets
+        query_targets = sorted(requested if has_requested_ips else scoped_targets)
+        if has_requested_ips and not requested:
+            return _result(self.name, [], [], summary="No asset profiles returned: the requested endpoints are outside the selected target scope.")
+        query_kwargs = {**scope_kwargs, "limit": scope.max_records}
+        if query_targets:
+            query_kwargs["target_ips"] = query_targets
+        # A case-only context is not a filter the asset profiler can enforce.
+        # Do not let it degrade into a global flow query.
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
+        scoped_flows = self.db.get_flows(**query_kwargs)
+        observed_ips = {
+            str(ip) for row in scoped_flows for ip in (row.get("src_ip"), row.get("dst_ip")) if ip
+        }
+        if scoped_targets:
+            observed_ips &= scoped_targets
+        if requested:
+            observed_ips &= requested
+        ips = sorted(observed_ips)[:scope.max_records]
+
+        class ScopedAssetDB:
+            """Expose only entity and flow evidence admitted by this analyst scope."""
+            def get_entity(_self, ip):
+                rows = self.db.get_all_entities(**scope_kwargs, target_ips=[ip])
+                return next((row for row in rows if str(row.get("ip")) == str(ip)), None)
+
+            def get_entity_flows(_self, ip, **_ignored):
+                return self.db.get_entity_flows(ip, limit=scope.max_records, **scope_kwargs)
+
+        profiler = LocalAssetProfiler(ScopedAssetDB())
+        rows = [
+            profiler.build(str(ip), source=scope.source, persist=False, sensor_node_id=scope.node_id).to_dict()
+            for ip in ips
+        ]
+        citations = [EvidenceCitation(f"entity:{row['ip']}", scope.source or "watchtower", "Stored passive asset profile",
+                                     kind="watchtower", scope=_scope(scope)) for row in rows]
+        return _result(self.name, rows, citations, truncated=len(observed_ips) > scope.max_records,
+                       summary=f"{len(rows)} passive asset profile(s) built from stored evidence in the selected scope.")
+
+
+class TimelineTool(ReadOnlyTool):
+    manifest = ToolManifest("timeline", "Read bounded traffic timeline statistics for the selected scope.",
+                            {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}}},
+                            requires_scope=True)
+
+    def __init__(self, db):
+        self.db = db
+
+    def execute(self, scope, **arguments):
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
         limit = min(scope.max_records, max(1, int(arguments.get("limit", 60))))
-        if scope.node_id or scope.interface or scope.session_id:
+        if any((scope.source, scope.node_id, scope.interface, scope.session_id,
+                scope.target_ips, scope.time_start is not None, scope.time_end is not None)):
             flow_kwargs = {"source": scope.source, "interface": scope.interface,
-                           "capture_session_id": scope.session_id, "limit": scope.max_records}
+                           "capture_session_id": scope.session_id, "limit": scope.max_records + 1,
+                           "target_ips": list(scope.target_ips), "time_start": scope.time_start,
+                           "time_end": scope.time_end}
             if scope.node_id:
                 flow_kwargs["sensor_node_id"] = scope.node_id
             buckets: Dict[int, Dict[str, Any]] = {}
-            for flow in self.db.get_flows(**flow_kwargs):
+            flow_rows = self.db.get_flows(**flow_kwargs)
+            flow_truncated = len(flow_rows) > scope.max_records
+            for flow in flow_rows[:scope.max_records]:
                 timestamp = int(float(flow.get("last_seen") or flow.get("start_time") or 0) // 300 * 300)
                 bucket = buckets.setdefault(timestamp, {"timestamp": timestamp, "packets": 0, "bytes": 0})
                 bucket["packets"] += int(flow.get("packet_count") or 0)
                 bucket["bytes"] += int(flow.get("byte_count") or 0)
             rows = sorted(buckets.values(), key=lambda item: item["timestamp"], reverse=True)[:limit]
         else:
+            flow_truncated = False
             rows = self.db.get_timeline(limit=limit, source=scope.source or "live")
-        return _result(self.name, rows, _citations(rows, "timeline", scope), len(rows) == limit)
+        return _result(self.name, rows, _citations(rows, "timeline", scope),
+                       flow_truncated or len(rows) == limit)
 
 
 class SigmaPreviewTool(ReadOnlyTool):
@@ -218,12 +473,23 @@ class SigmaPreviewTool(ReadOnlyTool):
         self.engine = SigmaEngine(db=db)
 
     def execute(self, scope, **arguments):
-        alerts = self.engine.run_hunt(scope.source, arguments.get("rule"), scope.interface, persist=False)
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
+        report = self.engine.run_hunt_report(
+            scope.source, arguments.get("rule"), scope.interface, persist=False,
+            capture_session_id=scope.session_id, time_start=scope.time_start,
+            time_end=scope.time_end, sensor_node_id=scope.node_id,
+            target_ips=list(scope.target_ips),
+        )
+        alerts = report["alerts"]
         rows = [{"type": alert.type, "severity": alert.severity, "explanation": alert.explanation,
                  "evidence": alert.evidence} for alert in alerts]
         citations = [EvidenceCitation(str(row["evidence"].get("record_id") or index), scope.source or "historical",
                                      row["explanation"], kind="watchtower", scope=_scope(scope)) for index, row in enumerate(rows)]
-        return _result(self.name, rows, citations, summary=f"Historical Sigma preview found {len(rows)} match(es).")
+        result = _result(self.name, rows, citations, summary=f"Historical Sigma preview found {len(rows)} match(es).")
+        result.complete = report["complete"]
+        result.limitations = list(report["limitations"])
+        return result
 
 
 class StreamTool(ReadOnlyTool):
@@ -270,7 +536,7 @@ class EvidenceExcerptTool(ReadOnlyTool):
                 {"type": "array", "minItems": 5, "maxItems": 5},
                 {"type": "string", "maxLength": 512},
             ]},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500},
         }},
         requires_scope=True,
     )
@@ -279,13 +545,32 @@ class EvidenceExcerptTool(ReadOnlyTool):
         self.db = db
 
     def execute(self, scope, **arguments):
+        if not _has_capture_filters(scope):
+            return _scope_unavailable(self.name, scope)
         limit = min(scope.max_records, max(1, int(arguments.get("limit", 20))), 100)
+        flow_id = arguments.get("flow_id")
+        endpoint_ip = None
+        if isinstance(flow_id, str):
+            try:
+                endpoint_ip = str(ipaddress.ip_address(flow_id.strip()))
+            except ValueError:
+                pass
+        if endpoint_ip and scope.target_ips and endpoint_ip not in set(scope.target_ips):
+            result = _result(
+                self.name, {"items": []}, [],
+                summary="No evidence excerpt returned: the requested endpoint is outside the selected target scope.",
+            )
+            result.complete = False
+            result.limitations.append("The requested endpoint is outside the selected target scope; no flow records were read.")
+            return result
         flow_kwargs = {"source": scope.source, "interface": scope.interface,
-                       "capture_session_id": scope.session_id, "limit": limit}
+                       "capture_session_id": scope.session_id, "limit": limit + 1,
+                       "target_ips": [endpoint_ip] if endpoint_ip else list(scope.target_ips),
+                       "time_start": scope.time_start,
+                       "time_end": scope.time_end}
         if scope.node_id:
             flow_kwargs["sensor_node_id"] = scope.node_id
         rows = self.db.get_flows(**flow_kwargs)
-        flow_id = arguments.get("flow_id")
         query_warning = None
         if isinstance(flow_id, list) and len(flow_id) == 5:
             needle = (str(flow_id[0]), str(flow_id[1]), int(flow_id[2]), int(flow_id[3]), str(flow_id[4]))
@@ -293,7 +578,7 @@ class EvidenceExcerptTool(ReadOnlyTool):
                 str(row.get("src_ip")), str(row.get("dst_ip")), int(row.get("src_port") or 0),
                 int(row.get("dst_port") or 0), str(row.get("protocol")),
             ) == needle]
-        elif flow_id:
+        elif flow_id and not endpoint_ip:
             # Some local models confuse a session ID with a flow selector. Keep
             # the request scoped and useful by returning the bounded page while
             # making the ignored selector explicit to the analyst.
@@ -324,8 +609,18 @@ class EvidenceExcerptTool(ReadOnlyTool):
         data = {"items": evidence}
         if query_warning:
             data["query_warning"] = query_warning
-        return _result(self.name, data, citations, len(rows) > limit,
-                       f"{len(evidence)} redacted evidence excerpt(s) returned without packet payloads.")
+        truncated = len(rows) > limit
+        result = _result(self.name, data, citations, truncated,
+                         f"{len(evidence)} redacted evidence excerpt(s) returned without packet payloads.")
+        if truncated:
+            result.complete = False
+            result.limitations.append(
+                f"Evidence excerpts are capped at {limit} flow records; at least one additional matching flow was not returned."
+            )
+        if query_warning:
+            result.complete = False
+            result.limitations.append(query_warning)
+        return result
 
 
 class CaseExportTool(AITool):
@@ -359,10 +654,35 @@ class ResearchTool(AITool):
 
     def __init__(self, broker):
         self.broker = broker
+        schema = {
+            **type(self).manifest.input_schema,
+            "properties": dict(type(self).manifest.input_schema.get("properties", {})),
+        }
+        config = getattr(broker, "config", None)
+        enabled_web_providers = [
+            name for name in ("brave", "openai")
+            if bool(getattr(getattr(config, name, None), "enabled", False))
+        ]
+        if enabled_web_providers:
+            schema["properties"]["web_provider"] = {
+                "type": "string", "enum": enabled_web_providers,
+            }
+        else:
+            schema["properties"].pop("web_provider", None)
+        self.manifest = replace(type(self).manifest, input_schema=schema)
 
     def execute(self, scope, **arguments):
-        documents = self.broker.research(arguments.get("indicators") or (), str(arguments.get("query") or ""),
-                                         bool(arguments.get("include_web", True)), str(arguments.get("web_provider") or "brave"))
+        research_args = (
+            arguments.get("indicators") or (), str(arguments.get("query") or ""),
+            bool(arguments.get("include_web", True)), str(arguments.get("web_provider") or "brave"),
+        )
+        if hasattr(self.broker, "research_detailed"):
+            execution = self.broker.research_detailed(*research_args)
+            documents = execution.documents
+            source_statuses = execution.source_statuses
+        else:
+            documents = self.broker.research(*research_args)
+            source_statuses = []
         citations = [item.citation() for item in documents]
         rows = [{"source": item.source_kind, "url": item.canonical_url, "title": item.title,
                  "summary": item.summary, "content_hash": item.content_hash, "retrieved_at": item.retrieved_at,
@@ -375,8 +695,36 @@ class ResearchTool(AITool):
                     redact_value(item.get("value")), confidence=float(item.get("confidence", 0.5) or 0.0),
                     freshness=document.retrieved_at, citations=[citation], scope=scope.to_dict(),
                 ))
-        result = _result(self.name, rows, citations, summary=f"{len(rows)} external research source(s) returned.")
+        status_names = {
+            "returned": "returned data", "no_results": "no results", "disabled": "disabled",
+            "missing_credential": "credential missing", "timed_out": "timed out", "failed": "failed",
+        }
+        distinct_statuses = []
+        seen_statuses = set()
+        for item in source_statuses:
+            pair = (item["source"], item["status"])
+            if pair not in seen_statuses:
+                seen_statuses.add(pair)
+                distinct_statuses.append(f"{pair[0]} {status_names.get(pair[1], pair[1])}")
+        status_summary = "; ".join(distinct_statuses[:12])
+        if len(distinct_statuses) > 12:
+            status_summary += f"; {len(distinct_statuses) - 12} additional source outcomes"
+        summary = f"{len(rows)} external research source(s) returned."
+        if status_summary:
+            summary += f" Source outcomes: {status_summary}."
+        result = _result(self.name, rows, citations, summary=summary)
         result.facts = facts
+        incomplete_statuses = {"timed_out", "failed", "missing_credential"}
+        if any(item["status"] in incomplete_statuses for item in source_statuses):
+            result.complete = False
+            if status_summary:
+                result.limitations.append(f"Research source outcomes: {status_summary}.")
+        if not documents:
+            result.complete = False
+            result.limitations.append(
+                "No external research source returned data; this is not evidence that the indicator is benign. "
+                + (f"Source outcomes: {status_summary}." if status_summary else "Source failures may be unavailable.")
+            )
         return result
 
 
@@ -399,7 +747,7 @@ class ToolRegistry:
         allowed_set = set(allowed or self.tools)
         groups = {
             "identity": {"identity_coverage", "identities", "lookup", "investigate", "endpoint_processes"},
-            "finding": {"finding_summary", "findings", "alerts", "risk_explain", "sigma_hunt_preview"},
+            "finding": {"finding_summary", "findings", "alerts", "risk_explain", "priority_endpoints", "sigma_hunt_preview"},
             "traffic": {"session_summary", "top_conversations", "flows", "timeline", "topology", "evidence_excerpt"},
             "health": {"visibility_limits", "pipeline_health", "pcap_jobs", "reports", "mesh_nodes"},
             "research": {"lookup", "research", "evidence", "graph_neighborhood", "graph_timeline"},
@@ -408,9 +756,11 @@ class ToolRegistry:
         selected = set()
         if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("identity", "ip", "host", "device", "endpoint", "enrich")):
             selected |= groups["identity"]
-        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("alert", "finding", "detector", "sigma", "score", "risk", "suspicious")):
+        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("alert", "alerts", "finding", "findings", "detector", "sigma", "score", "risk", "suspicious")):
             selected |= groups["finding"]
-        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("flow", "traffic", "conversation", "timeline", "topology", "pcap", "packet")):
+        if re.search(r"\b(?:priority|priorit(?:y|ies)|first to investigate|investigate first|start investigating)\b", text):
+            selected.add("priority_endpoints")
+        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("flow", "flows", "traffic", "conversation", "conversations", "timeline", "topology", "pcap", "packet", "packets")):
             selected |= groups["traffic"]
         if any(re.search(rf"\b{re.escape(word)}\b", text) for word in ("health", "complete", "drop", "sensor", "session")):
             selected |= groups["health"]
@@ -421,7 +771,25 @@ class ToolRegistry:
         selected &= allowed_set
         if not selected:
             selected = {name for name in ("session_summary", "identity_coverage", "finding_summary", "visibility_limits") if name in allowed_set}
-        ordered = sorted(name for name in selected if name in self.tools)
+        ordered = [name for name in selected if name in self.tools]
+        priority: Dict[str, int] = {}
+        def prioritize(names: Iterable[str]) -> None:
+            for name in names:
+                if name in ordered and name not in priority:
+                    priority[name] = len(priority)
+        # Keep every capability explicitly requested by a compound prompt
+        # ahead of the general evidence inventory. This remains bounded for
+        # local models while avoiding alphabetical truncation of a needed
+        # research, pivot, or risk tool.
+        if re.search(r"\b(?:research|who owns|asn|organization)\b", text):
+            prioritize(("research", "lookup"))
+        if re.search(r"\b(?:investigate|inspect|analy[sz]e)\b", text):
+            prioritize(("investigate", "identities", "identity_coverage"))
+        if re.search(r"\b(?:flow|flows|traffic|pivot|conversation)\b", text):
+            prioritize(("flows", "top_conversations", "timeline", "evidence_excerpt"))
+        if re.search(r"\b(?:risk|score|priority|suspicious)\b", text):
+            prioritize(("priority_endpoints", "risk_explain", "findings", "finding_summary", "alerts"))
+        ordered.sort(key=lambda name: (priority.get(name, 100), name))
         # Keep an explicitly requested opening tool available even when the
         # intent router has more than ten relevant candidates.
         first_match = re.search(r"\bfirst\s+(?:use|call|run)\s+([a-z][a-z0-9_]*)\b", text)
@@ -455,27 +823,34 @@ def build_native_tools(db, service=None, stream_engine=None, research_broker=Non
         CallableTool(ToolManifest("session_summary", "Summarize the selected capture session and its visibility state.", {"type": "object", "properties": {}}, requires_scope=True),
                      lambda scope, **args: _session_summary(db, scope), "session"),
         CallableTool(ToolManifest("identity_coverage", "Return truthful identity state counts for the selected scope.", {"type": "object", "properties": {}}, requires_scope=True),
-                     lambda scope, **args: service.identity_status(scope.source, scope.interface, scope.session_id), "identity"),
+                     lambda scope, **args: _scoped_identity_coverage(service, scope), "identity"),
         CallableTool(ToolManifest("top_conversations", "Return the highest-volume conversations in the selected scope.", {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}}, requires_scope=True),
                      lambda scope, **args: _top_conversations(db, scope, int(args.get("limit", 10))), "flow"),
         CallableTool(ToolManifest("finding_summary", "Summarize canonical findings in the selected scope.", {"type": "object", "properties": {}}, requires_scope=True),
-                     lambda scope, **args: service.scoring_findings(source=scope.source, interface=scope.interface, session=scope.session_id, limit=scope.max_records, sensor_node_id=scope.node_id), "finding"),
+                     lambda scope, **args: _scoped_findings(service, scope), "finding"),
         CallableTool(ToolManifest("visibility_limits", "Report capture completeness, processing limits, and pipeline health.", {"type": "object", "properties": {}}),
                      lambda scope, **args: service.pipeline_health(), "pipeline"),
         CallableTool(ToolManifest("findings", "Read V2 canonical detection findings.", {"type": "object", "properties": {"finding_type": {"type": "string"}}}, requires_scope=True),
-                     lambda scope, **args: service.scoring_findings(source=scope.source, interface=scope.interface, session=scope.session_id,
-                                                                       finding_type=args.get("finding_type"), limit=scope.max_records,
-                                                                       sensor_node_id=scope.node_id), "finding"),
+                     lambda scope, **args: _scoped_findings(service, scope, finding_type=args.get("finding_type")), "finding"),
         CallableTool(ToolManifest("risk_explain", "Explain a V2 investigation-priority score for an endpoint.", {"type": "object", "properties": {"ip": {"type": "string"}}, "required": ["ip"]}, requires_scope=True),
-                     lambda scope, **args: service.scoring_risk(args["ip"], scope.source, scope.interface, scope.session_id, explain=True, sensor_node_id=scope.node_id), "risk"),
+                     lambda scope, **args: _scoped_risk(service, scope, args["ip"]), "risk"),
+        CallableTool(ToolManifest(
+            "priority_endpoints",
+            "Rank observed endpoints by WatchTower V2 priority score within the exact selected capture scope. Traffic volume is not a priority score.",
+            {"type": "object", "properties": {}}, requires_scope=True,
+        ), lambda scope, **args: _priority_endpoints(db, service, scope), "risk"),
         CallableTool(ToolManifest("identities", "Read evidence-backed endpoint identity cards.", {"type": "object", "properties": {"limit": {"type": "integer"}}}, requires_scope=True),
-                     lambda scope, **args: service.endpoint_identities(scope.source, scope.interface, scope.session_id, min(scope.max_records, int(args.get("limit", scope.max_records))), scope.node_id), "identity"),
+                     lambda scope, **args: service.endpoint_identities(
+                         scope.source, scope.interface, scope.session_id,
+                         min(scope.max_records, int(args.get("limit", scope.max_records))), scope.node_id,
+                         list(scope.target_ips), scope.time_start, scope.time_end,
+                     ), "identity"),
         CallableTool(ToolManifest("lookup", "Look up one endpoint using WatchTower's local evidence and enrichment.", {"type": "object", "properties": {"ip": {"type": "string"}}, "required": ["ip"]}, requires_scope=True),
-                     lambda scope, **args: service.lookup(args["ip"], scope.source, scope.node_id), "lookup"),
+                     lambda scope, **args: _scoped_lookup(service, scope, args["ip"]), "lookup"),
         CallableTool(ToolManifest("investigate", "Build a scoped WatchTower investigation for an endpoint.", {"type": "object", "properties": {"ip": {"type": "string"}}, "required": ["ip"]}, requires_scope=True),
-                     lambda scope, **args: service.investigate(args["ip"], scope.source, scope.node_id), "investigation"),
+                     lambda scope, **args: _scoped_lookup(service, scope, args["ip"], investigate=True), "investigation"),
         CallableTool(ToolManifest("topology", "Read the bounded network topology from stored flows.", {"type": "object", "properties": {}}, requires_scope=True),
-                     lambda scope, **args: service.topology(scope.source, scope.interface, scope.session_id, scope.node_id), "topology"),
+                     lambda scope, **args: _scoped_topology(db, scope), "topology"),
         CallableTool(ToolManifest("mesh_nodes", "Read registered sensor nodes and mesh health.", {"type": "object", "properties": {}}),
                      lambda scope, **args: service.mesh_status(), "mesh-node"),
         CallableTool(ToolManifest(
@@ -484,15 +859,36 @@ def build_native_tools(db, service=None, stream_engine=None, research_broker=Non
                 "ip": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
             }}, requires_scope=True),
-                     lambda scope, **args: service.endpoint_processes(args.get("ip"), scope.node_id, min(scope.max_records, int(args.get("limit", 50)))), "endpoint-process"),
+                     lambda scope, **args: _scoped_endpoint_processes(
+                         service, scope, args.get("ip"), min(scope.max_records, int(args.get("limit", 50))),
+                     ), "endpoint-process"),
         CallableTool(ToolManifest("graph_status", "Read Neo4j evidence graph availability and freshness.", {"type": "object", "properties": {}}),
                      lambda scope, **args: service.graph_status(), "graph"),
         CallableTool(ToolManifest("graph_neighborhood", "Read a bounded evidence graph neighborhood for one endpoint.", {"type": "object", "properties": {"ip": {"type": "string"}, "depth": {"type": "integer", "minimum": 1, "maximum": 3}}, "required": ["ip"]}, requires_scope=True),
-                     lambda scope, **args: service.graph_neighborhood(args["ip"], scope.node_id, int(args.get("depth", 2)), scope.max_records), "graph"),
+                     lambda scope, **args: (
+                         _endpoint_scope_block(scope, args["ip"])
+                         or service.graph_neighborhood(
+                             args["ip"], scope.node_id, int(args.get("depth", 2)), scope.max_records,
+                             scope.interface, scope.session_id, scope.time_start, scope.time_end,
+                             list(scope.target_ips),
+                         )
+                     ), "graph"),
         CallableTool(ToolManifest("graph_path", "Find a bounded evidence path between two endpoint IPs.", {"type": "object", "properties": {"source_ip": {"type": "string"}, "target_ip": {"type": "string"}}, "required": ["source_ip", "target_ip"]}, requires_scope=True),
-                     lambda scope, **args: service.graph_path(args["source_ip"], args["target_ip"], scope.node_id), "graph"),
+                     lambda scope, **args: (
+                         _endpoint_scope_block(scope, args["source_ip"], args["target_ip"])
+                         or service.graph_path(
+                             args["source_ip"], args["target_ip"], scope.node_id, scope.interface,
+                             scope.session_id, scope.time_start, scope.time_end,
+                         )
+                     ), "graph"),
         CallableTool(ToolManifest("graph_timeline", "Read a bounded evidence timeline for one endpoint.", {"type": "object", "properties": {"ip": {"type": "string"}}, "required": ["ip"]}, requires_scope=True),
-                     lambda scope, **args: service.graph_timeline(args["ip"], scope.node_id, scope.time_start, scope.time_end, scope.max_records), "graph"),
+                     lambda scope, **args: (
+                         _endpoint_scope_block(scope, args["ip"])
+                         or service.graph_timeline(
+                             args["ip"], scope.node_id, scope.time_start, scope.time_end, scope.max_records,
+                             scope.interface, scope.session_id,
+                         )
+                     ), "graph"),
         CallableTool(ToolManifest("pipeline_health", "Read capture and analytics health telemetry.", {"type": "object", "properties": {}}),
                      lambda scope, **args: service.pipeline_health(), "pipeline"),
         CallableTool(ToolManifest("reports", "List completed and partial PCAP analysis reports.", {"type": "object", "properties": {}}),
@@ -504,8 +900,8 @@ def build_native_tools(db, service=None, stream_engine=None, research_broker=Non
                      lambda scope, **args: service.plugin_inventory(), "plugin"),
         CallableTool(ToolManifest("calibration_status", "Read detector calibration and attestation state.", {"type": "object", "properties": {"detector_id": {"type": "string"}}}),
                      lambda scope, **args: service.plugin_calibration_status(args.get("detector_id")), "calibration"),
-        CallableTool(ToolManifest("evidence", "List carved evidence metadata without raw file contents.", {"type": "object", "properties": {"ip": {"type": "string"}}}),
-                     lambda scope, **args: service.evidence(scope.source, args.get("ip")), "evidence"),
+        CallableTool(ToolManifest("evidence", "List carved evidence metadata without raw file contents.", {"type": "object", "properties": {"ip": {"type": "string"}}}, requires_scope=True),
+                     lambda scope, **args: _scoped_evidence(service, scope, args.get("ip")), "evidence"),
         CallableTool(ToolManifest(
             "capture_start", "Start a selected WatchTower capture source after operator confirmation.",
             {"type": "object", "properties": {"interface": {"type": "string"}, "backend": {"type": "string", "enum": ["python", "rust"]},
@@ -546,7 +942,10 @@ def build_native_tools(db, service=None, stream_engine=None, research_broker=Non
             "sigma_hunt_persist", "Run an active Sigma hunt against stored traffic and persist resulting findings.",
             {"type": "object", "properties": {"rule": {"type": "string"}}},
             risk_tier="confirm", active=True, requires_scope=True,
-        ), lambda scope, **args: service.run_hunt(scope.source, scope.interface, args.get("rule"), True), "action"),
+        ), lambda scope, **args: service.run_hunt(
+            scope.source, scope.interface, args.get("rule"), True,
+            scope.session_id, scope.time_start, scope.time_end, scope.node_id,
+        ), "action"),
         CallableTool(ToolManifest(
             "scoring_recompute", "Deterministically recompute behavioral-priority snapshots.",
             {"type": "object", "properties": {"dry_run": {"type": "boolean"}}},
@@ -634,18 +1033,141 @@ def build_native_tools(db, service=None, stream_engine=None, research_broker=Non
 
 
 def _scoped_flow_rows(db, scope: ScopedContext) -> List[Dict[str, Any]]:
+    if not _has_capture_filters(scope):
+        return []
     kwargs = {"source": scope.source, "interface": scope.interface,
-              "capture_session_id": scope.session_id, "limit": min(scope.max_records, 5000)}
+              "capture_session_id": scope.session_id, "limit": min(scope.max_records, 5000),
+              "target_ips": list(scope.target_ips), "time_start": scope.time_start,
+              "time_end": scope.time_end}
     if scope.node_id:
         kwargs["sensor_node_id"] = scope.node_id
     return db.get_flows(**kwargs)
 
 
+def _priority_endpoints(db, service, scope: ScopedContext) -> Dict[str, Any]:
+    """Rank only endpoints observed in a bounded, fully filtered capture query."""
+    if not _has_capture_filters(scope):
+        return {
+            "endpoints": [], "top_endpoints": [], "complete": False,
+            "effective_scope": scope.to_dict(),
+            "scope_limitations": ["A capture-filtered scope is required to rank endpoints; no flow records were read."],
+        }
+    page_size = 500
+    row_cap = 5000
+    filters = {
+        "source": scope.source, "interface": scope.interface,
+        "capture_session_id": scope.session_id, "sensor_node_id": scope.node_id,
+        "target_ips": list(scope.target_ips), "time_start": scope.time_start,
+        "time_end": scope.time_end,
+    }
+    rows = []
+    offset = 0
+    while offset < row_cap:
+        page = db.get_flows(**filters, limit=min(page_size, row_cap - offset), offset=offset)
+        if not page:
+            break
+        rows.extend(page)
+        offset += len(page)
+        if len(page) < page_size:
+            break
+    observed = {
+        str(ip) for row in rows if isinstance(row, dict)
+        for ip in (row.get("src_ip"), row.get("dst_ip")) if ip
+    }
+    if scope.target_ips:
+        observed.intersection_update(str(ip) for ip in scope.target_ips)
+    limitations = []
+    summary = db.summarize_flows(**filters) if hasattr(db, "summarize_flows") else None
+    total_flows = int((summary or {}).get("flow_count", len(rows)))
+    truncated = len(rows) >= row_cap
+    complete = not truncated and len(rows) >= total_flows and not any(bool(row.get("partial")) for row in rows)
+    if not complete:
+        limitations.append(
+            f"Priority ranking used {len(rows)} bounded flow rows of {total_flows} matching rows; the endpoint ranking may be incomplete."
+        )
+    if len(observed) > 500:
+        observed = set(sorted(observed)[:500])
+        complete = False
+        limitations.append("Endpoint scoring was capped at 500 observed addresses; lower-ranked endpoints may be missing.")
+    assessments = []
+    for ip in sorted(observed):
+        assessment = service.scoring_risk(
+            ip, scope.source, scope.interface, scope.session_id, explain=True,
+            sensor_node_id=scope.node_id, time_start=scope.time_start,
+            time_end=scope.time_end, target_ips=list(scope.target_ips),
+        )
+        assessments.append({
+            "ip": ip,
+            "priority_score": float(assessment.get("priority_score") or 0.0),
+            "risk_level": str(assessment.get("risk_level") or "UNKNOWN"),
+            "assessment_confidence": float(assessment.get("assessment_confidence") or 0.0),
+        })
+    assessments.sort(key=lambda row: (-row["priority_score"], row["ip"]))
+    top_score = assessments[0]["priority_score"] if assessments else None
+    top = [row for row in assessments if row["priority_score"] == top_score][:10] if assessments else []
+    top_tie_count = sum(1 for row in assessments if row["priority_score"] == top_score) if assessments else 0
+    return {
+        "ranked_endpoints": assessments[:25], "top_endpoints": top,
+        "top_priority_score": top_score, "top_tie_count": top_tie_count,
+        "observed_endpoint_count": len(observed),
+        "flow_rows": len(rows), "total_flow_rows": total_flows,
+        "complete": complete, "effective_scope": scope.to_dict(),
+        "scope_limitations": limitations,
+    }
+
+
+def _scoped_topology(db, scope: ScopedContext) -> Dict[str, Any]:
+    if not _has_capture_filters(scope):
+        return {
+            "nodes": [], "edges": [], "effective_scope": scope.to_dict(), "complete": False,
+            "scope_limitations": [
+                "The selected context has no capture filter supported by topology; no flows were read."
+            ],
+        }
+    filters = {
+        "source": scope.source, "interface": scope.interface,
+        "capture_session_id": scope.session_id, "sensor_node_id": scope.node_id,
+        "target_ips": list(scope.target_ips), "time_start": scope.time_start,
+        "time_end": scope.time_end,
+    }
+    rows = _scoped_flow_rows(db, scope)
+    summary = db.summarize_flows(**filters) if hasattr(db, "summarize_flows") else None
+    edges_by_key = {}
+    node_ips = set()
+    for row in rows:
+        src, dst = row.get("src_ip"), row.get("dst_ip")
+        if not src or not dst:
+            continue
+        node_ips.update((str(src), str(dst)))
+        key = (str(src), str(dst))
+        edge = edges_by_key.setdefault(key, {"source": key[0], "target": key[1], "bytes": 0, "packets": 0, "flows": 0})
+        edge["bytes"] += int(row.get("byte_count") or 0)
+        edge["packets"] += int(row.get("packet_count") or 0)
+        edge["flows"] += 1
+    total = int((summary or {}).get("flow_count", len(rows)))
+    complete = len(rows) >= total and not any(bool(row.get("partial")) for row in rows)
+    limitations = [] if complete else [
+        f"Topology is based on {len(rows)} bounded flow records; {total} matching records exist or capture completeness is limited."
+    ]
+    return {
+        "nodes": [{"id": ip, "label": ip, "type": "unknown"} for ip in sorted(node_ips)],
+        "edges": list(edges_by_key.values()), "effective_scope": scope.to_dict(),
+        "complete": complete, "total": total, "scope_limitations": limitations,
+    }
+
+
 def _session_summary(db, scope: ScopedContext) -> Dict[str, Any]:
+    if not _has_capture_filters(scope):
+        return {
+            "scope": scope.to_dict(), "flow_count": 0, "packet_count": 0, "byte_count": 0,
+            "protocols": {}, "complete": False, "bounded_rows": 0, "rows_limited": False,
+            "limitations": ["The selected context does not contain a capture filter supported by session summaries."],
+        }
     rows = _scoped_flow_rows(db, scope)
     aggregate = db.summarize_flows(
         source=scope.source, interface=scope.interface,
         capture_session_id=scope.session_id, sensor_node_id=scope.node_id,
+        target_ips=list(scope.target_ips), time_start=scope.time_start, time_end=scope.time_end,
     ) if hasattr(db, "summarize_flows") else None
     protocols: Dict[str, int] = {}
     for row in rows:

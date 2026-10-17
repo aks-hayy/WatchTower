@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, File, Form, Query, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, Query, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,6 +20,7 @@ from core.api.schemas import (
     CalibrationPromoteRequest,
     AIApprovalRequest,
     AIConversationRequest,
+    AIConversationBranchRequest,
     AICredentialRequest,
     AIProviderConnectRequest,
     AIProviderModelRequest,
@@ -505,9 +506,12 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
         source: Optional[str] = "live", interface: Optional[str] = None,
         session: Optional[str] = None, limit: int = Query(100, ge=1, le=500),
         cursor: Optional[str] = None, node: Optional[str] = None,
+        time_start: Optional[float] = None, time_end: Optional[float] = None,
         api: WatchtowerApiService = Depends(get_service),
     ):
-        return api.topology_page(source, interface, session, limit, cursor, node)
+        if time_start is not None and time_end is not None and time_start > time_end:
+            raise ApiServiceError(422, "invalid_time_window", "time_start must be less than or equal to time_end")
+        return api.topology_page(source, interface, session, limit, cursor, node, time_start, time_end)
 
     @app.get("/api/v2/risk/entities/{ip}", tags=["scoring-v2"])
     def risk_v2(ip: str, source: Optional[str] = None, interface: Optional[str] = None,
@@ -615,6 +619,15 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
     def delete_ai_conversation(conversation_id: str, api: WatchtowerApiService = Depends(get_service)):
         return api.ai_delete_conversation(conversation_id)
 
+    @app.post("/api/v2/ai/conversations/{conversation_id}/branch", status_code=202, tags=["ai"])
+    def branch_ai_conversation(conversation_id: str, payload: AIConversationBranchRequest, request: Request,
+                               api: WatchtowerApiService = Depends(get_service)):
+        operator_session = getattr(request.state, "operator_session", None)
+        return api.ai_branch_message(
+            conversation_id, payload.message_id, payload.prompt, payload.client_request_id,
+            getattr(operator_session, "id", None),
+        )
+
     @app.post("/api/v2/ai/runs", status_code=202, tags=["ai"])
     def start_ai_run(payload: AIRunRequest, request: Request,
                      api: WatchtowerApiService = Depends(get_service)):
@@ -627,23 +640,41 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
             payload.research_mode,
             getattr(operator_session, "id", None),
             payload.mode,
+            payload.client_request_id,
         )
 
     @app.get("/api/v2/ai/runs/{run_id}", tags=["ai"])
     def ai_run(run_id: str, api: WatchtowerApiService = Depends(get_service)):
         return api.ai_run(run_id)
 
+    @app.post("/api/v2/ai/runs/{run_id}/cancel", tags=["ai"])
+    def cancel_ai_run(run_id: str, api: WatchtowerApiService = Depends(get_service)):
+        return api.ai_cancel(run_id)
+
+    @app.post("/api/v2/ai/runs/{run_id}/retry", tags=["ai"])
+    def retry_ai_run(run_id: str, request: Request, api: WatchtowerApiService = Depends(get_service)):
+        operator_session = getattr(request.state, "operator_session", None)
+        return api.ai_retry(run_id, getattr(operator_session, "id", None))
+
     @app.get("/api/v2/ai/runs/{run_id}/events", tags=["ai"])
-    def ai_events(run_id: str, after: int = Query(0, ge=0), api: WatchtowerApiService = Depends(get_service)):
+    def ai_events(
+        run_id: str,
+        after: int = Query(0, ge=0),
+        last_event_id: Optional[int] = Header(default=None, alias="Last-Event-ID", ge=0),
+        api: WatchtowerApiService = Depends(get_service),
+    ):
         def event_stream():
-            cursor = after
+            cursor = last_event_id if last_event_id is not None else after
             deadline = time.monotonic() + 60.0
             while time.monotonic() < deadline:
                 for event in api.ai_events(run_id, cursor):
                     cursor = int(event["sequence"])
-                    yield f"event: {event['kind']}\ndata: {json.dumps(event, separators=(',', ':'), default=str)}\n\n"
+                    yield (
+                        f"id: {cursor}\nevent: {event['kind']}\n"
+                        f"data: {json.dumps(event, separators=(',', ':'), default=str)}\n\n"
+                    )
                 current = api.ai_run(run_id)
-                if str(current.get("status")).upper() in {"COMPLETE", "DEGRADED", "NEEDS_SCOPE", "FAILED", "REJECTED"}:
+                if str(current.get("status")).upper() in {"COMPLETE", "DEGRADED", "NEEDS_SCOPE", "FAILED", "REJECTED", "CANCELLED", "INTERRUPTED"}:
                     yield f"event: terminal\ndata: {json.dumps({'status': current.get('status')})}\n\n"
                     return
                 time.sleep(0.5)
@@ -814,18 +845,23 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
 
     @app.get("/api/v2/graph/neighborhood/{ip}", tags=["evidence-graph"])
     def graph_neighborhood(ip: str, node: Optional[str] = None, depth: int = Query(2, ge=1, le=3),
-                           limit: int = Query(100, ge=1, le=250), api: WatchtowerApiService = Depends(get_service)):
-        return api.graph_neighborhood(ip, node, depth, limit)
+                           limit: int = Query(100, ge=1, le=250), interface: Optional[str] = None,
+                           session: Optional[str] = None, start: Optional[float] = None, end: Optional[float] = None,
+                           target_ips: Optional[str] = None, api: WatchtowerApiService = Depends(get_service)):
+        targets = [item.strip() for item in (target_ips or "").split(",") if item.strip()]
+        return api.graph_neighborhood(ip, node, depth, limit, interface, session, start, end, targets)
 
     @app.get("/api/v2/graph/path", tags=["evidence-graph"])
-    def graph_path(source_ip: str, target_ip: str, node: Optional[str] = None,
+    def graph_path(source_ip: str, target_ip: str, node: Optional[str] = None, interface: Optional[str] = None,
+                   session: Optional[str] = None, start: Optional[float] = None, end: Optional[float] = None,
                    api: WatchtowerApiService = Depends(get_service)):
-        return api.graph_path(source_ip, target_ip, node)
+        return api.graph_path(source_ip, target_ip, node, interface, session, start, end)
 
     @app.get("/api/v2/graph/timeline/{ip}", tags=["evidence-graph"])
     def graph_timeline(ip: str, node: Optional[str] = None, start: Optional[float] = None, end: Optional[float] = None,
-                       limit: int = Query(200, ge=1, le=500), api: WatchtowerApiService = Depends(get_service)):
-        return api.graph_timeline(ip, node, start, end, limit)
+                       limit: int = Query(200, ge=1, le=500), interface: Optional[str] = None,
+                       session: Optional[str] = None, api: WatchtowerApiService = Depends(get_service)):
+        return api.graph_timeline(ip, node, start, end, limit, interface, session)
 
     @app.post("/api/v1/identities/rebuild", tags=["investigation"])
     def identity_rebuild(payload: IdentityRebuildRequest,
@@ -869,11 +905,19 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
 
     @app.post("/api/v1/hunts/sigma", tags=["detections"])
     def hunt(payload: HuntRequest, api: WatchtowerApiService = Depends(get_service)):
-        return api.run_hunt(payload.source, payload.interface, payload.rule, payload.persist)
+        return api.run_hunt(
+            payload.source, payload.interface, payload.rule, payload.persist,
+            payload.capture_session_id, payload.time_start, payload.time_end, payload.sensor_node_id,
+        )
 
     @app.get("/api/v1/plugins", tags=["plugins"])
     def plugins(api: WatchtowerApiService = Depends(get_service)):
         return api.plugin_inventory()
+
+    @app.get("/api/v1/plugins/coverage", tags=["plugins"])
+    @app.get("/api/v2/plugins/coverage", tags=["plugins-v2"])
+    def plugin_coverage(api: WatchtowerApiService = Depends(get_service)):
+        return api.plugin_coverage()
 
     @app.get("/api/v1/plugins/calibration/status", tags=["plugins"])
     def plugin_calibration_status(detector_id: Optional[str] = None, api: WatchtowerApiService = Depends(get_service)):
@@ -1030,10 +1074,10 @@ def create_app(db=None, daemon=None, registry=None, jobs=None, enforce_auth: Opt
                 keylog_path = upload_dir / f"{uuid.uuid4().hex}.keylog"
                 keylog_path.write_bytes(raw_keylog)
             if keylog_path:
-                return api.jobs.submit(
+                return api.submit_pcap(
                     str(path), filename, mode, backend, keylog_path=str(keylog_path),
                 )
-            return api.jobs.submit(str(path), filename, mode, backend)
+            return api.submit_pcap(str(path), filename, mode, backend)
         except UnicodeDecodeError as exc:
             raise ApiServiceError(422, "invalid_tls_keylog", "TLS keylog must contain ASCII text") from exc
         except Exception:

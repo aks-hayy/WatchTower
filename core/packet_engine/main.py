@@ -2,12 +2,21 @@ import sys
 import argparse
 import multiprocessing
 import os
+import re
 from pathlib import Path
 import time
-from core.context import context
-from core.daemon.manager import DaemonManager
-from core.daemon.client import DaemonClient
-from rich.console import Console
+try:
+    from rich.console import Console
+except ModuleNotFoundError:  # Keep --help/--version usable during dependency repair.
+    class Console:  # type: ignore[no-redef]
+        def print(self, *values, **kwargs):
+            cleaned = [re.sub(r"\[/?[^\]]+\]", "", str(value)) for value in values]
+            print(*cleaned)
+
+        def print_json(self, *, data):
+            import json
+
+            print(json.dumps(data, indent=2, default=str))
 
 if sys.platform == "win32":
     for stream in (sys.stdout, sys.stderr):
@@ -17,6 +26,10 @@ if sys.platform == "win32":
             pass
 
 console = Console()
+
+# Keep the lifecycle seam importable for the CLI entry point and adapters that
+# need to replace the manager in a controlled test or embedding environment.
+from core.daemon.manager import DaemonManager
 
 ASCII_ART = r"""
 [bold cyan]
@@ -45,19 +58,51 @@ ASCII_ART = r"""
 def main():
     parser = argparse.ArgumentParser(
         prog="tower",
-        description="Watchtower — Network Forensics & Traffic Analysis Platform",
+        description="WatchTower — local network security that starts simple and grows with you.",
+        epilog=(
+            "Getting started: tower setup | tower start | tower status | tower open | tower investigate | tower doctor\n"
+            "Run 'tower help --all' for every command or 'tower <task> --help' for focused help."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    from core import __version__
+    parser.add_argument("--version", action="version", version=f"WatchTower {__version__}")
     
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command", title="Common tasks", metavar="TASK",
+        description="Task-first commands for setup, monitoring, investigation, and analysis.",
+    )
+    common_tasks = {
+        "setup", "start", "stop", "status", "open", "monitor", "investigate", "alerts",
+        "sensors", "extensions", "rules", "analyze", "chat", "ai", "doctor", "help",
+    }
+    command_summaries = {}
+
+    def add_command(name, *positional, **options):
+        summary = options.get("help", "")
+        command_summaries[name] = summary
+        options["help"] = summary
+        return subparsers.add_parser(name, *positional, **options)
     
-    # Core Commands
-    subparsers.add_parser("shell", help="Enter interactive shell (default)")
-    ui_parser = subparsers.add_parser("ui", help="Launch the local Web Dashboard and API")
-    ui_parser.add_argument("--port", type=int, default=4173, help="Dashboard port (default: 4173)")
-    ui_parser.add_argument("--api-port", type=int, default=8000, help="Local API port (default: 8000)")
-    ui_parser.add_argument("--no-open", action="store_true", help="Do not open the dashboard in a browser")
-    auth_parser = subparsers.add_parser("auth", help="Manage local operator authentication")
+    # Core Commands.  The old commands remain registered below for compatibility,
+    # while these task-oriented entry points are the public happy path.
+    add_command("shell", help="Open the legacy interactive shell")
+    help_parser = add_command("help", help="Show task-first or full command help")
+    help_parser.add_argument("--all", action="store_true", help="Show every current and compatibility command")
+    setup_parser = add_command("setup", help="Secure and configure this local WatchTower installation")
+    setup_parser.add_argument("--disable", action="store_true", help="Skip local authentication (not recommended)")
+    setup_parser.add_argument("--name", default="Local Operator", help="Name shown for the local operator")
+
+    def add_ui_arguments(command_parser):
+        command_parser.add_argument("--port", type=int, default=4173, help="Dashboard port (default: 4173)")
+        command_parser.add_argument("--api-port", type=int, default=8000, help="Local API port (default: 8000)")
+        command_parser.add_argument("--no-open", action="store_true", help="Do not open the dashboard in a browser")
+
+    ui_parser = add_command("ui", help="Launch the local Web Dashboard and API")
+    add_ui_arguments(ui_parser)
+    open_parser = add_command("open", help="Open the local WatchTower dashboard")
+    add_ui_arguments(open_parser)
+    auth_parser = add_command("auth", help="Manage local operator authentication")
     auth_commands = auth_parser.add_subparsers(dest="auth_command", required=True)
     auth_setup = auth_commands.add_parser("setup", help="Configure the first local operator")
     auth_setup.add_argument("--disable", action="store_true", help="Explicitly disable application authentication")
@@ -76,7 +121,7 @@ def main():
     auth_reset = auth_recovery_commands.add_parser("reset", help="Reset the operator PIN and recovery code")
     auth_reset.add_argument("--os-admin", action="store_true")
     auth_reset.add_argument("--reason", default="")
-    chat_parser = subparsers.add_parser("chat", help="Open the shared WatchTower analyst conversation")
+    chat_parser = add_command("chat", help="Open the shared WatchTower analyst conversation")
     chat_parser.add_argument("--conversation", help="Existing analyst conversation ID")
     chat_parser.add_argument("--source", help="Capture source scope")
     chat_parser.add_argument("--interface", help="Capture interface scope")
@@ -86,7 +131,7 @@ def main():
     chat_parser.add_argument("--research", choices=["auto", "off"], default="auto")
     chat_parser.add_argument("--mode", choices=["auto", "general", "investigate", "action"], default="auto")
     chat_parser.add_argument("--prompt", help="Run one prompt without entering the interactive chat")
-    ai_parser = subparsers.add_parser("ai", help="Manage local analyst providers and conversations")
+    ai_parser = add_command("ai", help="Manage local analyst providers and conversations")
     ai_commands = ai_parser.add_subparsers(dest="ai_command", required=True)
     ai_commands.add_parser("status", help="Show analyst providers, tools, and readiness")
     ai_providers = ai_commands.add_parser("providers", help="Show configured model providers")
@@ -122,41 +167,53 @@ def main():
     ai_credentials.add_argument("reference", nargs="?")
     
     # Engine Control
-    start_parser = subparsers.add_parser("start", help="Start packet capture engine")
+    start_parser = add_command("start", help="Start packet capture engine")
     start_parser.add_argument("-i", "--interface", help="Network interface to monitor")
     start_parser.add_argument("-b", "--background", action="store_true", help="Start in persistent background mode")
     start_parser.add_argument("--backend", choices=["python", "rust"], help="Capture core")
     start_parser.add_argument("--source-type", choices=["network", "bluetooth"], default="network", help="Capture source type")
     
-    stop_parser = subparsers.add_parser("stop", help="Stop packet capture engine")
+    stop_parser = add_command("stop", help="Stop packet capture engine")
     stop_parser.add_argument("-i", "--interface", help="Specific interface to stop")
+
+    monitor_parser = add_command("monitor", help="Inspect live traffic, devices, and sources")
+    monitor_parser.add_argument("view", choices=["status", "flows", "sources"], nargs="?", default="status")
+    investigate_parser = add_command("investigate", help="Search alerts, entities, and historical evidence")
+    investigate_parser.add_argument("view", choices=["alerts", "lookup", "dive", "hunt"], nargs="?", default="alerts")
+    investigate_parser.add_argument("target", nargs="?", help="IP address or optional rule name")
+    sensors_parser = add_command("sensors", help="List and inspect native or remote sensors")
+    sensors_parser.add_argument("view", choices=["status", "list"], nargs="?", default="status")
+    extensions_parser = add_command("extensions", help="List and validate WatchTower extensions")
+    extensions_parser.add_argument("view", choices=["list", "test"], nargs="?", default="list")
+    rules_parser = add_command("rules", help="Inspect synchronized detection rules")
+    rules_parser.add_argument("view", choices=["status", "list"], nargs="?", default="status")
     
     # Forensic Commands
-    analyze_parser = subparsers.add_parser("analyze", help="Analyze offline PCAP files")
+    analyze_parser = add_command("analyze", help="Analyze offline PCAP files")
     analyze_parser.add_argument("filename", help="Path to PCAP file")
     analyze_parser.add_argument("--mode", choices=["auto", "memory", "streaming"], default="auto")
     analyze_parser.add_argument("--backend", choices=["python", "rust"])
     analyze_parser.add_argument("--keylog", help="TLS key log file")
     
     # Daemon Control
-    daemon_parser = subparsers.add_parser("daemon", help="Manage background service")
+    daemon_parser = add_command("daemon", help="Manage background service")
     daemon_parser.add_argument("action", choices=["start", "stop", "restart", "repair", "status", "bg"])
     daemon_parser.add_argument("--force", action="store_true", help="Terminate only a verified stale WatchTower daemon during repair")
     
     # Background Mode (Global)
-    bg_parser = subparsers.add_parser("background", help="Interactive background mode setup")
+    bg_parser = add_command("background", help="Interactive background mode setup")
 
 
 
     # Direct Forensic Commands (Exposed for AI/CLI parity)
-    flows_parser = subparsers.add_parser("flows", help="Show recent network flows")
+    flows_parser = add_command("flows", help="Show recent network flows")
     flows_parser.add_argument("ip", nargs="?", help="IP to filter")
     flows_parser.add_argument("limit", type=int, nargs="?", help="Max results")
     flows_parser.add_argument("--limit", dest="limit_option", type=int, help="Max results")
     flows_parser.add_argument("--source", help="Source filter")
     flows_parser.add_argument("--interface", help="Capture interface filter")
     flows_parser.add_argument("--session", help="Capture session filter")
-    alerts_parser = subparsers.add_parser("alerts", help="Show recent security alerts")
+    alerts_parser = add_command("alerts", help="Show recent security alerts")
     alerts_parser.add_argument("arguments", nargs="*", help="IP/limit or disposition ID")
     alerts_parser.add_argument("--limit", dest="limit_option", type=int, help="Max results")
     alerts_parser.add_argument("--source", help="Source filter")
@@ -165,17 +222,18 @@ def main():
     alerts_parser.add_argument("--verdict", choices=["true_positive", "false_positive", "benign_expected", "unknown"], help=argparse.SUPPRESS)
     alerts_parser.add_argument("--reason", default="", help=argparse.SUPPRESS)
     alerts_parser.add_argument("--actor", default="local-analyst", help=argparse.SUPPRESS)
-    stats_parser = subparsers.add_parser("stats", help="Show live traffic stats")
+    stats_parser = add_command("stats", help="Show live traffic stats")
     stats_parser.add_argument("--interface", help="Capture interface filter")
-    subparsers.add_parser("sources", help="List pluggable capture sources")
-    endpoint_parser = subparsers.add_parser("endpoint", help="Inspect endpoint telemetry and process attribution")
+    sources_parser = add_command("sources", help="List pluggable capture sources")
+    sources_parser.add_argument("--json", action="store_true", help="Emit a stable machine-readable inventory")
+    endpoint_parser = add_command("endpoint", help="Inspect endpoint telemetry and process attribution")
     endpoint_commands = endpoint_parser.add_subparsers(dest="endpoint_command", required=True)
     endpoint_sysmon = endpoint_commands.add_parser("sysmon", help="Inspect Sysmon endpoint telemetry")
     endpoint_sysmon.add_argument("action", choices=["status"], default="status", nargs="?")
     endpoint_processes = endpoint_commands.add_parser("processes", help="List redacted endpoint process observations")
     endpoint_processes.add_argument("--ip")
     endpoint_processes.add_argument("--limit", type=int, default=50)
-    mesh_parser = subparsers.add_parser("mesh", help="Manage secure WatchTower sensor mesh")
+    mesh_parser = add_command("mesh", help="Manage secure WatchTower sensor mesh")
     mesh_commands = mesh_parser.add_subparsers(dest="mesh_command", required=True)
     mesh_controller = mesh_commands.add_parser("controller", help="Initialize or serve the mesh controller")
     mesh_controller_commands = mesh_controller.add_subparsers(dest="mesh_controller_command", required=True)
@@ -246,23 +304,24 @@ def main():
     mesh_agent_run.add_argument("--interval", type=int, default=10)
     mesh_agent_run.add_argument("--limit", type=int, default=250)
     
-    dive_parser = subparsers.add_parser("dive", help="Deep dive investigation into an IP")
+    dive_parser = add_command("dive", help="Deep dive investigation into an IP")
     dive_parser.add_argument("ip", help="IP address to investigate")
     dive_parser.add_argument("--source", help="Data source filter")
     dive_parser.add_argument("--export", nargs="?", const="", metavar="CASE_NAME", help="Export a hashed case bundle")
     
-    lookup_parser = subparsers.add_parser("lookup", help="IP intelligence lookup")
+    lookup_parser = add_command("lookup", help="IP intelligence lookup")
     lookup_parser.add_argument("ip", help="IP address to lookup")
     lookup_parser.add_argument("--source", help="Capture source filter")
     
-    graph_parser = subparsers.add_parser("graph", help="Generate network topology visualization")
+    graph_parser = add_command("graph", help="Generate network topology visualization")
     graph_commands = graph_parser.add_subparsers(dest="graph_command")
     graph_commands.add_parser("status", help="Show Neo4j graph availability and materialization lag")
     graph_materialize = graph_commands.add_parser("materialize", help="Materialize pending SQLite graph events")
     graph_materialize.add_argument("--limit", type=int, default=250)
-    plugins_parser = subparsers.add_parser("plugins", help="Manage forensic plugins")
+    plugins_parser = add_command("plugins", help="Manage forensic plugins")
     plugin_commands = plugins_parser.add_subparsers(dest="plugin_command")
     plugin_commands.add_parser("list", help="List active forensic plugins")
+    plugin_commands.add_parser("coverage", help="Show capability coverage and unavailable dependencies")
     plugin_commands.add_parser("test", help="Validate and smoke-test forensic plugins")
     scaffold_plugins = plugin_commands.add_parser("scaffold", help="Create a calibration-ready plugin skeleton")
     scaffold_commands = scaffold_plugins.add_subparsers(dest="scaffold_type", required=True)
@@ -288,7 +347,11 @@ def main():
     calibration_promote.add_argument("report")
     calibration_promote.add_argument("--reviewer", required=True)
     calibration_promote.add_argument("--reason", required=True)
-    calibration_commands.add_parser("verify", help="Verify profile attestations and staleness")
+    calibration_verify = calibration_commands.add_parser("verify", help="Verify profile attestations and staleness")
+    calibration_verify.add_argument(
+        "--format", choices=["rich", "json"], default="rich", dest="output_format",
+        help="Use concise human output or structured JSON for automation",
+    )
     calibration_commands.add_parser(
         "invalidate-stale",
         help="Demote stale trust claims to uncalibrated without granting new trust",
@@ -304,21 +367,30 @@ def main():
     sigma_load.add_argument("--sha256", required=True, help="SHA-256 returned by preview")
     sigma_commands.add_parser("sync", help="Synchronize compatible rules from SigmaHQ/sigma")
     sigma_commands.add_parser("rollback", help="Restore the previous Sigma corpus")
-    subparsers.add_parser("status", help="Show unified system health and status")
-    doctor_parser = subparsers.add_parser("doctor", help="Run backend operational diagnostics")
+    add_command("status", help="Show unified system health and status")
+    doctor_parser = add_command("doctor", help="Run backend operational diagnostics")
     doctor_parser.add_argument("--json", action="store_true", help="Emit a machine-readable diagnostic report")
+    doctor_parser.add_argument(
+        "--install-check",
+        action="store_true",
+        help="Treat a not-yet-started daemon as expected during installation",
+    )
     
-    hunt_parser = subparsers.add_parser("hunt", help="Run Sigma rules hunt")
+    hunt_parser = add_command("hunt", help="Run Sigma rules hunt")
     hunt_parser.add_argument("rule", nargs="?", help="Specific rule to hunt for")
     hunt_parser.add_argument("--list", action="store_true", help="List all carved files in evidence vault")
     hunt_parser.add_argument("--source", help="Historical capture source")
     hunt_parser.add_argument("--interface", help="Capture interface")
-    survey_parser = subparsers.add_parser("survey", help="Capture and survey directly connected private networks")
+    hunt_parser.add_argument("--session", help="Capture session ID")
+    hunt_parser.add_argument("--node", help="Sensor mesh node ID")
+    hunt_parser.add_argument("--time-start", type=float, help="Inclusive start time (Unix seconds)")
+    hunt_parser.add_argument("--time-end", type=float, help="Inclusive end time (Unix seconds)")
+    survey_parser = add_command("survey", help="Capture and survey directly connected private networks")
     survey_parser.add_argument("--duration", default="60m", help="Passive capture duration, e.g. 60m")
     survey_parser.add_argument("--active", choices=["none", "safe", "deep"], default="deep")
     survey_parser.add_argument("--backend", choices=["python", "rust"])
 
-    scoring_parser = subparsers.add_parser("scoring", help="Validate and operate behavioral scoring V2")
+    scoring_parser = add_command("scoring", help="Validate and operate behavioral scoring V2")
     scoring_commands = scoring_parser.add_subparsers(dest="scoring_command", required=True)
     scoring_commands.add_parser("status", help="Show model, mode, and finding status")
     scoring_commands.add_parser("validate", help="Validate profiles, plugins, and storage")
@@ -339,7 +411,7 @@ def main():
     scoring_restore = scoring_commands.add_parser("restore-backup", help="Restore a verified pre-migration backup")
     scoring_restore.add_argument("file")
 
-    enrich_parser = subparsers.add_parser("enrich", help="Inspect and safely rebuild evidence-backed IP enrichment")
+    enrich_parser = add_command("enrich", help="Inspect and safely rebuild evidence-backed IP enrichment")
     enrich_commands = enrich_parser.add_subparsers(dest="enrich_command", required=True)
     enrich_status = enrich_commands.add_parser("status", help="Show enrichment coverage for stored traffic")
     enrich_rebuild = enrich_commands.add_parser("rebuild", help="Back up then repair historical enrichment from capture evidence")
@@ -348,7 +420,7 @@ def main():
         command.add_argument("--interface")
         command.add_argument("--session")
     enrich_rebuild.add_argument("--dry-run", action="store_true")
-    identity_parser = subparsers.add_parser("identity", help="Inspect and safely rebuild endpoint identity cards")
+    identity_parser = add_command("identity", help="Inspect and safely rebuild endpoint identity cards")
     identity_commands = identity_parser.add_subparsers(dest="identity_command", required=True)
     identity_status = identity_commands.add_parser("status", help="Show endpoint identity coverage for stored traffic")
     identity_rebuild = identity_commands.add_parser("rebuild", help="Back up then rebuild endpoint identities from capture evidence")
@@ -364,12 +436,94 @@ def main():
     identity_confirm.add_argument("--dry-run", action="store_true")
     identity_enrich.add_argument("--ip", action="append", default=[], dest="ips")
 
+    # argparse has no public API for selectively hiding subcommand help rows.
+    # Keep the full parser choices registered, but limit the default listing to
+    # the task-first commands; `tower help --all` reads the captured inventory.
+    subparsers._choices_actions[:] = [
+        choice for choice in subparsers._choices_actions if choice.dest in common_tasks
+    ]
     args = parser.parse_args()
+
+    if args.command == "help":
+        if args.all:
+            console.print("All WatchTower commands, including advanced and compatibility routes:")
+            for name, summary in sorted(command_summaries.items()):
+                console.print(f"  tower {name:<14} {summary}")
+        else:
+            parser.print_help()
+        return
+
+    # Normalize task-oriented commands into the existing implementation paths.
+    # This keeps one execution path and lets old automation continue to work.
+    if args.command == "monitor":
+        if args.view == "flows":
+            args.command = "flows"
+            args.ip = None
+            args.limit = None
+            args.limit_option = None
+            args.source = None
+            args.interface = None
+            args.session = None
+        elif args.view == "sources":
+            args.command = "sources"
+        else:
+            args.command = "status"
+    elif args.command == "investigate":
+        if args.view == "lookup":
+            if not args.target:
+                parser.error("tower investigate lookup requires an IP address")
+            args.command = "lookup"
+            args.ip = args.target
+            args.source = None
+        elif args.view == "dive":
+            if not args.target:
+                parser.error("tower investigate dive requires an IP address")
+            args.command = "dive"
+            args.ip = args.target
+            args.source = None
+            args.export = None
+        elif args.view == "hunt":
+            args.command = "hunt"
+            args.rule = args.target
+            args.list = False
+            args.source = None
+            args.interface = None
+        else:
+            args.command = "alerts"
+            args.arguments = []
+            args.limit_option = None
+            args.source = None
+            args.interface = None
+            args.session = None
+            args.verdict = None
+            args.reason = ""
+            args.actor = "local-analyst"
+    elif args.command == "sensors":
+        args.command = "mesh"
+        args.mesh_command = "controller" if args.view == "status" else "nodes"
+        if args.view == "status":
+            args.mesh_controller_command = "status"
+        else:
+            args.mesh_nodes_command = "list"
+    elif args.command == "extensions":
+        args.command = "plugins"
+        args.plugin_command = args.view
+    elif args.command == "rules":
+        args.command = "plugins"
+        args.plugin_command = "sigma"
+        args.sigma_command = args.view
 
     # Read-only installation diagnostics are intentionally available before
     # first-run auth setup; mutating graph operations remain protected.
-    diagnostic_command = args.command == "doctor" or (
+    diagnostic_command = args.command in {"doctor", "status", "version"} or (
         args.command == "graph" and getattr(args, "graph_command", None) == "status"
+    ) or (
+        args.command == "plugins"
+        and getattr(args, "plugin_command", None) in {"list", "coverage", "test"}
+    ) or (
+        args.command == "plugins"
+        and getattr(args, "plugin_command", None) == "calibration"
+        and getattr(args, "calibration_command", None) == "verify"
     )
     sensor_service_operation = os.environ.get("WATCHTOWER_SENSOR_SERVICE") == "1" and (
         args.command in {"start", "stop", "daemon"}
@@ -378,7 +532,7 @@ def main():
             and getattr(args, "mesh_command", None) == "agent"
         )
     )
-    if args.command not in {"auth", "ui"} and not diagnostic_command and not sensor_service_operation:
+    if args.command and args.command not in {"auth", "ui", "open", "setup", "version"} and not diagnostic_command and not sensor_service_operation:
         from core.cli.modules.auth import AuthModule
 
         auth_module = AuthModule(console=console)
@@ -411,7 +565,58 @@ def main():
             auth_module.close()
 
     # 1. Dispatch
-    if not args.command or args.command == "shell":
+    if not args.command:
+        from core.cli.ux import quick_status
+        try:
+            from core.auth import OperatorAuthService
+            from core.daemon.client import DaemonClient
+            from core.storage.database import WatchtowerDB
+
+            db = WatchtowerDB()
+            try:
+                configured = OperatorAuthService(db).status().get("state") != "setup_required"
+            finally:
+                db.close()
+            status = DaemonClient().get_status()
+        except (OSError, PermissionError, ModuleNotFoundError) as exc:
+            console.print("WatchTower is not ready to inspect its local runtime.")
+            console.print(f"Detail: {exc}")
+            console.print("Next step: run 'tower doctor' or set WATCHTOWER_HOME to a writable data directory.")
+            return
+        console.print(quick_status(status, configured=configured))
+        return
+
+    if args.command in {"ui", "open"}:
+        try:
+            from core.ui_launcher import launch_ui
+
+            launch_ui(console, port=args.port, api_port=args.api_port, open_browser=not args.no_open)
+        except (ModuleNotFoundError, OSError, PermissionError, RuntimeError) as exc:
+            console.print(f"[bold red]Dashboard could not open:[/bold red] {exc}")
+            console.print("[dim]Follow the recovery steps above; run 'tower doctor' if the cause remains unclear.[/dim]")
+            raise SystemExit(1) from exc
+        return
+
+    if args.command == "setup":
+        try:
+            from core.cli.modules.auth import AuthModule
+
+            module = AuthModule(console=console)
+            try:
+                ok = module.setup(args.disable, args.name)
+            finally:
+                module.close()
+        except (ModuleNotFoundError, OSError, PermissionError, RuntimeError) as exc:
+            console.print(f"Could not complete WatchTower setup: {exc}")
+            console.print("Next step: run 'tower doctor' and retry 'tower setup'.")
+            return
+        if not ok:
+            raise SystemExit(4)
+        return
+
+    from core.daemon.client import DaemonClient
+
+    if args.command == "shell":
         from core.cli.shell import WatchtowerShell
         
         try:
@@ -440,14 +645,9 @@ def main():
             opts = {"backend": args.backend, "source_type": args.source_type}
             if args.interface:
                 opts["interface"] = args.interface
-            CaptureModule(opts).run(background=args.background)
-
-    elif args.command == "ui":
-        from core.ui_launcher import launch_ui
-        try:
-            launch_ui(console, port=args.port, api_port=args.api_port, open_browser=not args.no_open)
-        except RuntimeError as exc:
-            console.print(f"[bold red]UI launch failed:[/bold red] {exc}")
+            capture_ok = CaptureModule(opts).run(background=args.background)
+            if capture_ok is False:
+                raise SystemExit(1)
 
     elif args.command == "auth":
         from core.cli.modules.auth import AuthModule
@@ -478,11 +678,14 @@ def main():
 
     elif args.command == "chat":
         from core.cli.modules.ai import AIModule
-        AIModule(console=console).chat(
+        module = AIModule(console=console)
+        module.chat(
             conversation_id=args.conversation, source=args.source, interface=args.interface, session=args.session,
             node=args.node, provider=args.provider, research_mode=args.research, prompt=args.prompt,
             mode=args.mode,
         )
+        if module.last_error:
+            raise SystemExit(2)
 
     elif args.command == "ai":
         from core.cli.modules.ai import AIModule
@@ -515,6 +718,8 @@ def main():
                 module.credential_set(args.reference)
             else:
                 module.credential_delete(args.reference)
+        if module.last_error is not None:
+            raise SystemExit(2)
         
     elif args.command == "stop":
         from core.mesh.hybrid import hybrid_enabled
@@ -626,7 +831,13 @@ def main():
 
     elif args.command == "status":
         from core.mesh.hybrid import hybrid_enabled
-        if hybrid_enabled():
+        deployment_role = os.environ.get("WATCHTOWER_DEPLOYMENT_ROLE", "native").strip().lower()
+        if deployment_role in {"controller", "offline"} and not hybrid_enabled():
+            from core.cli.modules.forensics import ForensicsModule
+            report = ForensicsModule({}).doctor()
+            if report.get("status") == "fail":
+                raise SystemExit(1)
+        elif hybrid_enabled():
             from core.mesh.hybrid import status as hybrid_status
             from core.storage.database import WatchtowerDB
             db = WatchtowerDB()
@@ -644,7 +855,9 @@ def main():
 
     elif args.command == "doctor":
         from core.cli.modules.forensics import ForensicsModule
-        ForensicsModule({}).doctor(json_output=args.json)
+        report = ForensicsModule({}).doctor(json_output=args.json, install_check=args.install_check)
+        if report.get("status") == "fail":
+            raise SystemExit(1)
 
     elif args.command == "stats":
         from core.cli.modules.forensics import ForensicsModule
@@ -653,12 +866,6 @@ def main():
     elif args.command == "sources":
         from rich.table import Table
         from core.mesh.hybrid import devices as hybrid_devices, hybrid_enabled
-        table = Table(title="Capture Sources")
-        table.add_column("Type", style="cyan")
-        table.add_column("Device", style="white")
-        table.add_column("Address", style="green")
-        table.add_column("Backends")
-        table.add_column("Status")
         if hybrid_enabled():
             from core.storage.database import WatchtowerDB
             db = WatchtowerDB()
@@ -669,6 +876,16 @@ def main():
         else:
             from core.capture_sources import default_registry
             device_rows = default_registry().list_devices()
+        if args.json:
+            from core.cli.ux import capture_source_inventory
+            console.print_json(data=capture_source_inventory(device_rows))
+            return
+        table = Table(title="Capture Sources")
+        table.add_column("Type", style="cyan")
+        table.add_column("Device", style="white")
+        table.add_column("Address", style="green")
+        table.add_column("Backends")
+        table.add_column("Status")
         for device in device_rows:
             if isinstance(device, dict):
                 available = bool(device.get("available", True))
@@ -888,7 +1105,16 @@ def main():
 
     elif args.command == "plugins":
         from core.forensics.plugin_loader import PluginLoader
-        if args.plugin_command == "scaffold":
+        if args.plugin_command == "coverage":
+            from core.operations.capabilities import CapabilityRegistry
+            from core.operations.coverage import build_coverage_matrix
+
+            inventory = PluginLoader().list_plugins()
+            capabilities = CapabilityRegistry().summary()
+            result = build_coverage_matrix(list(inventory.values()), capabilities)
+            result["capabilities"] = capabilities
+            console.print_json(data=result)
+        elif args.plugin_command == "scaffold":
             from core.calibration.service import CalibrationError, CalibrationService
             try:
                 result = CalibrationService().scaffold(args.detector_id, args.finding_type, args.input_kind)
@@ -924,6 +1150,13 @@ def main():
                         raise SystemExit(2)
                 elif args.calibration_command == "status":
                     result = service.status(args.detector)
+                    from core.operations.calibration_presentation import calibration_trust_basis, calibration_trust_label
+                    for item in result["targets"]:
+                        item["trust_basis"] = calibration_trust_basis(
+                            item["calibration_level"], item["attestation_digest"],
+                            stale_reason=item.get("stale_reason", ""),
+                        )
+                        item["trust_label"] = calibration_trust_label(item["calibration_level"], item["trust_basis"])
                     if args.output_format == "json":
                         console.print_json(data=result)
                     else:
@@ -931,11 +1164,13 @@ def main():
                         table.add_column("Detector", style="cyan")
                         table.add_column("Finding")
                         table.add_column("Trust")
+                        table.add_column("Evidence basis")
                         table.add_column("Cap", justify="right")
                         table.add_column("Attestation")
                         for item in result["targets"]:
                             table.add_row(
-                                item["detector_id"], item["finding_type"], item["calibration_level"],
+                                item["detector_id"], item["finding_type"], item["trust_label"],
+                                item["trust_basis"],
                                 f"{item['effective_cap']:.1f}", item["attestation_digest"][:12] or "-",
                             )
                         console.print(table)
@@ -947,9 +1182,15 @@ def main():
                     console.print_json(data=service.promote(args.report, args.reviewer, args.reason))
                 elif args.calibration_command == "invalidate-stale":
                     console.print_json(data=service.invalidate_stale_profiles())
-                else:
+                elif args.calibration_command == "verify":
                     result = service.verify()
-                    console.print_json(data=result)
+                    from core.operations.calibration_presentation import annotate_calibration_verification
+                    result = annotate_calibration_verification(result, service.profile_path)
+                    if args.output_format == "json":
+                        console.print_json(data=result)
+                    else:
+                        from core.cli.ux import calibration_verification_summary
+                        console.print(calibration_verification_summary(result))
                     if not result["valid"]:
                         raise SystemExit(2)
             except CalibrationError as exc:
@@ -981,8 +1222,17 @@ def main():
                 status = "[green]PASS[/green]" if info["valid"] and not info["errors"] else "[red]FAIL[/red]"
                 if args.plugin_command == "test":
                     contract = f"contract v{info.get('contract_version', 1)}"
-                    calibration = "not applicable" if info.get("type") == "parser" else info.get("calibration_level", "UNCALIBRATED")
-                    console.print(f" - {status} {name} [dim]({contract}, {calibration})[/dim]")
+                    if info.get("type") == "parser":
+                        trust_evidence = policy_level = "NOT APPLICABLE"
+                    else:
+                        from core.operations.calibration_presentation import calibration_trust_summary
+
+                        trust_evidence = calibration_trust_summary(info.get("calibration") or [])
+                        policy_level = str(info.get("calibration_level", "UNCALIBRATED"))
+                    console.print(
+                        f" - {status} {name} [dim]({contract}, trust: {trust_evidence}; "
+                        f"policy: {policy_level})[/dim]"
+                    )
                 else:
                     console.print(f" - [green]{name}[/green]: {info.get('description', 'No description')}")
 
@@ -993,8 +1243,21 @@ def main():
         else:
             from core.forensics.sigma_engine import SigmaEngine
             engine = SigmaEngine()
-            alerts = engine.run_hunt(source=args.source, specific_rule=args.rule, interface=args.interface)
-            console.print(f"[green]Hunt complete.[/green] {len(alerts)} Sigma match(es).")
+            report = engine.run_hunt_report(
+                source=args.source, specific_rule=args.rule, interface=args.interface,
+                capture_session_id=args.session, sensor_node_id=args.node,
+                time_start=args.time_start, time_end=args.time_end,
+            )
+            alerts = report["alerts"]
+            headline = "Hunt complete" if report["complete"] else "Hunt partially complete"
+            if report.get("coverage_status") == "no_compatible_rules":
+                console.print("[yellow]No compatible Sigma rules; no coverage. This is not a clean result.[/yellow]")
+            else:
+                console.print(f"[green]{headline}.[/green] {len(alerts)} Sigma match(es).")
+            console.print(f"Rules evaluated: {report.get('evaluated_rules', 0)}")
+            if not report["complete"]:
+                for limitation in report["limitations"]:
+                    console.print(f"[yellow]Partial hunt: {limitation}[/yellow]")
 
     elif args.command == "survey":
         from core.storage.database import WatchtowerDB

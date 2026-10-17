@@ -31,6 +31,25 @@ class ValidationReport:
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?%?(?![A-Za-z])")
 _NETWORK_WORDS = re.compile(r"\b(network|ip|flow|alert|finding|endpoint|entities|entity|risk|traffic|session|host|identity|score|bytes?|packets?)\b", re.I)
+_EXTERNAL_ATTRIBUTION_RE = re.compile(
+    r"\b(?:generated|provided|produced|published|reported|sourced|classified|attributed)\s+by\b",
+    re.I,
+)
+_COMPLETENESS_CLAIM_RE = re.compile(
+    r"\b(?:no|none|zero|without|free\s+of|all|fully)\b.{0,60}\b(?:gaps?|limitations?|issues?|problems?|missing|unknowns?|coverage)\b",
+    re.I,
+)
+_EMPTY_COMPLETENESS_FIELD_RE = re.compile(
+    r"\b(?:gaps?|limitations?|issues?|problems?|unknowns?)\b\s*[:=\-]?\s*(?:\*|[-•])?\s*(?:none|no|zero|nil|not\s+applicable)\b",
+    re.I,
+)
+_SEVERITY_COUNT_RE = re.compile(
+    r"\b(?P<count>\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?P<severity>critical|high|medium|low)\s+alerts?\b",
+    re.I,
+)
+_NUMBER_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+                 "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
 
 def _verified_fact_lines(results: Iterable[ToolResult]) -> tuple[list[str], int]:
@@ -74,10 +93,51 @@ def _evidence_text(results: Iterable[ToolResult]) -> str:
     ], sort_keys=True, default=str)
 
 
+def _exact_alert_severity_counts(results: Iterable[ToolResult]) -> dict[str, int] | None:
+    """Return counts only when scoped alert evidence supports exact severity totals."""
+    for result in results:
+        if not result.complete or result.truncated:
+            continue
+        data = result.data
+        groups = data.get("alert_groups") if isinstance(data, dict) else None
+        if not isinstance(groups, list) or not groups:
+            continue
+        counts: dict[str, int] = {}
+        exact = True
+        for group in groups:
+            if not isinstance(group, dict):
+                exact = False
+                break
+            severity = str(group.get("max_severity") or "").casefold()
+            try:
+                count = int(group.get("count"))
+            except (TypeError, ValueError, OverflowError):
+                exact = False
+                break
+            # A grouped row with multiple alerts gives only the maximum
+            # severity, not the severity of every member in that group.
+            if severity not in {"critical", "high", "medium", "low"} or count != 1:
+                exact = False
+                break
+            counts[severity] = counts.get(severity, 0) + 1
+        if exact:
+            return counts
+    return None
+
+
 def validate_answer(text: str, results: Iterable[ToolResult], *, mode: str = "investigate") -> ValidationReport:
     answer = redact_text(text or "", 12000).strip()
     collected = list(results)
     serialized = _evidence_text(collected)
+    has_external_evidence = any(
+        citation.kind == "external"
+        for result in collected for citation in result.citations
+    )
+    has_evidence_limitations = any(
+        result.limitations or not result.complete or result.truncated
+        for result in collected
+    )
+    exact_severity_counts = _exact_alert_severity_counts(collected)
     available_ips = set()
     for value in _IP_RE.findall(serialized):
         try:
@@ -87,6 +147,12 @@ def validate_answer(text: str, results: Iterable[ToolResult], *, mode: str = "in
             pass
 
     blocked = 0
+    if mode != "general" and has_evidence_limitations:
+        answer, rejected_fields = _EMPTY_COMPLETENESS_FIELD_RE.subn(
+            "[unsupported completeness claim removed; the scoped evidence includes limitations]",
+            answer,
+        )
+        blocked += rejected_fields
     known_fact_ids = {fact.fact_id for result in collected for fact in result.facts}
     if mode != "general" and re.search(r"[\{\[]\s*[\"'](?:name|tool)[\"']\s*:", answer):
         answer = "The provider returned a tool request as final text instead of a completed analyst answer. No unsupported tool action was executed."
@@ -96,11 +162,26 @@ def validate_answer(text: str, results: Iterable[ToolResult], *, mode: str = "in
     evidence_numbers = set(_NUMBER_RE.findall(serialized))
     verified_lines, endpoint_count = _verified_fact_lines(collected)
     for sentence in sentences:
+        if mode != "general" and _EXTERNAL_ATTRIBUTION_RE.search(sentence) and not has_external_evidence:
+            blocked += 1
+            sentence = "[unsupported external-source attribution removed; no external source was cited]"
+        if mode != "general" and has_evidence_limitations and _COMPLETENESS_CLAIM_RE.search(sentence):
+            blocked += 1
+            sentence = "[unsupported completeness claim removed; the scoped evidence includes limitations]"
+        severity_claim = _SEVERITY_COUNT_RE.search(sentence)
+        if mode != "general" and severity_claim and exact_severity_counts is not None:
+            raw_count = severity_claim.group("count").casefold()
+            claimed_count = int(raw_count) if raw_count.isdigit() else _NUMBER_WORDS[raw_count]
+            if claimed_count != exact_severity_counts.get(severity_claim.group("severity").casefold(), 0):
+                blocked += 1
+                sentence = "[unsupported alert-severity count removed; scoped alert evidence does not support the stated count]"
         for fact_id in re.findall(r"fact:[A-Za-z0-9_-]+", sentence):
             if fact_id not in known_fact_ids:
                 blocked += 1
                 sentence = sentence.replace(fact_id, "[unsupported fact reference removed]")
         unsupported_ips = [value for value in _IP_RE.findall(sentence) if value not in available_ips]
+        if mode == "general":
+            unsupported_ips = []
         if unsupported_ips:
             blocked += len(unsupported_ips)
             for value in unsupported_ips:
@@ -134,8 +215,11 @@ def validate_answer(text: str, results: Iterable[ToolResult], *, mode: str = "in
         answer += "\n\nValidation warning: one or more unsupported concrete claims were removed. Review visibility limits before drawing conclusions."
 
     meaningful = [part for part in cleaned if not part.startswith("[") and _NETWORK_WORDS.search(part)]
-    supported = max(0, len(meaningful) - blocked)
+    supported = 0 if mode == "general" else max(0, len(meaningful) - blocked)
     inferred = sum(1 for part in cleaned if re.search(r"\b(likely|may|could|inference|appears)\b", part, re.I))
     coverage = 1.0 if not meaningful else round(min(1.0, len(citations) / max(1, len(meaningful))), 2)
-    return ValidationReport(answer, "degraded" if blocked or (meaningful and not citations) else "validated",
+    status = "not_applicable" if mode == "general" else (
+        "degraded" if blocked or (meaningful and not citations) else "validated"
+    )
+    return ValidationReport(answer, status,
                             supported, inferred, blocked, 0.0 if blocked else 1.0, coverage)

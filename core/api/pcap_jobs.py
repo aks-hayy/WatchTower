@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 from core.ai.config import CredentialStore
 from core.backend_policy import backend_policy
 from core.constants import FORENSIC_TERMINAL_STATES
+from core.operations.capabilities import CapabilityRegistry
 from core.context import context
 from core.forensics.analysis_identity import PIPELINE_VERSION, build_analysis_identity
 from core.forensics.engine import ForensicsEngine
@@ -201,7 +202,9 @@ class PcapJobManager:
                keylog_path: Optional[str] = None, retain_input: bool = True) -> Dict[str, Any]:
         if mode not in {"auto", "memory", "streaming"}:
             raise ValueError("mode must be auto, memory, or streaming")
-        backend = backend_policy.replay_backend(backend)
+        data_dir = getattr(self.db, "data_dir", None)
+        runtime = CapabilityRegistry(data_dir=str(data_dir)).flags() if data_dir else None
+        backend = backend_policy.replay_backend(backend, runtime_capabilities=runtime)
         if Path(filename).suffix.lower() not in {".pcap", ".pcapng", ".cap"}:
             raise ValueError("file must use a .pcap, .pcapng, or .cap extension")
 
@@ -955,7 +958,10 @@ class PcapJobManager:
                 path=str(row.get("path") or ""),
                 file_size=int(row.get("file_size") or 0),
                 mode=str(row.get("mode") or "auto"),
-                backend=backend_policy.replay_backend(row.get("backend")),
+                backend=backend_policy.replay_backend(
+                    row.get("backend"),
+                    runtime_capabilities=CapabilityRegistry(data_dir=str(self.db.data_dir)).flags(),
+                ),
                 source=str(row.get("source") or ""),
                 case_id=row.get("case_id"),
                 analysis_id=row.get("analysis_id") or job_id,

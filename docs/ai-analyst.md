@@ -35,6 +35,17 @@ The result includes a harmless native-tool capability probe. A provider may
 remain available for general chat while its agentic mode is marked unavailable.
 No silent provider fallback occurs.
 
+## Restart recovery and retry
+
+Runs left in progress when WatchTower stops are marked `INTERRUPTED` on the
+next startup. Unclaimed approvals are cancelled and no interrupted operation
+is replayed automatically. For an interrupted read-only run, use **Retry
+original question** in the Analyst UI or `tower ai retry RUN_ID` in the CLI.
+The retry is a linked run that reuses the original message and scope; it does
+not add a duplicate user message. State-changing runs are not eligible for
+automatic retry because the outcome may be uncertain. Review their activity
+and submit a new action explicitly if appropriate.
+
 To connect OpenAI:
 
 ```text

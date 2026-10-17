@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from core.api.pcap_jobs import PcapJobManager
@@ -121,7 +122,38 @@ def test_v2_pcap_upload_remains_compatible_with_legacy_job_managers():
         )
         assert response.status_code == 202
         assert response.json()["id"] == "job-1"
-        assert client.get("/api/v2/pcap/analyses/job-1").status_code == 200
+        operation = response.json().get("operation")
+        assert operation is not None, response.json()
+        assert operation["operation_id"] == "job-1"
+        assert operation["state"] == "queued"
+        assert operation["completeness"] == "not_applicable"
+        fetched = client.get("/api/v2/pcap/analyses/job-1")
+        assert fetched.status_code == 200
+        assert fetched.json()["operation"]["state"] == "running"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_state", "expected_completeness"),
+    [
+        ("partial", "partial", "partial"),
+        ("failed", "failed", "partial"),
+        ("cancelling", "running", "not_applicable"),
+    ],
+)
+def test_pcap_lifecycle_projects_incomplete_and_cancelling_states_truthfully(
+    status, expected_state, expected_completeness,
+):
+    service = WatchtowerApiService(
+        db=FakeDatabase(), daemon=FakeDaemon(), registry=FakeRegistry(), jobs=FakeJobs(),
+    )
+
+    result = service._pcap_job_operation({"id": "job-state", "status": status})
+
+    assert result["status"] == status
+    assert result["operation"]["operation_id"] == "job-state"
+    assert result["operation"]["state"] == expected_state
+    assert result["operation"]["completeness"] == expected_completeness
+    assert result["operation"]["next_actions"]
 
 
 def test_completed_pcap_job_history_survives_manager_restart(tmp_path):

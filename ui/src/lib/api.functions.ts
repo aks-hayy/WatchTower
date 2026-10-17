@@ -23,6 +23,7 @@ import type {
   EvidenceGraphStatus,
   PluginCalibrationRunResult,
   PluginCalibrationStatus,
+  PluginCoverage,
   PluginInventory,
   PipelineHealth,
   RiskEntity,
@@ -535,12 +536,37 @@ export const setFindingDisposition = createServerFn({ method: "POST" })
 
 export const fetchTopology = createServerFn({ method: "GET" })
   .validator(
-    (data: { source?: string; interface?: string; session?: string; node?: string } = {}) => data,
+    (
+      data: {
+        source?: string;
+        interface?: string;
+        session?: string;
+        node?: string;
+        time_start?: number;
+        time_end?: number;
+        cursor?: string;
+        limit?: number;
+      } = {},
+    ) => data,
   )
   .handler(async ({ data }) =>
-    requestApiV2<{ nodes: TopologyNode[]; edges: TopologyEdge[] }>("/topology", undefined, {
+    requestApiV2<{
+      nodes: TopologyNode[];
+      edges: TopologyEdge[];
+      next_cursor: string | null;
+      limit: number;
+      page_flow_count: number;
+      scope: {
+        source?: string | null;
+        interface?: string | null;
+        session?: string | null;
+        sensor_node_id?: string | null;
+        time_start?: number | null;
+        time_end?: number | null;
+      };
+    }>("/topology", undefined, {
       ...data,
-      limit: 100,
+      limit: data.limit ?? 100,
     }),
   );
 
@@ -602,42 +628,68 @@ export const fetchDashboard = createServerFn({ method: "GET" })
 
 export const startEngine = createServerFn({ method: "POST" })
   .validator((data: { interface_id: string; backend?: string; source_type?: string }) => data)
-  .handler(async ({ data }) =>
-    requestApi<JsonObject>("/capture/start", {
-      method: "POST",
-      body: JSON.stringify({
-        interface: data.interface_id,
-        backend: data.backend,
-        source_type: data.source_type || "network",
-      }),
-    }),
-  );
+  .handler(async ({ data }) => {
+    try {
+      return await requestApi<JsonObject>("/capture/start", {
+        method: "POST",
+        body: JSON.stringify({
+          interface: data.interface_id,
+          backend: data.backend,
+          source_type: data.source_type || "network",
+        }),
+      });
+    } catch (error) {
+      return mutationFailure(error);
+    }
+  });
 
 export const stopEngine = createServerFn({ method: "POST" })
   .validator((data: { interface_id: string }) => data)
   .handler(async ({ data }) => {
-    const sessions = await requestApi<CaptureSession[]>("/sessions", undefined, {
-      interface: data.interface_id,
-      limit: 10,
-    });
-    const active = sessions.find((item) =>
-      ["running", "draining"].includes(String(item.processing_state || item.status).toLowerCase()),
-    );
-    if (active) {
-      return requestApiV2<JsonObject>(`/captures/${encodeURIComponent(active.id)}/stop`, {
-        method: "POST",
-        body: JSON.stringify({ reason: "operator_stop" }),
+    try {
+      const sessions = await requestApi<CaptureSession[]>("/sessions", undefined, {
+        interface: data.interface_id,
+        limit: 10,
       });
+      const active = sessions.find((item) =>
+        ["running", "draining"].includes(
+          String(item.processing_state || item.status).toLowerCase(),
+        ),
+      );
+      if (active) {
+        return requestApiV2<JsonObject>(`/captures/${encodeURIComponent(active.id)}/stop`, {
+          method: "POST",
+          body: JSON.stringify({ reason: "operator_stop" }),
+        });
+      }
+      return requestApi<JsonObject>("/capture/stop", {
+        method: "POST",
+        body: JSON.stringify({ interface: data.interface_id }),
+      });
+    } catch (error) {
+      return mutationFailure(error);
     }
-    return requestApi<JsonObject>("/capture/stop", {
-      method: "POST",
-      body: JSON.stringify({ interface: data.interface_id }),
-    });
   });
+
+function mutationFailure(error: unknown): JsonObject {
+  if (error instanceof WatchtowerApiError) {
+    return { ok: false, error: error.message, status: error.status };
+  }
+  throw error;
+}
 
 export const runSigmaHunt = createServerFn({ method: "POST" })
   .validator(
-    (data: { source?: string; interface?: string; rule?: string; persist?: boolean }) => data,
+    (data: {
+      source?: string;
+      interface?: string;
+      rule?: string;
+      persist?: boolean;
+      capture_session_id?: string;
+      time_start?: number;
+      time_end?: number;
+      sensor_node_id?: string;
+    }) => data,
   )
   .handler(async ({ data }) =>
     requestApi<{
@@ -645,6 +697,12 @@ export const runSigmaHunt = createServerFn({ method: "POST" })
       persisted: boolean;
       active_rules: number;
       rejected_rules: number;
+      complete?: boolean;
+      limitations?: string[];
+      evaluated_flows?: number;
+      evaluated_identity_observations?: number | null;
+      evaluated_rules?: number;
+      coverage_status?: string;
     }>("/hunts/sigma", {
       method: "POST",
       body: JSON.stringify(data),
@@ -662,6 +720,10 @@ export const resetDatabase = createServerFn({ method: "POST" })
 
 export const fetchPluginInventory = createServerFn({ method: "GET" }).handler(async () =>
   requestApi<PluginInventory>("/plugins"),
+);
+
+export const fetchPluginCoverage = createServerFn({ method: "GET" }).handler(async () =>
+  requestApi<PluginCoverage>("/plugins/coverage"),
 );
 
 export const fetchPluginCalibrationStatus = createServerFn({ method: "GET" })
@@ -747,6 +809,20 @@ export const fetchAIStatus = createServerFn({ method: "GET" }).handler(async () 
   requestApiV2<AIStatus>("/ai/status"),
 );
 
+export const testAIProvider = createServerFn({ method: "POST" })
+  .validator((data: { provider: "ollama" | "openai" }) => data)
+  .handler(async ({ data }) =>
+    requestApiV2<{
+      provider: string;
+      available: boolean;
+      model_catalog_available: boolean;
+      selected_model_available: boolean;
+      model: string;
+      agentic_ready: boolean;
+      capability: { chat_ready?: boolean; detail?: string };
+    }>(`/ai/providers/${encodeURIComponent(data.provider)}/test`, { method: "POST" }),
+  );
+
 export const fetchAIConversations = createServerFn({ method: "GET" })
   .validator((data: { limit?: number } = {}) => data)
   .handler(async ({ data }) =>
@@ -774,6 +850,29 @@ export const createAIConversation = createServerFn({ method: "POST" })
     }),
   );
 
+export const branchAIConversation = createServerFn({ method: "POST" })
+  .validator(
+    (data: {
+      conversation_id: string;
+      message_id: string;
+      prompt: string;
+      client_request_id: string;
+    }) => data,
+  )
+  .handler(async ({ data }) =>
+    requestApiV2<{ conversation: AIConversation; run: AIRun }>(
+      `/ai/conversations/${encodeURIComponent(data.conversation_id)}/branch`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          message_id: data.message_id,
+          prompt: data.prompt,
+          client_request_id: data.client_request_id,
+        }),
+      },
+    ),
+  );
+
 export const startAIRun = createServerFn({ method: "POST" })
   .validator(
     (data: {
@@ -783,6 +882,7 @@ export const startAIRun = createServerFn({ method: "POST" })
       scope: AIContextScope;
       research_mode: "auto" | "off";
       mode?: "auto" | "general" | "investigate" | "action";
+      client_request_id?: string;
     }) => data,
   )
   .handler(async ({ data }) =>
@@ -792,6 +892,22 @@ export const startAIRun = createServerFn({ method: "POST" })
 export const fetchAIRun = createServerFn({ method: "GET" })
   .validator((data: { run_id: string }) => data)
   .handler(async ({ data }) => requestApiV2<AIRun>(`/ai/runs/${encodeURIComponent(data.run_id)}`));
+
+export const cancelAIRun = createServerFn({ method: "POST" })
+  .validator((data: { run_id: string }) => data)
+  .handler(async ({ data }) =>
+    requestApiV2<AIRun>(`/ai/runs/${encodeURIComponent(data.run_id)}/cancel`, { method: "POST" }),
+  );
+
+export const retryAIRun = createServerFn({ method: "POST" })
+  .validator((data: { run_id: string }) => data)
+  .handler(async ({ data }) =>
+    requestApiV2<AIRun>(`/ai/runs/${encodeURIComponent(data.run_id)}/retry`, { method: "POST" }),
+  );
+
+export function aiRunEventsUrl(runId: string, after = 0) {
+  return `${apiV2Base()}/ai/runs/${encodeURIComponent(runId)}/events?after=${Math.max(0, after)}`;
+}
 
 export const approveAIAction = createServerFn({ method: "POST" })
   .validator((data: { approval_id: string; confirmation?: string }) => data)

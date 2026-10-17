@@ -45,6 +45,21 @@ export function LookupIntelPanel({ lookup }: { lookup: IpLookup }) {
         <p className="mt-4 text-[13px] leading-relaxed text-muted-foreground">{lookup.summary}</p>
       </section>
 
+      {!!lookup.scope_limitations?.length && (
+        <section
+          role="note"
+          aria-label="Evidence scope limits"
+          className="panel border-l-2 border-severity-medium px-4 py-3"
+        >
+          <h2 className="section-label text-severity-medium">/ EVIDENCE SCOPE LIMITS</h2>
+          <ul className="mt-2 space-y-1 text-[12px] leading-relaxed text-foreground">
+            {lookup.scope_limitations.map((limitation, index) => (
+              <li key={`${limitation}-${index}`}>{limitation}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="grid gap-px bg-border md:grid-cols-2 xl:grid-cols-4">
         <Metric label="ROLE" value={role} icon={<Server className="h-3.5 w-3.5" />} />
         <Metric label="ORG / VENDOR" value={company} icon={<Building2 className="h-3.5 w-3.5" />} />

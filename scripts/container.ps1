@@ -9,7 +9,9 @@ param(
     [string]$MeshBindAddress = "",
     [switch]$HybridBridge,
     [switch]$NoBuild,
-    [switch]$Prune
+    [switch]$Prune,
+    [ValidateSet("controller", "offline")]
+    [string]$Role = "controller"
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,6 +92,8 @@ function Initialize-ContainerState {
     Write-Host "The installation key stays in $SecretDir and is ignored by Git." -ForegroundColor DarkGray
 }
 
+$isCleanup = $Command -in @("down", "reset")
+
 function Compose-Arguments {
     $arguments = @("compose", "--env-file", $EnvFile, "-f", "compose.yaml")
     if ($WithNeo4j) { $arguments += @("-f", "deploy/compose.neo4j.yaml", "--profile", "graph") }
@@ -102,38 +106,58 @@ function Compose-Arguments {
 Set-Location $Root
 if ($Command -eq "init") {
     Initialize-ContainerState
+    Set-EnvValue "WATCHTOWER_DEPLOYMENT_ROLE" $Role
+    Write-Host "Container role: $Role" -ForegroundColor DarkGray
     return
 }
 Require-Docker
 if (-not (Test-Path -LiteralPath $EnvFile) -or -not (Test-Path -LiteralPath $MasterKey)) {
+    if ($isCleanup) {
+        throw "Container state is incomplete; refusing to create new secrets during cleanup. Restore the deployment configuration, then retry."
+    }
     Initialize-ContainerState
 }
-if ($WithNeo4j) {
+if ($WithNeo4j -and -not $isCleanup) {
     New-Secret $Neo4jKey 36
     Ensure-EnvValue "WATCHTOWER_NEO4J_PASSWORD_FILE" "deploy/container/secrets/watchtower_neo4j_password"
 }
-if ($WithMesh -and $MeshBindAddress) {
+if ($WithMesh -and $MeshBindAddress -and -not $isCleanup) {
     Set-EnvValue "WATCHTOWER_MESH_BIND_ADDRESS" $MeshBindAddress
 }
-if ($HybridBridge) {
+if ($HybridBridge -and -not $isCleanup) {
     Set-EnvValue "WATCHTOWER_HYBRID_BRIDGE" "1"
 }
+if (-not $isCleanup) { Set-EnvValue "WATCHTOWER_DEPLOYMENT_ROLE" $Role }
 
 $compose = Compose-Arguments
-switch ($Command) {
-    "build" { & docker @compose build }
-    "up" {
-        $upArguments = @("up", "--detach", "--remove-orphans")
-        if (-not $NoBuild) { $upArguments += "--build" }
-        & docker @compose @upArguments
+if ($isCleanup -and $WithMesh -and $MeshBindAddress) {
+    $previousMeshBindAddress = $env:WATCHTOWER_MESH_BIND_ADDRESS
+    $env:WATCHTOWER_MESH_BIND_ADDRESS = $MeshBindAddress
+}
+try {
+    switch ($Command) {
+        "build" { & docker @compose build }
+        "up" {
+            $upArguments = @("up", "--detach", "--remove-orphans")
+            if (-not $NoBuild) { $upArguments += "--build" }
+            & docker @compose @upArguments
+        }
+        "down" { & docker @compose down --remove-orphans }
+        "status" { & docker @compose ps }
+        "logs" { & docker @compose logs --tail 200 --follow }
+        "config" { & docker @compose config }
+        "reset" {
+            & docker @compose down --volumes --remove-orphans
+            if ($Prune) { & docker system prune --force }
+        }
     }
-    "down" { & docker @compose down }
-    "status" { & docker @compose ps }
-    "logs" { & docker @compose logs --tail 200 --follow }
-    "config" { & docker @compose config }
-    "reset" {
-        & docker @compose down --volumes --remove-orphans
-        if ($Prune) { & docker system prune --force }
+} finally {
+    if ($isCleanup -and $WithMesh -and $MeshBindAddress) {
+        if ($null -eq $previousMeshBindAddress) {
+            Remove-Item Env:WATCHTOWER_MESH_BIND_ADDRESS -ErrorAction SilentlyContinue
+        } else {
+            $env:WATCHTOWER_MESH_BIND_ADDRESS = $previousMeshBindAddress
+        }
     }
 }
 if ($LASTEXITCODE -ne 0) {

@@ -3,6 +3,7 @@
 from dataclasses import asdict
 import base64
 from hashlib import sha256
+import inspect
 import ipaddress
 import json
 import os
@@ -10,6 +11,7 @@ import platform
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -30,6 +32,9 @@ from core.daemon.client import DaemonClient
 from core.intelligence.ip_lookup import IpLookupService
 from core.investigation.service import InvestigationService
 from core.storage.database import WatchtowerDB
+from core.ux.contracts import CaptureState, DeploymentRole, ServiceState, describe_status
+from core.operations.capabilities import CapabilityRegistry
+from core.operations.envelope import OperationEnvelope
 from core.utils.network import format_flow_id
 
 
@@ -64,6 +69,22 @@ class WatchtowerApiService:
         self._mesh = None
         self._graph = None
         self.graph_worker = None
+
+    @staticmethod
+    def _with_operation(result: Dict[str, Any], *, operation_id: str, summary: str,
+                        effective_scope: Optional[Dict[str, Any]] = None,
+                        next_actions: Iterable[str] = (), state: Optional[str] = None) -> Dict[str, Any]:
+        """Add the shared operation contract without rewriting legacy response fields."""
+        payload = dict(result)
+        operation_result = {**payload, "status": state} if state else payload
+        payload["operation"] = OperationEnvelope.from_result(
+            operation_result,
+            operation_id=operation_id,
+            summary=summary,
+            effective_scope=effective_scope,
+            next_actions=next_actions,
+        ).as_dict()
+        return payload
 
     def mesh(self):
         if self._mesh is None:
@@ -146,6 +167,8 @@ class WatchtowerApiService:
             return status
 
     def health(self) -> Dict[str, Any]:
+        data_dir = getattr(self.db, "data_dir", None)
+        runtime_capabilities = CapabilityRegistry(data_dir=str(data_dir) if data_dir else None).summary()
         database = "ok"
         try:
             self.db.get_capture_sessions(limit=1)
@@ -153,22 +176,70 @@ class WatchtowerApiService:
             database = "error"
         daemon = self.daemon_status()
         daemon_running = bool(daemon.get("running"))
+        engines = daemon.get("engines") or {}
+        active_interfaces = [
+            str(interface)
+            for interface, engine in engines.items()
+            if isinstance(engine, dict) and engine.get("capture_alive")
+        ]
+        capture_state = (
+            CaptureState.ACTIVE
+            if active_interfaces
+            else CaptureState.IDLE
+            if daemon_running
+            else CaptureState.UNAVAILABLE
+        )
+        deployment_name = os.environ.get("WATCHTOWER_DEPLOYMENT_ROLE", DeploymentRole.NATIVE.value)
+        try:
+            deployment = DeploymentRole(deployment_name)
+        except ValueError:
+            deployment = DeploymentRole.NATIVE
+        status_view = describe_status(
+            service=(
+                ServiceState.RUNNING
+                if daemon_running or deployment is not DeploymentRole.NATIVE
+                else ServiceState.STOPPED
+            ),
+            capture=capture_state,
+            deployment=deployment,
+        )
+        if database != "ok":
+            service_status = "degraded"
+        elif not daemon_running and deployment is DeploymentRole.NATIVE:
+            service_status = "offline"
+        elif (daemon_running and not bool(daemon.get("healthy", True))) or any(
+            not item["available"] and item["name"] not in {"ollama", "graph", "mesh"}
+            for item in runtime_capabilities.values()
+        ):
+            service_status = "degraded"
+        else:
+            service_status = "ok"
         return {
-            "status": "ok" if database == "ok" else "degraded",
+            "status": service_status,
             "version": __version__,
             "database": database,
-            "daemon": "online" if daemon_running else "offline",
+            "daemon": (
+                "online" if daemon_running else "offline"
+            ) if deployment is DeploymentRole.NATIVE else "not_applicable",
             "daemon_healthy": daemon_running and bool(daemon.get("healthy", True)),
+            "capture_state": capture_state.value,
+            "capture_interface": active_interfaces[0] if active_interfaces else None,
+            "deployment_role": deployment.value,
+            "next_action": status_view["next_action"],
+            "capabilities": runtime_capabilities,
         }
 
     def capabilities(self) -> Dict[str, Any]:
         devices = self.devices()
+        data_dir = getattr(self.db, "data_dir", None)
+        runtime = CapabilityRegistry(data_dir=str(data_dir) if data_dir else None).summary()
         return {
             "api_version": "v1",
             "ai_mode": "local-agentic",
             "ai_provider_ready": False,
             "capture_backends": sorted({backend for item in devices for backend in item["backends"]}),
             "capture_sources": sorted({item["source_type"] for item in devices}),
+            "runtime_capabilities": runtime,
             "features": {
                 "flows": True,
                 "alerts": True,
@@ -248,6 +319,8 @@ class WatchtowerApiService:
         sensor_node_id: Optional[str] = None,
         after_packet_count: Optional[int] = None,
         after_id: Optional[int] = None,
+        time_start: Optional[float] = None,
+        time_end: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         kwargs = {
             "source": source,
@@ -266,6 +339,10 @@ class WatchtowerApiService:
             kwargs["offset"] = offset
         if sensor_node_id:
             kwargs["sensor_node_id"] = sensor_node_id
+        if time_start is not None:
+            kwargs["time_start"] = time_start
+        if time_end is not None:
+            kwargs["time_end"] = time_end
         if entity:
             rows = self.db.get_entity_flows(entity, **kwargs)
         else:
@@ -377,12 +454,14 @@ class WatchtowerApiService:
         }
 
     def flow_page(self, source=None, interface=None, session=None, entity=None,
-                  protocol=None, port=None, limit=100, cursor=0, sensor_node_id=None):
+                  protocol=None, port=None, limit=100, cursor=0, sensor_node_id=None,
+                  time_start=None, time_end=None):
         position = self._decode_cursor(cursor)
         items = self.flows(
             source, interface, session, entity, protocol, port, limit + 1,
             int(position.get("offset") or 0), sensor_node_id,
             position.get("packet_count"), position.get("id"),
+            time_start, time_end,
         )
         last = items[min(limit, len(items)) - 1] if items else None
         next_cursor = self._encode_cursor({
@@ -456,27 +535,42 @@ class WatchtowerApiService:
         }) if last else None
         return self._page(rows, limit, next_cursor)
 
-    def topology_page(self, source=None, interface=None, session=None, limit=100, cursor=0, sensor_node_id=None):
-        page = self.flow_page(source, interface, session, None, None, None, limit, cursor, sensor_node_id)
-        entities = {item["ip"]: item for item in self.entities(source, None, 500)}
+    def topology_page(self, source=None, interface=None, session=None, limit=100, cursor=0,
+                      sensor_node_id=None, time_start=None, time_end=None):
+        page = self.flow_page(
+            source, interface, session, None, None, None, limit, cursor, sensor_node_id,
+            time_start, time_end,
+        )
         priorities = {
             item["subject"]: item
             for item in self.scoring_entities(source, interface, session, limit=500, offset=0, sensor_node_id=sensor_node_id)["items"]
         }
+        if time_start is not None or time_end is not None:
+            # Risk rollups are not timestamp-windowed; don't attach out-of-window
+            # scores to a time-filtered topology.
+            priorities = {}
         node_ids = {ip for flow in page["items"] for ip in (flow.get("src_ip"), flow.get("dst_ip")) if ip}
         nodes = [{"data": {
             "id": ip,
-            "label": entities.get(ip, {}).get("hostname") or ip,
-            "type": entities.get(ip, {}).get("asset_role") or entities.get(ip, {}).get("device_type") or "unknown",
+            "label": ip,
+            "type": "unknown",
             "risk": float(priorities.get(ip, {}).get("priority_score") or 0),
-            "risk_level": priorities.get(ip, {}).get("risk_level", "LOW"),
+            "risk_level": priorities.get(ip, {}).get("risk_level", "UNKNOWN"),
             "assessment_confidence": float(priorities.get(ip, {}).get("assessment_confidence") or 0),
+            "risk_available": ip in priorities,
         }} for ip in sorted(node_ids)]
         edges = [{"data": {
             "source": flow.get("src_ip"), "target": flow.get("dst_ip"),
             "weight": int(flow.get("byte_count") or 0),
         }} for flow in page["items"]]
-        return {"nodes": nodes, "edges": edges, "next_cursor": page["next_cursor"], "limit": limit}
+        return {
+            "nodes": nodes, "edges": edges, "next_cursor": page["next_cursor"], "limit": limit,
+            "scope": {
+                "source": source, "interface": interface, "session": session,
+                "sensor_node_id": sensor_node_id, "time_start": time_start, "time_end": time_end,
+            },
+            "page_flow_count": len(page["items"]),
+        }
 
     def flow_detail(self, flow_id: int) -> Dict[str, Any]:
         row = self.db.get_flow(flow_id)
@@ -546,8 +640,19 @@ class WatchtowerApiService:
 
         return self._cached(self._entity_cache, key, 2.0, load)
 
-    def evidence(self, source: Optional[str], entity: Optional[str]) -> List[Dict[str, Any]]:
-        return self.db.get_carved_files(entity_ip=entity, source=source)
+    def evidence(
+        self, source: Optional[str], entity: Optional[str], *, interface: Optional[str] = None,
+        capture_session_id: Optional[str] = None, sensor_node_id: Optional[str] = None,
+        time_start: Optional[float] = None, time_end: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        rows = self.db.get_carved_files(
+            entity_ip=entity, source=source, interface=interface,
+            capture_session_id=capture_session_id, sensor_node_id=sensor_node_id,
+            time_start=time_start, time_end=time_end,
+            limit=max(1, min(int(limit), 500)) if limit is not None else None,
+        )
+        return rows
 
     def stats(self, source: str, interface: Optional[str],
               sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
@@ -696,22 +801,32 @@ class WatchtowerApiService:
         ]
         return {"nodes": nodes, "edges": edges}
 
-    def investigate(self, ip: str, source: Optional[str], sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
+    def investigate(self, ip: str, source: Optional[str], sensor_node_id: Optional[str] = None,
+                    interface: Optional[str] = None, capture_session_id: Optional[str] = None,
+                    time_start: Optional[float] = None, time_end: Optional[float] = None) -> Dict[str, Any]:
         try:
             result = InvestigationService(self.db).investigate(
                 ip, source=source, persist=True, sensor_node_id=sensor_node_id,
+                interface=interface, capture_session_id=capture_session_id,
+                time_start=time_start, time_end=time_end,
             ).to_dict()
             result["lookup"] = IpLookupService(self.db).lookup(
                 ip, source=source, persist=True, sensor_node_id=sensor_node_id,
+                interface=interface, capture_session_id=capture_session_id,
+                time_start=time_start, time_end=time_end,
             )
             return result
         except ValueError as exc:
             raise ApiServiceError(400, "invalid_target", str(exc)) from exc
 
-    def lookup(self, ip: str, source: Optional[str], sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
+    def lookup(self, ip: str, source: Optional[str], sensor_node_id: Optional[str] = None,
+               interface: Optional[str] = None, capture_session_id: Optional[str] = None,
+               time_start: Optional[float] = None, time_end: Optional[float] = None) -> Dict[str, Any]:
         try:
             return IpLookupService(self.db).lookup(
                 ip, source=source, persist=True, sensor_node_id=sensor_node_id,
+                interface=interface, capture_session_id=capture_session_id,
+                time_start=time_start, time_end=time_end,
             )
         except ValueError as exc:
             raise ApiServiceError(400, "invalid_target", str(exc)) from exc
@@ -733,10 +848,13 @@ class WatchtowerApiService:
             raise ApiServiceError(409, "enrichment_rebuild_unavailable", str(exc)) from exc
 
     def endpoint_identities(self, source: Optional[str], interface: Optional[str], session: Optional[str],
-                            limit: int = 1000, sensor_node_id: Optional[str] = None) -> List[Dict[str, Any]]:
+                            limit: int = 1000, sensor_node_id: Optional[str] = None,
+                            target_ips: Optional[List[str]] = None, time_start: Optional[float] = None,
+                            time_end: Optional[float] = None) -> List[Dict[str, Any]]:
         return self.db.get_endpoint_identities(
             source=source, interface=interface, capture_session_id=session, limit=limit,
-            sensor_node_id=sensor_node_id,
+            sensor_node_id=sensor_node_id, target_ips=target_ips,
+            time_start=time_start, time_end=time_end,
         )
 
     def endpoint_telemetry_status(self, sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
@@ -747,8 +865,12 @@ class WatchtowerApiService:
         return result
 
     def endpoint_processes(self, ip: Optional[str] = None, sensor_node_id: Optional[str] = None,
-                           limit: int = 100) -> List[Dict[str, Any]]:
-        return self.db.get_endpoint_process_observations(ip=ip, sensor_node_id=sensor_node_id, limit=limit)
+                           limit: int = 100, time_start: Optional[float] = None,
+                           time_end: Optional[float] = None) -> List[Dict[str, Any]]:
+        return self.db.get_endpoint_process_observations(
+            ip=ip, sensor_node_id=sensor_node_id, limit=limit,
+            time_start=time_start, time_end=time_end,
+        )
 
     def mesh_status(self) -> Dict[str, Any]:
         result = self.mesh().status()
@@ -757,13 +879,29 @@ class WatchtowerApiService:
         return result
 
     def mesh_initialize(self, host: str = "127.0.0.1") -> Dict[str, Any]:
-        return self.mesh().initialize(host)
+        result = self.mesh().initialize(host)
+        return self._with_operation(
+            result,
+            operation_id=uuid.uuid4().hex,
+            summary="Mesh trust authority initialized",
+            effective_scope={"component": "mesh-controller"},
+            next_actions=("Review controller status and configure its advertised address.",),
+            state="initialized",
+        )
 
     def mesh_setup(self, mode: str, address: Optional[str], enrollment_port: int,
                    ingest_port: int, acknowledge_public_risk: bool) -> Dict[str, Any]:
         try:
-            return self.mesh().setup(
+            result = self.mesh().setup(
                 mode, address, enrollment_port, ingest_port, acknowledge_public_risk,
+            )
+            return self._with_operation(
+                result,
+                operation_id=uuid.uuid4().hex,
+                summary="Mesh controller configuration saved",
+                effective_scope={"component": "mesh-controller", "mode": mode},
+                next_actions=("Start the controller when ready to accept sensor connections.",),
+                state="configured",
             )
         except ValueError as exc:
             raise ApiServiceError(422, "mesh_setup_rejected", str(exc)) from exc
@@ -773,12 +911,20 @@ class WatchtowerApiService:
         runtime = MeshRuntimeManager(str(self.db.data_dir))
         try:
             if action == "start":
-                return runtime.start_controller()
-            if action == "stop":
-                return runtime.stop_controller()
-            if action == "restart":
-                return runtime.restart_controller()
-            raise ValueError("Unsupported mesh lifecycle action")
+                result = runtime.start_controller()
+            elif action == "stop":
+                result = runtime.stop_controller()
+            elif action == "restart":
+                result = runtime.restart_controller()
+            else:
+                raise ValueError("Unsupported mesh lifecycle action")
+            state = str(result.get("state") or result.get("status") or "unknown")
+            return self._with_operation(
+                result,
+                operation_id=str(result.get("operation_id") or result.get("pid") or uuid.uuid4()),
+                summary=f"Mesh controller {action} {state}",
+                effective_scope={"component": "mesh-controller"},
+            )
         except (RuntimeError, ValueError) as exc:
             raise ApiServiceError(409, "mesh_lifecycle_failed", str(exc)) from exc
 
@@ -786,10 +932,26 @@ class WatchtowerApiService:
         from core.mesh.runtime import MeshRuntimeManager
         if MeshRuntimeManager(str(self.db.data_dir)).controller_status().get("running"):
             raise ApiServiceError(409, "mesh_controller_running", "Stop the controller before rotating its listener certificate")
-        return self.mesh().rotate_certificate()
+        result = self.mesh().rotate_certificate()
+        return self._with_operation(
+            result,
+            operation_id=uuid.uuid4().hex,
+            summary="Mesh listener certificate rotated",
+            effective_scope={"component": "mesh-controller"},
+            next_actions=("Restart the controller to activate the rotated listener certificate.",),
+            state="rotated",
+        )
 
     def mesh_enrollment(self, name: Optional[str], ttl_seconds: int, max_uses: int) -> Dict[str, Any]:
-        return self.mesh().create_enrollment(name, ttl_seconds, max_uses)
+        result = self.mesh().create_enrollment(name, ttl_seconds, max_uses)
+        return self._with_operation(
+            result,
+            operation_id=str(result.get("id") or uuid.uuid4()),
+            summary="Mesh enrollment created",
+            effective_scope={"component": "mesh-enrollment"},
+            next_actions=("Use the enrollment code to join the intended sensor securely.",),
+            state="created",
+        )
 
     def mesh_nodes(self, limit: int = 100) -> List[Dict[str, Any]]:
         return self.db.list_sensor_nodes(limit)
@@ -814,7 +976,7 @@ class WatchtowerApiService:
             if status in {"revoked", "decommissioned"}:
                 readiness = "decommissioned"
             elif status == "local":
-                readiness = "ready"
+                readiness = "ready" if daemon.get("running") else "offline"
             elif not capabilities:
                 readiness = "capability_sync"
             elif not health.get("captured_at"):
@@ -823,9 +985,6 @@ class WatchtowerApiService:
                 readiness = "offline"
             else:
                 readiness = "ready"
-            if status == "local":
-                node["last_seen_at"] = now
-                health["captured_at"] = now
             nodes.append({
                 **node,
                 "readiness": readiness,
@@ -857,7 +1016,13 @@ class WatchtowerApiService:
     def mesh_revoke(self, node_id: str, reason: str) -> Dict[str, Any]:
         if not self.mesh().revoke(node_id, reason):
             raise ApiServiceError(404, "mesh_node_not_found", "Mesh node was not found")
-        return {"node_id": node_id, "status": "decommissioned", "historical_evidence_retained": True}
+        return self._with_operation(
+            {"node_id": node_id, "status": "decommissioned", "historical_evidence_retained": True},
+            operation_id=node_id,
+            summary="Mesh sensor decommissioned",
+            effective_scope={"node_id": node_id},
+            next_actions=("Review retained evidence and remove the sensor from any external inventory.",),
+        )
 
     def mesh_command(self, node_id: str, action: str, arguments: Dict[str, Any], ttl_seconds: int) -> Dict[str, Any]:
         try:
@@ -878,27 +1043,53 @@ class WatchtowerApiService:
             result.update(self.graph_worker.status())
         return result
 
-    def graph_neighborhood(self, ip: str, node: Optional[str], depth: int, limit: int) -> Dict[str, Any]:
+    def graph_neighborhood(self, ip: str, node: Optional[str], depth: int, limit: int,
+                           interface: Optional[str] = None, session: Optional[str] = None,
+                           start: Optional[float] = None, end: Optional[float] = None,
+                           target_ips: Optional[List[str]] = None) -> Dict[str, Any]:
         try:
-            return self.graph().neighborhood(ip, node, depth, limit)
+            return self.graph().neighborhood(ip, node, depth, limit, {
+                "node_id": node, "interface": interface, "session_id": session,
+                "time_start": start, "time_end": end, "target_ips": target_ips or [],
+            })
         except RuntimeError as exc:
             raise ApiServiceError(503, "evidence_graph_unavailable", str(exc), self.graph().status()) from exc
+        except ValueError as exc:
+            raise ApiServiceError(422, "invalid_scope", str(exc)) from exc
 
-    def graph_path(self, source_ip: str, target_ip: str, node: Optional[str]) -> Dict[str, Any]:
+    def graph_path(self, source_ip: str, target_ip: str, node: Optional[str],
+                   interface: Optional[str] = None, session: Optional[str] = None,
+                   start: Optional[float] = None, end: Optional[float] = None) -> Dict[str, Any]:
         try:
-            return self.graph().shortest_path(source_ip, target_ip, node)
+            return self.graph().shortest_path(source_ip, target_ip, node, {
+                "node_id": node, "interface": interface, "session_id": session,
+                "time_start": start, "time_end": end, "target_ips": [source_ip, target_ip],
+            })
         except RuntimeError as exc:
             raise ApiServiceError(503, "evidence_graph_unavailable", str(exc), self.graph().status()) from exc
+        except ValueError as exc:
+            raise ApiServiceError(422, "invalid_scope", str(exc)) from exc
 
-    def graph_timeline(self, ip: str, node: Optional[str], start: Optional[float], end: Optional[float], limit: int) -> Dict[str, Any]:
+    def graph_timeline(self, ip: str, node: Optional[str], start: Optional[float], end: Optional[float], limit: int,
+                       interface: Optional[str] = None, session: Optional[str] = None) -> Dict[str, Any]:
         try:
-            return self.graph().timeline(ip, node, start, end, limit)
+            return self.graph().timeline(ip, node, start, end, limit, {
+                "node_id": node, "interface": interface, "session_id": session, "target_ips": [ip],
+            })
         except RuntimeError as exc:
             raise ApiServiceError(503, "evidence_graph_unavailable", str(exc), self.graph().status()) from exc
+        except ValueError as exc:
+            raise ApiServiceError(422, "invalid_scope", str(exc)) from exc
 
-    def identity_status(self, source: Optional[str], interface: Optional[str], session: Optional[str]) -> Dict[str, Any]:
+    def identity_status(self, source: Optional[str], interface: Optional[str], session: Optional[str],
+                        sensor_node_id: Optional[str] = None, target_ips: Optional[List[str]] = None,
+                        time_start: Optional[float] = None, time_end: Optional[float] = None) -> Dict[str, Any]:
         from core.intelligence.reindex import EndpointIdentityReindexer
-        result = EndpointIdentityReindexer(self.db).status(source=source, interface=interface, session_id=session)
+        result = EndpointIdentityReindexer(self.db).status(
+            source=source, interface=interface, session_id=session,
+            sensor_node_id=sensor_node_id, target_ips=target_ips,
+            time_start=time_start, time_end=time_end,
+        )
         result["truth_model"] = {
             "confirmed": "A direct packet binding, DHCP lease, protocol identity, or approved live response",
             "probable": "Useful protocol/name/ownership evidence without a direct endpoint binding",
@@ -1005,13 +1196,19 @@ class WatchtowerApiService:
                 command = start_native_capture(self.db, interface, backend, source_type)
             except (RuntimeError, ValueError) as exc:
                 raise ApiServiceError(503, "native_sensor_unavailable", str(exc)) from exc
-            return {
+            result = {
                 "status": "queued",
                 "interface": interface,
                 "backend": backend,
                 "source_type": source_type,
                 "command": command,
             }
+            return self._with_operation(
+                result,
+                operation_id=str(command.get("id") or uuid.uuid4()),
+                summary="Capture start queued for the native sensor",
+                effective_scope={"interface": interface, "backend": backend, "source_type": source_type},
+            )
 
         if not self.daemon_status(force=True).get("running"):
             try:
@@ -1039,7 +1236,17 @@ class WatchtowerApiService:
                 # failed; health and the identity operation retain the reason.
                 return
         threading.Thread(target=confirm_pending_targets, name="watchtower-identity-confirm", daemon=True).start()
-        return result
+        return self._with_operation(
+            result,
+            operation_id=str(result.get("session_id") or uuid.uuid4()),
+            summary="Capture start accepted" if result.get("status") == "started" else "Capture start result",
+            effective_scope={
+                "interface": interface,
+                "backend": backend,
+                "source_type": source_type,
+                **({"session_id": result["session_id"]} if result.get("session_id") else {}),
+            },
+        )
 
     def stop_capture(self, interface: str) -> Dict[str, Any]:
         from core.mesh.hybrid import hybrid_enabled
@@ -1049,16 +1256,28 @@ class WatchtowerApiService:
                 commands = stop_native_capture(self.db, interface)
             except (RuntimeError, ValueError) as exc:
                 raise ApiServiceError(503, "native_sensor_unavailable", str(exc)) from exc
-            return {
+            result = {
                 "status": "draining" if commands else "not_running",
                 "interface": interface,
                 "commands": commands,
             }
+            command_id = next((str(item.get("id")) for item in commands if item.get("id")), None)
+            return self._with_operation(
+                result,
+                operation_id=command_id or uuid.uuid4().hex,
+                summary="Capture stop sent to the native sensor" if commands else "No active capture was found",
+                effective_scope={"interface": interface},
+            )
         result = self.daemon.stop_engine(interface)
         self._daemon_cache = (0.0, {"running": False})
         if result.get("status") == "error":
             raise ApiServiceError(503, "daemon_error", result.get("message") or "Capture stop failed", result)
-        return result
+        return self._with_operation(
+            result,
+            operation_id=str(result.get("session_id") or uuid.uuid4()),
+            summary="Capture stopped" if result.get("status") == "stopped" else "Capture stop result",
+            effective_scope={"interface": interface},
+        )
 
     def capture_session(self, session_id: str) -> Dict[str, Any]:
         if not hasattr(self.db, "get_capture_session"):
@@ -1127,19 +1346,39 @@ class WatchtowerApiService:
         item["processing_state"] = state
         item["complete"] = bool(item.get("complete") or state == "complete")
         item["completeness"] = "complete" if item["complete"] else state
+        operation_result = {**item, "status": state}
+        item["operation"] = OperationEnvelope.from_result(
+            operation_result,
+            operation_id=str(item.get("id") or "unknown"),
+            summary=f"Capture session {state.replace('_', ' ')}",
+            effective_scope={
+                key: item[key] for key in ("source", "interface", "node_id", "sensor_node_id")
+                if item.get(key)
+            } | ({"session_id": str(item["id"])} if item.get("id") else {}),
+        ).as_dict()
         return item
 
     def request_capture_stop(self, session_id: str, reason: str = "operator_stop") -> Dict[str, Any]:
         session = self.capture_session(session_id)
         if session["processing_state"] in {"complete", "partial", "failed", "cancelled"}:
-            return {"status": session["processing_state"], "session_id": session_id, "already_stopped": True}
+            return self._with_operation(
+                {"status": session["processing_state"], "session_id": session_id, "already_stopped": True},
+                operation_id=session_id,
+                summary=f"Capture session is already {session['processing_state']}",
+                effective_scope={"interface": session.get("interface"), "session_id": session_id},
+            )
         interface = session.get("interface") or session.get("device_id")
         if not interface:
             raise ApiServiceError(409, "capture_interface_unknown", "The session has no capture interface")
         with self._capture_stop_lock:
             existing = self._capture_stops.get(session_id)
             if existing and existing.get("state") == "draining":
-                return {"status": "draining", "session_id": session_id, "interface": interface}
+                return self._with_operation(
+                    {"status": "draining", "session_id": session_id, "interface": interface},
+                    operation_id=session_id,
+                    summary="Capture stop is already draining",
+                    effective_scope={"interface": interface, "session_id": session_id},
+                )
             self._capture_stops[session_id] = {"state": "draining", "interface": interface, "requested_at": time.time()}
         if hasattr(self.db, "update_capture_session_state"):
             self.db.update_capture_session_state(session_id, "draining", reason=reason)
@@ -1161,10 +1400,16 @@ class WatchtowerApiService:
                         "state": "failed", "error": "Native sensor has no active capture command", "finished_at": time.time(),
                     }
                 raise ApiServiceError(409, "native_capture_not_active", "The native sensor has no active capture on this interface")
-            return {
+            result = {
                 "status": "draining", "session_id": session_id, "interface": interface,
                 "reason": reason, "commands": commands,
             }
+            return self._with_operation(
+                result,
+                operation_id=session_id,
+                summary="Capture stop sent to the native sensor",
+                effective_scope={"interface": interface, "session_id": session_id},
+            )
 
         def drain_capture():
             try:
@@ -1179,7 +1424,12 @@ class WatchtowerApiService:
                 self._daemon_cache = (0.0, {"running": False})
 
         threading.Thread(target=drain_capture, name=f"capture-drain-{session_id[:8]}", daemon=True).start()
-        return {"status": "draining", "session_id": session_id, "interface": interface, "reason": reason}
+        return self._with_operation(
+            {"status": "draining", "session_id": session_id, "interface": interface, "reason": reason},
+            operation_id=session_id,
+            summary="Capture stop requested; evidence is draining",
+            effective_scope={"interface": interface, "session_id": session_id},
+        )
 
     def pipeline_health(self) -> Dict[str, Any]:
         daemon = self.daemon_status(force=True)
@@ -1244,27 +1494,77 @@ class WatchtowerApiService:
             },
         }
 
-    def run_hunt(self, source: Optional[str], interface: Optional[str], rule: Optional[str], persist: bool) -> Dict:
+    def run_hunt(self, source: Optional[str], interface: Optional[str], rule: Optional[str], persist: bool,
+                 capture_session_id: Optional[str] = None, time_start: Optional[float] = None,
+                 time_end: Optional[float] = None, sensor_node_id: Optional[str] = None) -> Dict:
         from core.forensics.sigma_engine import SigmaEngine
 
         engine = SigmaEngine(db=self.db)
-        matches = engine.run_hunt(source=source, interface=interface, specific_rule=rule, persist=persist)
+        report = engine.run_hunt_report(source=source, interface=interface, specific_rule=rule, persist=persist,
+                                        capture_session_id=capture_session_id, time_start=time_start,
+                                        time_end=time_end, sensor_node_id=sensor_node_id)
+        matches = report["alerts"]
         return {
             "matched": len(matches),
             "persisted": persist,
             "active_rules": len(engine.rules),
             "rejected_rules": len(engine.rejected),
+            "complete": report["complete"],
+            "limitations": report["limitations"],
+            "evaluated_flows": report["evaluated_flows"],
+            "evaluated_identity_observations": report["evaluated_identity_observations"],
+            "evaluated_rules": report.get("evaluated_rules", 0),
+            "coverage_status": report.get("coverage_status", "unknown"),
         }
 
-    def submit_pcap(self, path: str, filename: str, mode: str, backend: Optional[str]) -> Dict[str, Any]:
+    def submit_pcap(self, path: str, filename: str, mode: str, backend: Optional[str],
+                    keylog_path: Optional[str] = None) -> Dict[str, Any]:
         try:
-            backend = backend_policy.replay_backend(backend)
-            return self.jobs.submit(path, filename, mode, backend)
+            data_dir = getattr(getattr(self, "db", None), "data_dir", None)
+            runtime = CapabilityRegistry(data_dir=str(data_dir)).flags() if data_dir else None
+            backend = backend_policy.replay_backend(backend, runtime_capabilities=runtime)
+            submit = self.jobs.submit
+            if keylog_path:
+                parameters = inspect.signature(submit).parameters.values()
+                supports_keylog = any(
+                    parameter.name == "keylog_path" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                if not supports_keylog:
+                    raise ApiServiceError(
+                        422,
+                        "tls_keylog_unsupported",
+                        "The configured PCAP job manager does not support TLS keylog input.",
+                    )
+                result = submit(path, filename, mode, backend, keylog_path=keylog_path)
+            else:
+                result = submit(path, filename, mode, backend)
+            return self._with_operation(
+                result,
+                operation_id=str(result.get("id") or uuid.uuid4()),
+                summary="PCAP analysis queued",
+                effective_scope={"source": result.get("source"), "case_id": result.get("case_id")},
+            )
         except (BackendPolicyError, ValueError) as exc:
             raise ApiServiceError(422, "invalid_pcap_job", str(exc)) from exc
 
     def pcap_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        return self.jobs.list(limit)
+        results = self.jobs.list(limit)
+        return [self._pcap_job_operation(result) for result in results]
+
+    def _pcap_job_operation(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        job_id = str(result.get("id") or uuid.uuid4())
+        status = str(result.get("status") or "unknown").casefold()
+        summary = f"PCAP analysis {status.replace('_', ' ')}"
+        scope = {
+            key: result[key] for key in ("source", "case_id", "analysis_id") if result.get(key)
+        }
+        return self._with_operation(
+            result,
+            operation_id=job_id,
+            summary=summary,
+            effective_scope=scope,
+        )
 
     def pcap_cases(self, limit: int = 100) -> Dict[str, Any]:
         if not hasattr(self.db, "list_forensic_cases"):
@@ -1316,7 +1616,7 @@ class WatchtowerApiService:
         job = self.jobs.get(job_id)
         if not job:
             raise ApiServiceError(404, "pcap_job_not_found", f"PCAP analysis {job_id} was not found")
-        return job
+        return self._pcap_job_operation(job)
 
     def pcap_analysis(self, job_id: str) -> Dict[str, Any]:
         job = self.pcap_progress(job_id)
@@ -1706,7 +2006,7 @@ class WatchtowerApiService:
         if not job:
             raise ApiServiceError(404, "pcap_job_not_found", f"PCAP job {job_id} was not found")
         if not include_results or job["status"] not in {"complete", "partial", "cancelled"}:
-            return job
+            return self._pcap_job_operation(job)
 
         source = job["source"]
         flows = self.flows(source, None, None, None, None, None, 5000)
@@ -1725,7 +2025,7 @@ class WatchtowerApiService:
         total_ports = sum(port_counts.values()) or 1
         started_at = float(job.get("started_at") or job["created_at"])
         completed_at = float(job.get("completed_at") or time.time())
-        return {
+        return self._pcap_job_operation({
             **job,
             "duration_seconds": max(0.0, completed_at - started_at),
             "packet_count": sum(int(flow.get("packet_count") or 0) for flow in flows),
@@ -1743,13 +2043,13 @@ class WatchtowerApiService:
                 {"port": key, "service": "", "count": value, "percentage": round(value * 100 / total_ports, 1)}
                 for key, value in sorted(port_counts.items(), key=lambda item: item[1], reverse=True)
             ],
-        }
+        })
 
     def cancel_pcap(self, job_id: str) -> Dict[str, Any]:
         job = self.jobs.cancel(job_id)
         if not job:
             raise ApiServiceError(404, "pcap_job_not_found", f"PCAP job {job_id} was not found")
-        return job
+        return self._pcap_job_operation(job)
 
     def forensic_reports(self) -> List[Dict[str, Any]]:
         return self.db.get_reports()
@@ -1851,13 +2151,24 @@ class WatchtowerApiService:
     def ai_create_conversation(self, title: str, provider: str, scope: Dict[str, Any]) -> Dict[str, Any]:
         return self.ai.create_conversation(title, provider, self._ai_scope(scope))
 
+    def ai_branch_message(self, conversation_id: str, message_id: str, prompt: str,
+                          client_request_id: str, operator_session_id: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            return self.ai.branch_message(
+                conversation_id, message_id, prompt, client_request_id,
+                operator_session_id=operator_session_id, background=True,
+            )
+        except ValueError as exc:
+            raise ApiServiceError(409, "ai_branch_invalid", str(exc)) from exc
+
     def ai_delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         if not self.ai.delete_conversation(conversation_id):
             raise ApiServiceError(404, "ai_conversation_not_found", "AI conversation was not found")
         return {"status": "deleted", "conversation_id": conversation_id}
 
     def ai_start_run(self, prompt: str, conversation_id: Optional[str], provider: str, scope: Dict[str, Any],
-                     research_mode: str, operator_session_id: Optional[str] = None, mode: str = "auto") -> Dict[str, Any]:
+                     research_mode: str, operator_session_id: Optional[str] = None, mode: str = "auto",
+                     client_request_id: Optional[str] = None) -> Dict[str, Any]:
         try:
             return self.ai.start(
                 prompt,
@@ -1868,6 +2179,7 @@ class WatchtowerApiService:
                 background=True,
                 operator_session_id=operator_session_id,
                 mode=mode,
+                client_request_id=client_request_id,
             )
         except (ValueError, PermissionError) as exc:
             raise ApiServiceError(422, "ai_invalid_run", str(exc)) from exc
@@ -1877,6 +2189,20 @@ class WatchtowerApiService:
         if not result:
             raise ApiServiceError(404, "ai_run_not_found", "AI run was not found")
         return result
+
+    def ai_cancel(self, run_id: str) -> Dict[str, Any]:
+        try:
+            return self.ai.cancel(run_id)
+        except ValueError as exc:
+            raise ApiServiceError(404, "ai_run_not_found", str(exc)) from exc
+
+    def ai_retry(self, run_id: str, operator_session_id: Optional[str] = None) -> Dict[str, Any]:
+        if not self.ai.run(run_id):
+            raise ApiServiceError(404, "ai_run_not_found", "AI run was not found")
+        try:
+            return self.ai.retry(run_id, operator_session_id=operator_session_id)
+        except ValueError as exc:
+            raise ApiServiceError(409, "ai_run_not_retryable", str(exc)) from exc
 
     def ai_events(self, run_id: str, after: int = 0) -> List[Dict[str, Any]]:
         self.ai_run(run_id)
@@ -1953,6 +2279,18 @@ class WatchtowerApiService:
             "hardware": self.registry.list_sources(),
         }
 
+    def plugin_coverage(self) -> Dict[str, Any]:
+        from core.operations.coverage import build_coverage_matrix
+
+        inventory = self.plugin_inventory()
+        plugins = [*inventory.get("parsers", []), *inventory.get("detectors", [])]
+        data_dir = getattr(self.db, "data_dir", None)
+        capabilities = CapabilityRegistry(data_dir=str(data_dir) if data_dir else None).summary()
+        result = build_coverage_matrix(plugins, capabilities)
+        result["capabilities"] = capabilities
+        result["hardware"] = inventory.get("hardware", [])
+        return result
+
     @staticmethod
     def _calibration_error(exc: Exception) -> ApiServiceError:
         message = str(exc) or "Calibration operation failed"
@@ -1976,6 +2314,15 @@ class WatchtowerApiService:
             "backend_selection": report.get("backend_selection") or "",
             "passed": bool(report.get("passed")),
             "awarded_level": report.get("awarded_level") or "UNCALIBRATED",
+            "trust_basis": (
+                "bootstrap_corpus"
+                if (report.get("bootstrap_exception") or {}).get("exception_id")
+                else "field_evidence"
+                if report.get("awarded_level") == "FIELD_CALIBRATED"
+                else "corpus"
+                if report.get("awarded_level") == "CORPUS_VALIDATED"
+                else "uncalibrated"
+            ),
             "failures": list(report.get("failures") or []),
             "field_failures": list(report.get("field_failures") or []),
             "metrics": {key: metrics.get(key) for key in allowed_metrics if key in metrics},
@@ -2020,6 +2367,7 @@ class WatchtowerApiService:
 
     def plugin_calibration_status(self, detector_id: Optional[str] = None) -> Dict[str, Any]:
         from core.calibration.service import CalibrationError, CalibrationService
+        from core.operations.calibration_presentation import calibration_trust_basis, calibration_trust_label
 
         try:
             status = CalibrationService(data_dir=Path(getattr(self.db, "data_dir", context.data_dir))).status(detector_id)
@@ -2028,6 +2376,14 @@ class WatchtowerApiService:
         targets = []
         for target in status.get("targets") or []:
             item = dict(target)
+            item["trust_basis"] = calibration_trust_basis(
+                str(item.get("calibration_level") or "UNCALIBRATED"),
+                str(item.get("attestation_digest") or ""),
+                stale_reason=str(item.get("stale_reason") or ""),
+            )
+            item["trust_label"] = calibration_trust_label(
+                str(item.get("calibration_level") or "UNCALIBRATED"), item["trust_basis"],
+            )
             item.update(self._calibration_corpus_info(
                 str(item.get("detector_id") or ""),
                 str(item.get("finding_type") or ""),
@@ -2111,20 +2467,25 @@ class WatchtowerApiService:
 
     def plugin_calibration_verify(self) -> Dict[str, Any]:
         from core.calibration.service import CalibrationError, CalibrationService
+        from core.operations.calibration_presentation import annotate_calibration_verification
 
         try:
-            return CalibrationService(data_dir=Path(getattr(self.db, "data_dir", context.data_dir))).verify()
+            service = CalibrationService(data_dir=Path(getattr(self.db, "data_dir", context.data_dir)))
+            result = service.verify()
+            return annotate_calibration_verification(result, service.profile_path)
         except CalibrationError as exc:
             raise self._calibration_error(exc) from exc
 
     def scoring_findings(self, subject=None, source=None, interface=None, session=None,
-                         finding_type=None, include_suppressed=False, limit=250, sensor_node_id=None):
+                         finding_type=None, include_suppressed=False, limit=250, sensor_node_id=None,
+                         time_start=None, time_end=None, target_ips=None):
         if not hasattr(self.db, "get_detection_findings"):
             return []
         return self.db.get_detection_findings(
             subject=subject, source=source, interface=interface,
             capture_session_id=session, finding_type=finding_type,
             include_suppressed=include_suppressed, limit=limit, sensor_node_id=sensor_node_id,
+            time_start=time_start, time_end=time_end, target_ips=target_ips,
         )
 
     def scoring_status(self):
@@ -2249,16 +2610,38 @@ class WatchtowerApiService:
             "pipeline": self.pipeline_health(),
         }
 
-    def scoring_risk(self, subject, source=None, interface=None, session=None, explain=False, sensor_node_id=None):
+    def scoring_risk(self, subject, source=None, interface=None, session=None, explain=False, sensor_node_id=None,
+                     time_start=None, time_end=None, target_ips=None):
         from core.detection.operations import ScoringOperations
-        if not explain and hasattr(self.db, "get_risk_snapshot"):
+        scoped_explanation = explain and any((source, interface, session, sensor_node_id))
+        if scoped_explanation or time_start is not None or time_end is not None or target_ips:
+            targets = [str(value) for value in (target_ips or ()) if value]
+            if targets and str(subject) not in targets:
+                raise ValueError("risk subject is outside the selected target scope")
+            assessment = self.db.recompute_risk(
+                subject, source=source, interface=interface, capture_session_id=session,
+                asset_role=None, persist=False, sensor_node_id=sensor_node_id,
+                time_start=time_start, time_end=time_end, target_ips=targets or None,
+            )
+            limitations = list(assessment.get("limitations") or [])
+            limitations.append(
+                "The global endpoint role is excluded because it is not specific to the selected evidence scope."
+            )
+            assessment["limitations"] = limitations
+            assessment["baseline_maturity"] = {
+                "mature": False, "features": 0, "minimum_sample_count": 0, "last_update": 0.0,
+            }
+            return assessment
+        if not explain and time_start is None and time_end is None and not target_ips and hasattr(self.db, "get_risk_snapshot"):
             snapshot = self.db.get_risk_snapshot(subject, source, interface, session, sensor_node_id)
             if snapshot:
                 snapshot["baseline_maturity"] = ScoringOperations(self.db).explain(
                     subject, source, interface, session, persist=False, sensor_node_id=sensor_node_id,
                 )["baseline_maturity"]
                 return snapshot
-        return ScoringOperations(self.db).explain(subject, source, interface, session, persist=False, sensor_node_id=sensor_node_id)
+        return ScoringOperations(self.db).explain(
+            subject, source, interface, session, persist=False, sensor_node_id=sensor_node_id,
+        )
 
     def scoring_disposition(self, finding_id, verdict, reason, actor="local-analyst", scope="finding"):
         try:

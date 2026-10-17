@@ -46,6 +46,7 @@ class PluginLoader:
         self.detectors = []
         self.health = {}
         self._detector_ids = set()
+        self._scoring_config = None
         
         # Ensure plugins directories exist
         parsers_dir = os.path.join(self.plugins_dir, "parsers")
@@ -95,7 +96,9 @@ class PluginLoader:
                                     try:
                                         from core.detection.scoring import ScoringConfig
 
-                                        config = ScoringConfig()
+                                        if self._scoring_config is None:
+                                            self._scoring_config = ScoringConfig()
+                                        config = self._scoring_config
                                         for finding_type in manifest.finding_types:
                                             profile = config.profile_for(manifest.detector_id, finding_type, manifest.version)
                                             metrics = {}

@@ -2,11 +2,39 @@ from rich.console import Console
 
 import core.cli.modules.forensics as forensics_module
 from core.cli.modules.forensics import ForensicsModule
+from core.forensics.models import EntityProfile, ForensicReport
 from core.utils.network import format_endpoint, format_flow_id
 
 
 IPV6_SERVER = "2001:db8:4700:9c62:9add:dbe:5ff2:75c4"
 IPV6_CLIENT = "2001:db8:201:f01a:d86:ca66:eea:1f4e"
+
+
+def test_forensic_cli_does_not_present_username_as_full_name(monkeypatch):
+    report = ForensicReport(
+        summary={
+            "total_flows": 0,
+            "total_entities": 1,
+            "total_alerts": 0,
+            "high_risk_entities": 0,
+        },
+        entities={
+            "192.0.2.20": EntityProfile(
+                ip="192.0.2.20",
+                user="ftp://watchtower_test",
+                risk_score=1.0,
+            )
+        },
+    )
+    test_console = Console(width=120, color_system=None)
+    monkeypatch.setattr(forensics_module, "console", test_console)
+
+    with test_console.capture() as capture:
+        object.__new__(ForensicsModule)._render_report(report, 0.01)
+
+    output = capture.get()
+    assert "User Account: ftp://watchtower_test" in output
+    assert "Full Name: unknown" in output
 
 
 def test_ipv6_endpoint_and_flow_id_are_unambiguous():

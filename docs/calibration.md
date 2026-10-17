@@ -32,7 +32,10 @@ Corpus validation requires at least 10 positive and 30 benign labeled cases, at 
 ```text
 tower plugins calibration promote REPORT --reviewer NAME --reason TEXT
 tower plugins calibration verify
+tower plugins calibration verify --format json
 ```
+
+Verification prints a concise human summary by default; use `--format json` for automation. It is read-only and available before first-run authentication. Exit status `0` means attestations verify, `2` means one or more trust claims are invalid or stale, and `3` means verification could not run. A valid result does not promote uncalibrated findings.
 
 Promotion revalidates the report, records reviewer identity and reason, writes a content-addressed attestation, and updates the matching profile. Direct edits cannot establish trust. The scoring profile and its referenced attestation must be committed together.
 

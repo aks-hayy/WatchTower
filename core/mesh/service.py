@@ -18,12 +18,14 @@ from cryptography import x509
 from core.detection.contracts import DetectionFindingV2
 from core.mesh.contracts import MESH_PROTOCOL_VERSION, TelemetryEnvelope
 from core.mesh.security import MeshAuthority, certificate_fingerprint, token_hash
+from core.operations.envelope import OperationEnvelope
 
 
 ALLOWED_COMMANDS = {"capture.start", "capture.stop", "case.export"}
 MAX_CASE_BUNDLE_BYTES = 20 * 1024 * 1024
 MAX_CASE_BUNDLE_FILES = 128
 MAX_CASE_BUNDLE_EXPANDED_BYTES = 50 * 1024 * 1024
+MAX_MESH_CSR_BYTES = 16 * 1024
 JOIN_PACKAGE_VERSION = "watchtower.mesh.join.v1"
 
 
@@ -143,7 +145,13 @@ class MeshControllerService:
         csr_pem = str(request.get("csr_pem") or "").encode("utf-8")
         if not token or not node_id or not csr_pem or len(node_id) > 128:
             raise ValueError("Enrollment requires token, node_id, and CSR")
-        enrollment = self.db.consume_mesh_enrollment(token_hash(token))
+        if len(csr_pem) > MAX_MESH_CSR_BYTES:
+            raise ValueError("Enrollment CSR exceeds the 16 KiB limit")
+        enrollment_token_hash = token_hash(token)
+        if not self.db.mesh_enrollment_usable(enrollment_token_hash):
+            raise PermissionError("Enrollment token is invalid, expired, exhausted, or revoked")
+        self.authority.validate_csr(csr_pem)
+        enrollment = self.db.consume_mesh_enrollment(enrollment_token_hash)
         if not enrollment:
             raise PermissionError("Enrollment token is invalid, expired, exhausted, or revoked")
         certificate = self.authority.sign_csr(csr_pem, node_id)
@@ -315,10 +323,18 @@ class MeshControllerService:
             raise ValueError("Mesh node is unavailable")
         normalized = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"))
         key = idempotency_key or sha256(f"{node_id}:{action}:{normalized}".encode("utf-8")).hexdigest()
-        return self.db.queue_mesh_command(
+        result = self.db.queue_mesh_command(
             str(uuid.uuid4()), node_id, action, arguments or {}, time.time() + max(30, min(int(ttl_seconds), 3600)), key,
             requested_by,
         )
+        state = str(result.get("status") or "queued")
+        result["operation"] = OperationEnvelope.from_result(
+            result,
+            operation_id=str(result.get("id") or ""),
+            summary=f"{action} {state}",
+            effective_scope={"node_id": str(node_id)},
+        ).as_dict()
+        return result
 
     def revoke(self, node_id: str, reason: str) -> bool:
         return self.db.decommission_sensor_node(node_id, reason)

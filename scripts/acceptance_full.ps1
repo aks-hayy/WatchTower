@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("preflight", "source", "offline", "docker", "live", "ui-ai", "all")]
+    [ValidateSet("preflight", "source", "offline", "sigma", "docker", "live", "ui-ai", "all")]
     [string]$Stage = "all",
     [string]$OutputRoot = "",
     [switch]$Resume,
@@ -8,12 +8,16 @@ param(
     [string]$SysmonExecutable = "",
     [switch]$RestoreSysmon,
     [switch]$ExcludeSigmaE2E,
+    [string]$AuthorizedCaptureInterface = "",
+    [string]$AuthorizedCaptureIPv4 = "",
+    [switch]$RunAuthorizedLiveCapture,
     [switch]$FullPerformance
 )
 
 $ErrorActionPreference = "Stop"
 $IsWindowsHost = ($env:OS -eq "Windows_NT")
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot "acceptance_network_scope.ps1")
 $runName = "acceptance-full-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss'))-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $RunRoot = if ($OutputRoot) { [IO.Path]::GetFullPath($OutputRoot) } else { Join-Path $Root ".acceptance-$runName" }
 $LogRoot = Join-Path $RunRoot "logs"
@@ -39,7 +43,7 @@ $Results = [ordered]@{
     repository = $Root
     started_at = [DateTimeOffset]::UtcNow.ToString("o")
     scope = [ordered]@{
-        sigma_end_to_end = (-not $ExcludeSigmaE2E)
+        sigma_end_to_end = ((-not $ExcludeSigmaE2E) -and ($Stage -in @("sigma", "offline", "all")))
         isolated_state = $true
         self_addressed_injection_only = $true
     }
@@ -49,6 +53,7 @@ $Results = [ordered]@{
     measurements = @()
     blockers = @()
     warnings = @()
+    sigma = $null
 }
 
 if ($Resume -and (Test-Path -LiteralPath $StateFile)) {
@@ -128,6 +133,29 @@ function Resolve-Executable([string]$Name, [string[]]$Candidates = @()) {
     if (-not $command) { $command = $commands | Select-Object -First 1 }
     if ($command) { return $command.Source }
     return $null
+}
+
+function Resolve-NpcapSdk {
+    if ($env:NPCAP_SDK -and (Test-NpcapSdkPath -Path $env:NPCAP_SDK)) {
+        return (Resolve-Path -LiteralPath $env:NPCAP_SDK).Path
+    }
+
+    $pinnedSdk = Join-Path $Root ".deps\npcap-sdk-1.16"
+    if (Test-NpcapSdkPath -Path $pinnedSdk) { return (Resolve-Path -LiteralPath $pinnedSdk).Path }
+
+    $legacySdk = Join-Path $Root ".deps\NpcapSDK"
+    if (Test-NpcapSdkPath -Path $legacySdk) { return (Resolve-Path -LiteralPath $legacySdk).Path }
+
+    return $null
+}
+
+function Test-NpcapSdkPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $header = Join-Path $Path "Include\pcap.h"
+    $library = Join-Path $Path "Lib\x64\wpcap.lib"
+    return (Test-Path -LiteralPath $Path -PathType Container) -and
+        (Test-Path -LiteralPath $header -PathType Leaf) -and
+        (Test-Path -LiteralPath $library -PathType Leaf)
 }
 
 function Invoke-Step {
@@ -303,6 +331,8 @@ function Start-OllamaIfNeeded {
 function Start-DockerIfNeeded {
     $docker = Resolve-Executable "docker" @(
         (Join-Path $env:ProgramFiles "Docker\Docker\resources\bin\docker.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\resources\bin\docker.exe"),
+        (Join-Path $env:LOCALAPPDATA "Docker\Docker\resources\bin\docker.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\resources\bin\docker.exe")
     )
     if (-not $docker) {
@@ -315,7 +345,13 @@ function Start-DockerIfNeeded {
         return $docker
     }
     $desktop = Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
-    if (-not (Test-Path -LiteralPath $desktop)) { $desktop = Join-Path $env:LOCALAPPDATA "Programs\Docker Desktop\Docker Desktop.exe" }
+    $desktopCandidates = @(
+        $desktop,
+        (Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\Docker Desktop.exe"),
+        (Join-Path $env:LOCALAPPDATA "Docker\Docker\Docker Desktop.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Docker Desktop\Docker Desktop.exe")
+    )
+    $desktop = $desktopCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not (Test-Path -LiteralPath $desktop)) {
         Add-Check "docker_ready" "blocked" "Docker engine is stopped and Docker Desktop executable was not found." "docker"
         return $docker
@@ -347,6 +383,7 @@ function Invoke-Preflight {
         disk_free_bytes = if ($drive) { [int64]$drive.AvailableFreeSpace } else { $null }
     }
     $python = Resolve-Python
+    $npcapSdkPath = Resolve-NpcapSdk
     $cargo = Resolve-Executable "cargo"
     $node = Resolve-Executable "node"
     $npm = Resolve-Executable "npm"
@@ -356,17 +393,27 @@ function Invoke-Preflight {
         node = $node
         npm = $npm
         ollama = (Resolve-Executable "ollama" @((Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe")))
-        docker = (Resolve-Executable "docker" @((Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\resources\bin\docker.exe")))
+        docker = (Resolve-Executable "docker" @(
+            (Join-Path $env:ProgramFiles "Docker\Docker\resources\bin\docker.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Docker\Docker\resources\bin\docker.exe"),
+            (Join-Path $env:LOCALAPPDATA "Docker\Docker\resources\bin\docker.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\resources\bin\docker.exe")
+        ))
         sysmon = if ($SysmonExecutable) { $SysmonExecutable } else { (Resolve-Executable "Sysmon64.exe" @((Join-Path $env:USERPROFILE "Downloads\SYSMON\Sysmon64.exe"))) }
         npcap = Test-Path -LiteralPath "C:\Program Files\Npcap\npcap.sys"
-        npcap_sdk = Test-Path -LiteralPath (Join-Path $Root ".deps\NpcapSDK\Lib\x64\wpcap.lib")
+        npcap_sdk = [bool]$npcapSdkPath
+        npcap_sdk_path = $npcapSdkPath
     }
     Add-Check "source_tree_present" "passed" "Acceptance runner resolved repository root $Root." "preflight"
     if ($Results.machine.disk_free_bytes -and $Results.machine.disk_free_bytes -lt 20GB) {
         Add-Check "disk_headroom" "blocked" "At least 20 GiB free disk is required for the 1 GiB PCAP and Docker volumes." "preflight"
     } else { Add-Check "disk_headroom" "passed" "Sufficient disk headroom is available." "preflight" }
     if ($Results.tooling.npcap) { Add-Check "npcap_runtime" "passed" "Npcap runtime is installed." "preflight" } else { Add-Check "npcap_runtime" "blocked" "Npcap runtime is unavailable." "preflight" }
-    if ($Results.tooling.npcap_sdk) { Add-Check "npcap_sdk" "passed" "Npcap SDK is available in the ignored dependency directory." "preflight" } else { Add-Check "npcap_sdk" "blocked" "Npcap SDK is missing; Windows Rust build/live capture cannot be verified until it is installed." "preflight" }
+    if ($Results.tooling.npcap_sdk) {
+        Add-Check "npcap_sdk" "passed" "Npcap SDK is available at $npcapSdkPath." "preflight"
+    } else {
+        Add-Check "npcap_sdk" "blocked" "Npcap SDK is missing; Windows Rust build/live capture cannot be verified until it is installed." "preflight"
+    }
     if ($Results.tooling.sysmon -and (Test-Path -LiteralPath $Results.tooling.sysmon)) { Add-Check "sysmon_binary" "passed" "Sysmon resolved at $($Results.tooling.sysmon)." "preflight" } else { Add-Check "sysmon_binary" "blocked" "Sysmon was not found; pass -SysmonExecutable or put Sysmon64.exe on PATH." "preflight" }
     Save-Results
 }
@@ -395,13 +442,11 @@ function Invoke-Source {
     if ($Results.tooling.cargo) {
         $buildScript = Join-Path $Root "scripts\build_rust_sensor.ps1"
         if ($Results.tooling.npcap_sdk -and (Test-Path -LiteralPath $buildScript)) {
-            $previousNpcapSdk = $env:NPCAP_SDK
-            $env:NPCAP_SDK = (Resolve-Path (Join-Path $Root ".deps\NpcapSDK")).Path
-            try {
-                Invoke-Step "rust_tests_windows" "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $buildScript, "-Test") 1800 -StageName "source" | Out-Null
-            } finally {
-                $env:NPCAP_SDK = $previousNpcapSdk
-            }
+            $rustTestArguments = @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $buildScript,
+                "-NpcapSdk", $Results.tooling.npcap_sdk_path, "-Test"
+            )
+            Invoke-Step "rust_tests_windows" "powershell.exe" $rustTestArguments 1800 -StageName "source" | Out-Null
         } else {
             Add-Check "rust_tests_windows" "blocked" "Npcap SDK or the Windows Rust build wrapper is unavailable." "source"
         }
@@ -424,12 +469,52 @@ function Invoke-Offline {
     if (-not $python) { Add-Check "offline_python" "blocked" "Python unavailable." "offline"; return }
     $fixture = Join-Path $ArtifactRoot "acceptance-25MiB.pcap"
     Invoke-Step "generate_25m_pcap" $python @("scripts/generate_acceptance_pcaps.py", "--output", $fixture, "--size", "25MiB") 900 -StageName "offline" | Out-Null
+    Invoke-Step "offline_rust_cli_analysis" $python @("scripts/acceptance_offline.py", "--pcap", $fixture) 1800 -StageName "offline" | Out-Null
     Invoke-Step "forensics_tests" $python @("-m", "pytest", "tests/forensics", "-q") 3600 -StageName "offline" | Out-Null
     Invoke-Step "rust_parity_tests" $python @("-m", "pytest", "tests/forensics/test_rust_analysis_parity.py", "tests/forensics/test_rust_fast_analysis.py", "-q") 1800 -StageName "offline" | Out-Null
+    if ($ExcludeSigmaE2E) {
+        $Results.sigma = [ordered]@{ status = "not_applicable"; reason = "Excluded by -ExcludeSigmaE2E." }
+        Add-Check "sigma_e2e_result" "not_applicable" "Sigma end-to-end was explicitly excluded." "offline"
+    } else {
+        Invoke-Sigma "offline"
+    }
     Invoke-Step "pcap_25m_benchmark" $python @("scripts/benchmark_large_pcap.py", "--size-gib", "0.025", "--path", (Join-Path $ArtifactRoot "benchmark-25m.pcap")) 1800 -AllowFailure -StageName "offline" | Out-Null
     if ($FullPerformance) {
         Invoke-Step "pcap_1g_benchmark" $python @("scripts/benchmark_large_pcap.py", "--size-gib", "1.0", "--path", (Join-Path $ArtifactRoot "benchmark-1g.pcap")) 7200 -AllowFailure -StageName "offline" | Out-Null
     } else { Add-Check "pcap_1g_benchmark" "not_applicable" "Pass -FullPerformance to run the multi-gigabyte benchmark." "offline" }
+}
+
+function Invoke-Sigma([string]$StageName = "sigma") {
+    if ($ExcludeSigmaE2E) {
+        $Results.sigma = [ordered]@{ status = "not_applicable"; reason = "Excluded by -ExcludeSigmaE2E." }
+        Add-Check "sigma_e2e_result" "not_applicable" "Sigma end-to-end was explicitly excluded." $StageName
+        return
+    }
+    $python = if ($Results.tooling -and $Results.tooling.python) { $Results.tooling.python } else { Resolve-Python }
+    if (-not $python) {
+        $Results.sigma = [ordered]@{ status = "blocked"; reason = "Python unavailable." }
+        Add-Check "sigma_e2e_result" "blocked" "Python unavailable for the isolated Sigma engine check." $StageName
+        return
+    }
+    $script = Join-Path $Root "scripts\acceptance_sigma.py"
+    $step = Invoke-Step "sigma_e2e" $python @($script) 180 -StageName $StageName
+    if ($step.status -ne "passed") {
+        $Results.sigma = [ordered]@{ status = "failed"; reason = $step.detail }
+        return
+    }
+    try {
+        $summary = Get-Content -LiteralPath $step.stdout -Raw | ConvertFrom-Json
+        $valid = ($summary.status -eq "passed") -and
+            ($summary.match_count -eq 1) -and
+            ($summary.rule_id -eq "c92ab6e7-9d55-4f33-80f1-4ce91010f998") -and
+            ($summary.persisted_alert_count -eq 1)
+        if (-not $valid) { throw "Sigma summary did not meet the one-match, one-alert scoped acceptance contract." }
+        $Results.sigma = $summary
+        Add-Check "sigma_e2e_result" "passed" "Bundled Sigma rule matched one synthetic flow in the selected session and persisted exactly one alert." $StageName
+    } catch {
+        $Results.sigma = [ordered]@{ status = "failed"; reason = $_.Exception.Message }
+        Add-Check "sigma_e2e_result" "failed" $_.Exception.Message $StageName
+    }
 }
 
 function Invoke-DockerStage {
@@ -444,13 +529,99 @@ function Invoke-DockerStage {
 
 function Invoke-Live {
     if (-not $IsWindowsHost) { Add-Check "windows_live_capture" "not_applicable" "Windows native capture stage only." "live"; return }
-    if (-not (Test-Administrator)) { Add-Check "live_privilege" "blocked" "Raw packet injection and temporary Sysmon installation require an elevated PowerShell." "live"; return }
-    if (-not $Results.tooling.npcap_sdk) { Add-Check "live_rust_build" "blocked" "Npcap SDK is missing." "live"; return }
-    $sysmon = $Results.tooling.sysmon
-    if (-not $sysmon) { Add-Check "live_sysmon" "blocked" "Sysmon executable was not resolved." "live"; return }
-    Add-Check "live_capture_scope" "warning" "The runner must resolve a connected physical adapter immediately before capture; current preflight reports Wi-Fi connected and Ethernet disconnected." "live"
-    Add-Check "live_scenario_injection" "blocked" "Raw self-addressed injection is intentionally gated behind an elevated execution pass and is not run from the non-elevated harness." "live"
-    Add-Check "sysmon_installation" "blocked" "Sysmon installation/restoration is intentionally deferred until the runner is executed elevated with the explicit executable path." "live"
+    if ([string]::IsNullOrWhiteSpace($AuthorizedCaptureInterface) -or [string]::IsNullOrWhiteSpace($AuthorizedCaptureIPv4)) {
+        Add-Check "live_capture_scope" "blocked" "Pass -AuthorizedCaptureInterface and -AuthorizedCaptureIPv4 for the expressly approved adapter. No capture was started." "live"
+        return
+    }
+    try {
+        # Use the read-only .NET inventory instead of elevated NetAdapter/WMI
+        # cmdlets so scope diagnostics work in a non-elevated preflight too.
+        $networkInterface = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object { $_.Name -ceq $AuthorizedCaptureInterface } |
+            Select-Object -First 1
+        $adapter = if ($networkInterface) {
+            [pscustomobject]@{
+                Name = $networkInterface.Name
+                Id = $networkInterface.Id
+                InterfaceIndex = $networkInterface.Id
+                Status = $networkInterface.OperationalStatus.ToString()
+                NetworkInterfaceType = $networkInterface.NetworkInterfaceType.ToString()
+            }
+        } else { $null }
+        $addresses = if ($networkInterface) {
+            @($networkInterface.GetIPProperties().UnicastAddresses |
+                Where-Object { $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                ForEach-Object { [pscustomobject]@{ InterfaceId = $networkInterface.Id; IPAddress = $_.Address.ToString() } })
+        } else { @() }
+        $scope = Get-AcceptanceCaptureScope $adapter $addresses $AuthorizedCaptureInterface $AuthorizedCaptureIPv4
+    } catch {
+        $scope = [ordered]@{
+            status = "blocked"
+            detail = "Could not verify the approved physical capture adapter/address: $($_.Exception.Message). No capture was started."
+        }
+    }
+    if ($scope.status -ne "passed") {
+        Add-Check "live_capture_scope" "blocked" $scope.detail "live"
+        return
+    }
+    $Results.live_capture_scope = $scope
+    Add-Check "live_capture_scope" "passed" $scope.detail "live"
+    $captureGate = Get-AcceptanceLiveCaptureGate ($scope.status -eq "passed") ([bool]$RunAuthorizedLiveCapture)
+    if ($captureGate.status -ne "passed") {
+        Add-Check "live_capture_opt_in" "blocked" $captureGate.detail "live"
+        return
+    }
+    if (-not (Test-Administrator)) { Add-Check "live_privilege" "blocked" "Windows Rust capture requires an elevated PowerShell session. No capture was started." "live"; return }
+    if (-not $Results.tooling.npcap) { Add-Check "live_npcap_runtime" "blocked" "Npcap runtime is unavailable; Rust live capture cannot start." "live"; return }
+    if (-not $Results.tooling.python) { Add-Check "live_python" "blocked" "Python unavailable for the isolated Rust capture runner." "live"; return }
+
+    $daemonPortListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $daemonPortListener.Start()
+        $isolatedDaemonPort = ([Net.IPEndPoint]$daemonPortListener.LocalEndpoint).Port
+    } finally { $daemonPortListener.Stop() }
+    $previousHome = $env:WATCHTOWER_HOME
+    $previousDaemonPort = $env:WATCHTOWER_DAEMON_PORT
+    $previousLiveApproval = $env:WATCHTOWER_ACCEPTANCE_LIVE_APPROVED
+    $env:WATCHTOWER_HOME = Join-Path $AcceptanceTemp "watchtower-home"
+    $env:WATCHTOWER_DAEMON_PORT = [string]$isolatedDaemonPort
+    $env:WATCHTOWER_ACCEPTANCE_LIVE_APPROVED = "1"
+    try {
+        $runner = Join-Path $Root "scripts\acceptance_live.py"
+        Write-Host "Starting the isolated 30-minute Rust capture on $($scope.interface) ($($scope.ipv4)); WatchTower will stop and drain its own session." -ForegroundColor Cyan
+        $step = Invoke-Step "live_capture_run" $Results.tooling.python @(
+            $runner, "--interface", $scope.interface, "--ipv4", $scope.ipv4,
+            "--duration-seconds", "1800"
+        ) 3600 -AllowFailure -StageName "live"
+    } finally {
+        if ($null -eq $previousHome) { Remove-Item Env:\WATCHTOWER_HOME -ErrorAction SilentlyContinue }
+        else { $env:WATCHTOWER_HOME = $previousHome }
+        if ($null -eq $previousDaemonPort) { Remove-Item Env:\WATCHTOWER_DAEMON_PORT -ErrorAction SilentlyContinue }
+        else { $env:WATCHTOWER_DAEMON_PORT = $previousDaemonPort }
+        if ($null -eq $previousLiveApproval) { Remove-Item Env:\WATCHTOWER_ACCEPTANCE_LIVE_APPROVED -ErrorAction SilentlyContinue }
+        else { $env:WATCHTOWER_ACCEPTANCE_LIVE_APPROVED = $previousLiveApproval }
+    }
+
+    try {
+        $events = @(
+            Get-Content -LiteralPath $step.stdout |
+                ForEach-Object { try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { $null } } |
+                Where-Object { $_ -and $_.event -eq "complete" }
+        )
+        $summary = $events | Select-Object -Last 1
+        if (-not $summary) { throw "The Rust capture runner did not emit a final JSON result." }
+        $Results.live_capture = $summary
+        if ($step.exit_code -eq 0 -and $summary.status -eq "passed") {
+            Add-Check "live_capture_result" "passed" "Rust capture completed for $($summary.duration_seconds) seconds; session $($summary.session_id); processed $($summary.processed_packets) packets, dropped $($summary.dropped_packets)." "live"
+        } elseif ($summary.status -eq "blocked") {
+            Add-Check "live_capture_result" "blocked" ([string]$summary.error) "live"
+        } else {
+            Add-Check "live_capture_result" "failed" ([string]($summary.error ?? $summary.completion_reason ?? "Rust capture did not complete.")) "live"
+        }
+        Add-Check "sysmon_live_capture" "not_applicable" "Sysmon endpoint telemetry is a separate feature-path check and is not required to validate Rust packet capture." "live"
+    } catch {
+        Add-Check "live_capture_result" "failed" $_.Exception.Message "live"
+    }
 }
 
 function Invoke-UiAi {
@@ -473,7 +644,7 @@ function Invoke-Stage([string]$Name) {
     $Results.stages[$Name] = [ordered]@{ status = "running"; started_at = [DateTimeOffset]::UtcNow.ToString("o") }
     Save-Results
     try {
-        if ($Name -ne "preflight" -and -not $Results.Contains("tooling")) {
+        if ($Name -notin @("preflight", "sigma") -and -not $Results.Contains("tooling")) {
             Invoke-Preflight
         }
         if ($Name -ne "preflight") { Initialize-IsolatedAuth }
@@ -481,6 +652,7 @@ function Invoke-Stage([string]$Name) {
             "preflight" { Invoke-Preflight }
             "source" { Invoke-Source }
             "offline" { Invoke-Offline }
+            "sigma" { Invoke-Sigma "sigma" }
             "docker" { Invoke-DockerStage }
             "live" { Invoke-Live }
             "ui-ai" { Invoke-UiAi }

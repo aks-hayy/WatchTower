@@ -112,6 +112,7 @@ class CarvedFile(Base):
     data = Column(LargeBinary)
     source = Column(String, default="live")
     capture_session_id = Column(String, index=True)
+    capture_interface = Column(String, index=True)
     sensor_node_id = Column(String, index=True)
 
     entity = relationship("Entity", back_populates="carved_files")
@@ -694,6 +695,10 @@ class AIConversation(Base):
     created_at = Column(Float, nullable=False, index=True)
     updated_at = Column(Float, nullable=False, index=True)
     archived = Column(Boolean, nullable=False, default=False, index=True)
+    parent_conversation_id = Column(String, index=True)
+    branched_from_message_id = Column(String)
+    branch_request_id = Column(String)
+    branch_prompt_hash = Column(String)
 
 
 class AIMessage(Base):
@@ -714,6 +719,11 @@ class AIRun(Base):
     provider = Column(String, nullable=False)
     status = Column(String, nullable=False, index=True)
     prompt_hash = Column(String, nullable=False)
+    user_message_id = Column(String, ForeignKey("ai_messages.id", ondelete="SET NULL"), index=True)
+    client_request_id = Column(String, index=True)
+    parent_run_id = Column(String, index=True)
+    checkpoint_json = Column(Text, nullable=False, default="{}")
+    answer_json = Column(Text, nullable=False, default="{}")
     scope_json = Column(Text, nullable=False, default="{}")
     policy_json = Column(Text, nullable=False, default="{}")
     final_text = Column(Text)
@@ -732,6 +742,22 @@ class AIRun(Base):
     error = Column(Text)
     created_at = Column(Float, nullable=False, index=True)
     updated_at = Column(Float, nullable=False)
+
+
+class AIEvent(Base):
+    """Durable lifecycle event used for reconnect and restart recovery."""
+    __tablename__ = "ai_run_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String, ForeignKey("ai_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    sequence = Column(Integer, nullable=False)
+    kind = Column(String, nullable=False)
+    message = Column(Text, nullable=False)
+    timestamp = Column(Float, nullable=False, index=True)
+    detail_json = Column(Text, nullable=False, default="{}")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="_ai_run_event_sequence_uc"),
+    )
 
 
 class AIToolInvocation(Base):

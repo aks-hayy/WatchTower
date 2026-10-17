@@ -17,6 +17,10 @@ class HealthResponse(ApiModel):
     database: str
     daemon: str
     daemon_healthy: bool = False
+    capture_state: str = "unavailable"
+    capture_interface: Optional[str] = None
+    deployment_role: str = "native"
+    next_action: Optional[str] = None
 
 
 class CapabilityResponse(ApiModel):
@@ -158,6 +162,16 @@ class HuntRequest(ApiModel):
     interface: Optional[str] = None
     rule: Optional[str] = None
     persist: bool = True
+    capture_session_id: Optional[str] = None
+    time_start: Optional[float] = None
+    time_end: Optional[float] = None
+    sensor_node_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_time_window(self):
+        if self.time_start is not None and self.time_end is not None and self.time_start > self.time_end:
+            raise ValueError("time_start must be less than or equal to time_end")
+        return self
 
 
 class ResetRequest(ApiModel):
@@ -244,6 +258,12 @@ class AIConversationRequest(ApiModel):
     scope: AIScopeRequest = Field(default_factory=AIScopeRequest)
 
 
+class AIConversationBranchRequest(ApiModel):
+    message_id: str = Field(min_length=1, max_length=64)
+    prompt: str = Field(min_length=1, max_length=12000)
+    client_request_id: str = Field(min_length=1, max_length=128)
+
+
 class AIRunRequest(ApiModel):
     prompt: str = Field(min_length=1, max_length=12000)
     conversation_id: Optional[str] = Field(default=None, max_length=64)
@@ -251,6 +271,7 @@ class AIRunRequest(ApiModel):
     scope: AIScopeRequest = Field(default_factory=AIScopeRequest)
     research_mode: str = Field(default="auto", pattern="^(auto|off)$")
     mode: str = Field(default="auto", pattern="^(auto|general|investigate|action)$")
+    client_request_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class AIApprovalRequest(ApiModel):

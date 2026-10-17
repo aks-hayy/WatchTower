@@ -83,18 +83,31 @@ class IpLookupService:
         return value
 
     def lookup(self, ip: str, source: Optional[str] = None, persist: bool = True,
-               sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
+               sensor_node_id: Optional[str] = None, interface: Optional[str] = None,
+               capture_session_id: Optional[str] = None, time_start: Optional[float] = None,
+               time_end: Optional[float] = None) -> Dict[str, Any]:
         try:
             address = ip_address(ip)
         except ValueError as exc:
             raise ValueError(f"invalid IP address: {ip}") from exc
 
         scope, subnet = classify_ip(ip)
-        entity = self.db.get_entity(ip) or {"ip": ip}
+        scope_restricted = any(value is not None for value in (
+            source, sensor_node_id, interface, capture_session_id, time_start, time_end,
+        ))
+        entity = (self.db.get_entity(ip) if not scope_restricted else None) or {"ip": ip}
         effective_source = source or entity.get("source") or "live"
-        flow_kwargs = {"source": source, "limit": 5000}
-        alert_kwargs = {"entity_ip": ip, "source": source, "limit": 1000}
-        file_kwargs = {"entity_ip": ip, "source": source}
+        flow_kwargs = {"source": source, "limit": 5000, "interface": interface,
+                       "capture_session_id": capture_session_id, "time_start": time_start,
+                       "time_end": time_end}
+        alert_kwargs = {"entity_ip": ip, "source": source, "limit": 1000, "interface": interface,
+                        "capture_session_id": capture_session_id, "time_start": time_start,
+                        "time_end": time_end}
+        file_kwargs = {
+            "entity_ip": ip, "source": source, "interface": interface,
+            "capture_session_id": capture_session_id,
+            "time_start": time_start, "time_end": time_end,
+        }
         if sensor_node_id:
             flow_kwargs["sensor_node_id"] = sensor_node_id
             alert_kwargs["sensor_node_id"] = sensor_node_id
@@ -106,6 +119,8 @@ class IpLookupService:
         endpoint = evidence.endpoint(ip)
         profile = self.asset_profiler.build(
             ip, source=source, persist=persist, sensor_node_id=sensor_node_id,
+            interface=interface, capture_session_id=capture_session_id,
+            time_start=time_start, time_end=time_end,
         ).to_dict()
 
         is_local = scope in {"private", "loopback", "link-local", "multicast", "unspecified"} or bool(endpoint.get("is_local_endpoint"))
@@ -141,18 +156,37 @@ class IpLookupService:
         observed_names = self._observed_names(safe_entity, reverse_dns, profile, endpoint.get("names") or [])
         activity = self._activity(safe_entity, flows, alerts, files, profile)
         identity = self._identity(safe_entity, hostname, organization, company, device_type, reverse_dns)
-        endpoint_identity = (
-            self.db.get_endpoint_identity(ip, source=source, sensor_node_id=sensor_node_id)
-            if sensor_node_id and hasattr(self.db, "get_endpoint_identity")
-            else self.db.get_endpoint_identity(ip, source=source) if hasattr(self.db, "get_endpoint_identity") else None
-        )
-        if hasattr(self.db, "get_endpoint_process_observations"):
+        endpoint_identity = None
+        if hasattr(self.db, "get_endpoint_identity"):
+            endpoint_identity = self.db.get_endpoint_identity(
+                ip, source=source, interface=interface, capture_session_id=capture_session_id,
+                sensor_node_id=sensor_node_id, time_start=time_start, time_end=time_end,
+            )
+        process_scope_supported = not any((source, interface, capture_session_id))
+        if process_scope_supported and hasattr(self.db, "get_endpoint_process_observations"):
             process_kwargs = {"ip": ip, "limit": 25}
             if sensor_node_id:
                 process_kwargs["sensor_node_id"] = sensor_node_id
+            if time_start is not None:
+                process_kwargs["time_start"] = time_start
+            if time_end is not None:
+                process_kwargs["time_end"] = time_end
             endpoint_processes = self.db.get_endpoint_process_observations(**process_kwargs)
         else:
             endpoint_processes = []
+        scope_limitations = []
+        if scope_restricted:
+            scope_limitations.append(
+                "Global entity identity was excluded because it cannot be attributed to the selected capture scope."
+            )
+        if interface or capture_session_id:
+            scope_limitations.append(
+                "Endpoint process observations lack interface/session provenance and were excluded."
+            )
+        if interface or capture_session_id or time_start is not None or time_end is not None:
+            scope_limitations.append(
+                "Artifacts without matching interface, capture-session, and time provenance are excluded."
+            )
         enrichment = self._enrichment(scope, subnet, address.version, geo, reverse_dns, observed_names)
         enrichment["evidence_source"] = (
             "capture_flow_metadata" if captured_geo
@@ -219,6 +253,7 @@ class IpLookupService:
             },
             "location": location,
             "gaps": gaps,
+            "scope_limitations": scope_limitations,
             "next_actions": next_actions,
         }
 

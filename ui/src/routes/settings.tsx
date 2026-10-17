@@ -50,7 +50,9 @@ import {
   testProvider,
   type ProviderModel,
 } from "@/lib/providers";
+import { toolSupportLabel } from "@/lib/provider-capability";
 import { captureStartBackend, selectCaptureBackend } from "@/lib/capture-backend";
+import { describeServiceStatus } from "@/lib/service-status";
 import type {
   AIProviderStatus,
   HealthStatus,
@@ -399,6 +401,7 @@ function SettingsPage() {
   };
 
   const system = initial.system;
+  const servicePresentation = describeServiceStatus(health);
   return (
     <div className="min-h-screen">
       <header className="border-b border-border bg-surface/60">
@@ -406,9 +409,9 @@ function SettingsPage() {
           <span className="section-label section-label-accent">CFG</span>
           <span className="text-foreground">/ System Control</span>
           <span
-            className={`ml-auto ${health.daemon === "online" ? "text-ok" : "text-severity-high"}`}
+            className={`ml-auto ${servicePresentation.nativeDaemonApplicable ? (health.daemon === "online" ? "text-ok" : "text-severity-high") : "text-muted-foreground"}`}
           >
-            daemon {health.daemon}
+            {servicePresentation.nativeDaemonLabel}
           </span>
         </div>
       </header>
@@ -689,7 +692,7 @@ function SettingsPage() {
                       </option>
                       {(providerModels[provider.name] || []).map((model) => (
                         <option key={model.id} value={model.id}>
-                          {model.label}
+                          {`${model.label} (tool support: ${toolSupportLabel(model.supports_tools).toLowerCase()})`}
                         </option>
                       ))}
                     </select>
@@ -857,8 +860,12 @@ function SettingsPage() {
             </button>
           </div>
           {health.daemon !== "online" && (
-            <div className="border-b border-severity-high/30 bg-severity-high/10 px-4 py-2.5 mono text-[10px] uppercase text-severity-high">
-              Start the WatchTower daemon before controlling capture sources
+            <div
+              className={`border-b px-4 py-2.5 mono text-[10px] uppercase ${servicePresentation.nativeDaemonApplicable ? "border-severity-high/30 bg-severity-high/10 text-severity-high" : "border-signal/30 bg-signal/5 text-muted-foreground"}`}
+            >
+              {servicePresentation.nativeDaemonApplicable
+                ? "Start the WatchTower daemon before controlling capture sources"
+                : health.next_action || "Capture is controlled by enrolled native sensors."}
             </div>
           )}
           <div className="divide-y divide-border">

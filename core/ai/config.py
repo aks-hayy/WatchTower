@@ -44,19 +44,24 @@ class _EncryptedFileCredentialBackend:
 
     def _key(self) -> bytes:
         try:
-            raw = self.key_path.read_bytes().strip()
+            raw = self.key_path.read_bytes()
         except OSError as exc:
             raise CredentialStoreError(
                 f"WatchTower container credential key is unavailable at {self.key_path}"
             ) from exc
+        # A Docker secret may contain any 32-byte value, including bytes that
+        # look like whitespace. Preserve that binary form before normalizing
+        # the optional textual (base64) representation.
+        if len(raw) == 32:
+            return raw
+        raw = raw.strip()
         try:
-            decoded = base64.urlsafe_b64decode(raw + b"=" * (-len(raw) % 4))
+            decoded = base64.b64decode(raw + b"=" * (-len(raw) % 4), altchars=b"-_", validate=True)
         except (ValueError, TypeError) as exc:
             raise CredentialStoreError("Container credential key must be 32 raw or base64 bytes") from exc
-        key = raw if len(raw) == 32 else decoded
-        if len(key) != 32:
+        if len(decoded) != 32:
             raise CredentialStoreError("Container credential key must contain exactly 32 bytes")
-        return key
+        return decoded
 
     def _read(self) -> dict[str, str]:
         if not self.vault_path.exists():

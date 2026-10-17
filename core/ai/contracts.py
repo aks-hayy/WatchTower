@@ -4,6 +4,8 @@ import json
 from typing import Any, Dict, List, Optional
 import uuid
 
+from core.operations.scope import EffectiveScope
+
 
 @dataclass(frozen=True)
 class EvidenceCitation:
@@ -67,7 +69,8 @@ class ScopedContext:
     max_records: int = 500
 
     def has_scope(self) -> bool:
-        return bool(self.source or self.interface or self.session_id or self.node_id or self.case_id or self.target_ips)
+        return bool(self.source or self.interface or self.session_id or self.node_id or self.case_id or
+                    self.target_ips or self.time_start is not None or self.time_end is not None)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -85,15 +88,16 @@ class ScopedContext:
     @classmethod
     def from_dict(cls, value: Optional[Dict[str, Any]]) -> "ScopedContext":
         value = value or {}
+        effective = EffectiveScope.from_dict(value)
         return cls(
-            source=value.get("source"),
-            interface=value.get("interface"),
-            session_id=value.get("session_id"),
-            node_id=value.get("node_id"),
-            time_start=float(value["time_start"]) if value.get("time_start") is not None else None,
-            time_end=float(value["time_end"]) if value.get("time_end") is not None else None,
+            source=effective.source,
+            interface=effective.interface,
+            session_id=effective.session_id,
+            node_id=effective.node_id,
+            time_start=effective.time_start,
+            time_end=effective.time_end,
             case_id=value.get("case_id"),
-            target_ips=tuple(str(item) for item in value.get("target_ips", ()) if item),
+            target_ips=effective.target_ips,
             max_records=max(1, min(int(value.get("max_records", 500)), 500)),
         )
 
@@ -126,6 +130,10 @@ class ToolManifest:
             "summary": {"type": "string"},
             "redacted": {"type": "boolean"},
             "facts": {"type": "array"},
+            "effective_scope": {"type": "object"},
+            "complete": {"type": "boolean"},
+            "total": {"type": ["integer", "null"]},
+            "limitations": {"type": "array", "items": {"type": "string"}},
         },
     })
     risk_tier: str = "read"
@@ -152,6 +160,10 @@ class ToolResult:
     summary: str = ""
     redacted: bool = True
     facts: List[EvidenceFact] = field(default_factory=list)
+    effective_scope: Dict[str, Any] = field(default_factory=dict)
+    complete: bool = True
+    total: Optional[int] = None
+    limitations: List[str] = field(default_factory=list)
 
 
 @dataclass

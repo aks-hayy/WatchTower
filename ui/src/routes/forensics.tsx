@@ -425,6 +425,11 @@ function AnalysisWorkspace({
       </div>
       {!isTerminal && (
         <div className="border border-border bg-background p-4">
+          {analysis.operation && (
+            <div className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
+              {analysis.operation.summary} — {analysis.operation.next_actions[0]}
+            </div>
+          )}
           <div className="flex items-center justify-between mono text-[10px] uppercase text-muted-foreground">
             <span>
               {formatBytes(analysis.bytes_processed)} of {formatBytes(analysis.file_size)}
@@ -446,6 +451,11 @@ function AnalysisWorkspace({
             Processing ended as {analysis.status}. Conclusions are explicitly partial.{" "}
             {analysis.error || ""}
           </span>
+        </div>
+      )}
+      {isTerminal && analysis.operation && analysis.operation.next_actions.length > 0 && (
+        <div className="border border-border bg-surface px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+          {analysis.operation.summary}. {analysis.operation.next_actions[0]}
         </div>
       )}
       <div className="flex overflow-x-auto border-b border-border">

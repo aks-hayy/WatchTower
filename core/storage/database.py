@@ -27,7 +27,7 @@ from core.storage.models import (
     BehavioralBaseline, InvestigationStep, AIUserFeedback,
     DetectionFinding, FindingWindow, RiskSnapshot, FeatureBaseline,
     AnalystDisposition, ScoringModel, SchemaMigration, AIConversation, AIMessage,
-    AIRun, AIToolInvocation, AIApproval, AICitation, AIResearchDocument, AIEvidenceFact,
+    AIRun, AIEvent, AIToolInvocation, AIApproval, AICitation, AIResearchDocument, AIEvidenceFact,
     OperatorAccount, OperatorCredential, OperatorSession, OperatorChallenge,
     SecurityAuditEvent, ServicePrincipal, AIPrivateScopeConsent, AIProviderModelCache, PcapAnalysisJob,
 )
@@ -44,6 +44,25 @@ _database_scope = ContextVar("watchtower_database_scope", default=None)
 def _live_source_clause(column):
     """Match local and mesh-prefixed live capture sources."""
     return or_(column.like("live%"), column.like("mesh:%:live%"))
+
+
+def _apply_time_window(query, first_seen, last_seen, time_start=None, time_end=None):
+    """Filter interval records to known overlap with an explicit time window.
+
+    A missing bound is usable only when the available bound proves overlap;
+    completely or ambiguously undated records must not widen a scoped query.
+    """
+    if time_start is not None:
+        query = query.filter(or_(
+            last_seen >= float(time_start),
+            and_(last_seen.is_(None), first_seen >= float(time_start)),
+        ))
+    if time_end is not None:
+        query = query.filter(or_(
+            first_seen <= float(time_end),
+            and_(first_seen.is_(None), last_seen <= float(time_end)),
+        ))
+    return query
 
 
 def _session_scope_key():
@@ -158,6 +177,13 @@ class WatchtowerDB:
         self._ensure_column_exists("alerts", "suppression_reason", "TEXT")
         self._ensure_column_exists("alerts", "policy_context", "TEXT")
         self._ensure_column_exists("ai_approvals", "requester", "TEXT DEFAULT 'local-operator'")
+        self._ensure_column_exists("ai_conversations", "parent_conversation_id", "TEXT")
+        self._ensure_column_exists("ai_conversations", "branched_from_message_id", "TEXT")
+        self._ensure_column_exists("ai_conversations", "branch_request_id", "TEXT")
+        self._ensure_column_exists("ai_conversations", "branch_prompt_hash", "TEXT")
+        self._ensure_unique_index(
+            "ai_conversations", "idx_ai_conversation_branch_request_unique", ["branch_request_id"],
+        )
         for table in ("alerts", "flows"):
             self._ensure_column_exists(table, "capture_session_id", "TEXT")
             self._ensure_column_exists(table, "capture_interface", "TEXT")
@@ -171,6 +197,11 @@ class WatchtowerDB:
         self._ensure_column_exists("endpoint_identities", "next_action", "TEXT")
         self._ensure_column_exists("endpoint_identities", "observation_count", "INTEGER DEFAULT 0")
         for column, col_type in {
+            "user_message_id": "TEXT",
+            "client_request_id": "TEXT",
+            "parent_run_id": "TEXT",
+            "checkpoint_json": "TEXT DEFAULT '{}'",
+            "answer_json": "TEXT DEFAULT '{}'",
             "analyst_version": "TEXT DEFAULT 'agentic-v2'",
             "rounds": "INTEGER DEFAULT 0",
             "tool_call_count": "INTEGER DEFAULT 0",
@@ -197,6 +228,7 @@ class WatchtowerDB:
         self._ensure_column_exists("detection_findings", "sensor_node_id", "TEXT")
         self._ensure_column_exists("risk_snapshots", "sensor_node_id", "TEXT")
         self._ensure_column_exists("carved_files", "capture_session_id", "TEXT")
+        self._ensure_column_exists("carved_files", "capture_interface", "TEXT")
         self._ensure_column_exists("carved_files", "sensor_node_id", "TEXT")
         self._ensure_column_exists("forensic_reports", "status", "TEXT DEFAULT 'RUNNING'")
         self._ensure_column_exists("forensic_reports", "analysis_mode", "TEXT DEFAULT 'memory'")
@@ -313,6 +345,7 @@ class WatchtowerDB:
         self._record_schema_migration("identity-v2-002", "identity-observation-ledger-and-truth-states")
         self._record_schema_migration("ai-v2-002", "bounded-iterative-evidence-runs")
         self._record_schema_migration("ai-v2-003", "scoped-modes-native-transcripts-and-claim-validation")
+        self._record_schema_migration("ai-v2-004", "idempotent-conversation-edit-branches-with-origin-lineage")
         self._record_schema_migration("endpoint-v1-001", "durable-sysmon-process-service-observations")
         self._record_schema_migration("mesh-v1-001", "sensor-nodes-enrollment-idempotent-telemetry-and-commands")
         self._record_schema_migration("graph-v1-001", "durable-neo4j-evidence-graph-outbox")
@@ -909,6 +942,81 @@ class WatchtowerDB:
         finally:
             self.Session.remove()
 
+    def update_ai_conversation_scope(self, conversation_id: str, scope: Dict) -> Optional[Dict]:
+        """Persist the operator's latest explicit scope for future conversation turns."""
+        session = self._get_session()
+        try:
+            row = session.query(AIConversation).filter_by(id=conversation_id).first()
+            if not row:
+                return None
+            row.scope_json = json.dumps(scope or {}, sort_keys=True)
+            row.updated_at = time.time()
+            session.commit()
+            return self._row_dict(row)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self.Session.remove()
+
+    def branch_ai_conversation(self, parent_conversation_id: str, message_id: str, revised_content: str,
+                               branch_request_id: str) -> Dict:
+        """Create an idempotent child transcript ending immediately before an edited user turn."""
+        session = self._get_session()
+        try:
+            existing = session.query(AIConversation).filter_by(branch_request_id=branch_request_id).first()
+            if existing:
+                if (existing.parent_conversation_id != parent_conversation_id
+                        or existing.branched_from_message_id != message_id
+                        or existing.branch_prompt_hash != sha256(revised_content.encode("utf-8")).hexdigest()):
+                    raise ValueError("Branch request ID was already used for a different edit")
+                return self.get_ai_conversation(existing.id)
+
+            parent = session.query(AIConversation).filter_by(id=parent_conversation_id).first()
+            if not parent:
+                raise ValueError("AI conversation was not found")
+            messages = (session.query(AIMessage)
+                        .filter_by(conversation_id=parent_conversation_id)
+                        .order_by(AIMessage.created_at.asc(), AIMessage.id.asc()).all())
+            target_index = next((index for index, item in enumerate(messages) if item.id == message_id), None)
+            if target_index is None or messages[target_index].role != "user":
+                raise ValueError("Only an existing user message can be edited into a branch")
+
+            child_id = str(uuid.uuid4())
+            now = time.time()
+            child = AIConversation(
+                id=child_id,
+                title=(revised_content or "New investigation")[:96],
+                provider=parent.provider,
+                scope_json=parent.scope_json,
+                created_at=now,
+                updated_at=now,
+                parent_conversation_id=parent_conversation_id,
+                branched_from_message_id=message_id,
+                branch_request_id=branch_request_id,
+                branch_prompt_hash=sha256(revised_content.encode("utf-8")).hexdigest(),
+            )
+            session.add(child)
+            for original in messages[:target_index]:
+                session.add(AIMessage(
+                    id=str(uuid.uuid4()), conversation_id=child_id, run_id=original.run_id,
+                    role=original.role, content=original.content,
+                    citations_json=original.citations_json, created_at=original.created_at,
+                ))
+            session.commit()
+            return self.get_ai_conversation(child_id)
+        except IntegrityError:
+            session.rollback()
+            existing = session.query(AIConversation).filter_by(branch_request_id=branch_request_id).first()
+            if existing:
+                return self.get_ai_conversation(existing.id)
+            raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self.Session.remove()
+
     def list_ai_conversations(self, limit: int = 100, include_archived: bool = False) -> List[Dict]:
         session = self._get_session()
         try:
@@ -926,9 +1034,12 @@ class WatchtowerDB:
             if not row:
                 return None
             result = self._row_dict(row)
+            result.pop("branch_request_id", None)
+            result.pop("branch_prompt_hash", None)
             result["scope"] = json.loads(result.pop("scope_json") or "{}")
             if include_messages:
-                messages = session.query(AIMessage).filter_by(conversation_id=conversation_id).order_by(AIMessage.created_at.asc()).all()
+                messages = (session.query(AIMessage).filter_by(conversation_id=conversation_id)
+                            .order_by(AIMessage.created_at.asc(), AIMessage.id.asc()).all())
                 result["messages"] = [self._row_dict(item) for item in messages]
                 for item in result["messages"]:
                     item["citations"] = json.loads(item.pop("citations_json") or "[]")
@@ -947,6 +1058,7 @@ class WatchtowerDB:
                 invocation_ids = [item[0] for item in session.query(AIToolInvocation.id)
                                   .filter(AIToolInvocation.run_id.in_(run_ids)).all()]
                 session.query(AICitation).filter(AICitation.run_id.in_(run_ids)).delete(synchronize_session=False)
+                session.query(AIEvent).filter(AIEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
                 session.query(AIApproval).filter(AIApproval.run_id.in_(run_ids)).delete(synchronize_session=False)
                 if invocation_ids:
                     session.query(AIApproval).filter(AIApproval.invocation_id.in_(invocation_ids)).delete(synchronize_session=False)
@@ -980,12 +1092,15 @@ class WatchtowerDB:
             self.Session.remove()
 
     def create_ai_run(self, run_id: str, conversation_id: str, provider: str, prompt_hash: str,
-                      scope: Dict, policy: Dict) -> Dict:
+                      scope: Dict, policy: Dict, user_message_id: str = None,
+                      client_request_id: str = None, parent_run_id: str = None) -> Dict:
         session = self._get_session()
         now = time.time()
         try:
             row = AIRun(id=run_id, conversation_id=conversation_id, provider=provider, status="QUEUED",
                         prompt_hash=prompt_hash, scope_json=json.dumps(scope or {}, sort_keys=True),
+                        user_message_id=user_message_id, client_request_id=client_request_id,
+                        parent_run_id=parent_run_id, checkpoint_json="{}",
                         policy_json=json.dumps(policy or {}, sort_keys=True), mode=str((policy or {}).get("mode") or "investigate"),
                         created_at=now, updated_at=now)
             session.add(row)
@@ -997,8 +1112,112 @@ class WatchtowerDB:
         finally:
             self.Session.remove()
 
+    def get_ai_run_by_client_request_id(self, client_request_id: str) -> Optional[Dict]:
+        if not client_request_id:
+            return None
+        session = self._get_session()
+        try:
+            row = session.query(AIRun).filter_by(client_request_id=client_request_id).order_by(AIRun.created_at.desc()).first()
+            return self._row_dict(row) if row else None
+        finally:
+            self.Session.remove()
+
+    def append_ai_event(self, run_id: str, kind: str, message: str, detail: Dict = None) -> Dict:
+        """Append one durable event and allocate its sequence in the database."""
+        session = self._get_session()
+        try:
+            current = session.query(func.max(AIEvent.sequence)).filter(AIEvent.run_id == run_id).scalar()
+            row = AIEvent(
+                run_id=run_id,
+                sequence=int(current or 0) + 1,
+                kind=str(kind),
+                message=str(message),
+                timestamp=time.time(),
+                detail_json=json.dumps(detail or {}, sort_keys=True, default=str),
+            )
+            session.add(row)
+            session.commit()
+            item = self._row_dict(row)
+            item["detail"] = self._json_field(item.pop("detail_json", None), {})
+            return item
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self.Session.remove()
+
+    def list_ai_events(self, run_id: str, after: int = 0, limit: int = 200) -> List[Dict]:
+        """Return the latest bounded event window after a reconnect cursor."""
+        session = self._get_session()
+        try:
+            query = session.query(AIEvent).filter(
+                AIEvent.run_id == run_id,
+                AIEvent.sequence > int(after),
+            ).order_by(AIEvent.sequence.asc())
+            rows = query.all()
+            if len(rows) > int(limit):
+                rows = rows[-int(limit):]
+            result = []
+            for row in rows:
+                item = self._row_dict(row)
+                item["detail"] = self._json_field(item.pop("detail_json", None), {})
+                result.append(item)
+            return result
+        finally:
+            self.Session.remove()
+
+    def interrupt_abandoned_ai_runs(self) -> List[str]:
+        """Mark work owned by a previous process as interrupted, never replay it."""
+        session = self._get_session()
+        try:
+            rows = session.query(AIRun).filter(
+                AIRun.status.in_(("QUEUED", "RUNNING", "AWAITING_APPROVAL")),
+            ).all()
+            ids = [str(row.id) for row in rows]
+            if ids:
+                now = time.time()
+                for row in rows:
+                    row.status = "INTERRUPTED"
+                    row.error = "The previous WatchTower process stopped before this run completed. Retry explicitly to continue."
+                    row.updated_at = now
+                pending_approvals = session.query(AIApproval).filter(
+                    AIApproval.run_id.in_(ids), AIApproval.status == "PENDING",
+                ).all()
+                for approval in pending_approvals:
+                    result = {"reason": "run interrupted by process shutdown; approval invalidated"}
+                    result_json = json.dumps(result, sort_keys=True)
+                    approval.status = "CANCELLED"
+                    approval.resolved_at = now
+                    approval.result_json = result_json
+                    invocation = session.query(AIToolInvocation).filter_by(id=approval.invocation_id).first()
+                    if invocation and invocation.status == "AWAITING_APPROVAL":
+                        invocation.status = "CANCELLED"
+                        invocation.result_json = result_json
+                        invocation.result_hash = sha256(result_json.encode("utf-8")).hexdigest()
+                        invocation.updated_at = now
+                session.commit()
+            return ids
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            self.Session.remove()
+
+    def get_active_ai_run(self, conversation_id: str) -> Optional[Dict]:
+        if not conversation_id:
+            return None
+        session = self._get_session()
+        try:
+            row = session.query(AIRun).filter(
+                AIRun.conversation_id == conversation_id,
+                AIRun.status.in_(("QUEUED", "RUNNING", "AWAITING_APPROVAL")),
+            ).order_by(AIRun.created_at.desc()).first()
+            return self._row_dict(row) if row else None
+        finally:
+            self.Session.remove()
+
     def update_ai_run(self, run_id: str, status: str, final_text: str = None, error: str = None,
-                      metrics: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
+                      metrics: Optional[Dict[str, Any]] = None, answer: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
         session = self._get_session()
         try:
             row = session.query(AIRun).filter_by(id=run_id).first()
@@ -1009,6 +1228,8 @@ class WatchtowerDB:
                 row.final_text = final_text
             if error is not None:
                 row.error = error
+            if answer is not None:
+                row.answer_json = json.dumps(answer, sort_keys=True, default=str)
             for field in ("analyst_version", "rounds", "tool_call_count", "redundant_tool_calls", "context_chars", "citation_coverage",
                           "mode", "validation_status", "supported_claims", "inferred_claims", "blocked_claims", "numeric_accuracy"):
                 if metrics and field in metrics and hasattr(row, field):
@@ -1030,6 +1251,10 @@ class WatchtowerDB:
             result = self._row_dict(row)
             result["scope"] = json.loads(result.pop("scope_json") or "{}")
             result["policy"] = json.loads(result.pop("policy_json") or "{}")
+            try:
+                result["answer"] = json.loads(result.pop("answer_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result["answer"] = {}
             result["tool_calls"] = [self._row_dict(item) for item in session.query(AIToolInvocation).filter_by(run_id=run_id).order_by(AIToolInvocation.created_at.asc()).all()]
             result["approvals"] = [self._row_dict(item) for item in session.query(AIApproval).filter_by(run_id=run_id).all()]
             result["citations"] = [self._row_dict(item) for item in session.query(AICitation).filter_by(run_id=run_id).all()]
@@ -1426,26 +1651,74 @@ class WatchtowerDB:
             return result
         return None
 
-    def get_all_entities(self, source: str = None) -> List[Dict]:
-        """Get all entities, optionally filtered by source, with counts."""
+    def get_all_entities(self, source: str = None, interface: str = None,
+                         capture_session_id: str = None, time_start: float = None,
+                         time_end: float = None, sensor_node_id: str = None,
+                         target_ips: List[str] = None) -> List[Dict]:
+        """Get entities and counts using the same evidence scope as flow queries."""
         session = self._get_session()
         
         # Optimized query to get entities + alert counts + carved file counts in one go
         from sqlalchemy import select, func, outerjoin
         
-        # Subqueries for counts
-        alert_counts = session.query(
-            Alert.entity_ip, func.count(Alert.id).label("alert_count")
-        ).group_by(Alert.entity_ip).subquery()
-        
-        carved_counts = session.query(
-            CarvedFile.entity_ip, func.count(CarvedFile.id).label("carved_count")
-        ).group_by(CarvedFile.entity_ip).subquery()
+        targets = [str(item) for item in (target_ips or ()) if str(item)]
 
-        flow_endpoints = session.query(
+        def scoped_flow(query):
+            if source:
+                query = query.filter(_live_source_clause(Flow.source) if source == "live" else Flow.source == source)
+            if interface:
+                query = query.filter(Flow.capture_interface == interface)
+            if capture_session_id:
+                query = query.filter(Flow.capture_session_id == capture_session_id)
+            if sensor_node_id:
+                query = query.filter(Flow.sensor_node_id == sensor_node_id)
+            query = _apply_time_window(query, Flow.start_time, Flow.last_seen, time_start, time_end)
+            if targets:
+                query = query.filter(or_(Flow.src_ip.in_(targets), Flow.dst_ip.in_(targets)))
+            return query
+
+        def scoped_alert(query):
+            if source:
+                query = query.filter(_live_source_clause(Alert.source) if source == "live" else Alert.source == source)
+            if interface:
+                query = query.filter(Alert.capture_interface == interface)
+            if capture_session_id:
+                query = query.filter(Alert.capture_session_id == capture_session_id)
+            if sensor_node_id:
+                query = query.filter(Alert.sensor_node_id == sensor_node_id)
+            if time_start is not None:
+                query = query.filter(Alert.timestamp >= float(time_start))
+            if time_end is not None:
+                query = query.filter(Alert.timestamp <= float(time_end))
+            if targets:
+                query = query.filter(Alert.entity_ip.in_(targets))
+            return query
+
+        alert_counts = scoped_alert(session.query(
+            Alert.entity_ip, func.count(Alert.id).label("alert_count")
+        )).group_by(Alert.entity_ip).subquery()
+
+        carved_query = session.query(
+            CarvedFile.entity_ip, func.count(CarvedFile.id).label("carved_count")
+        )
+        if source:
+            carved_query = carved_query.filter(_live_source_clause(CarvedFile.source) if source == "live" else CarvedFile.source == source)
+        if capture_session_id:
+            carved_query = carved_query.filter(CarvedFile.capture_session_id == capture_session_id)
+        if sensor_node_id:
+            carved_query = carved_query.filter(CarvedFile.sensor_node_id == sensor_node_id)
+        if time_start is not None:
+            carved_query = carved_query.filter(CarvedFile.timestamp >= float(time_start))
+        if time_end is not None:
+            carved_query = carved_query.filter(CarvedFile.timestamp <= float(time_end))
+        if targets:
+            carved_query = carved_query.filter(CarvedFile.entity_ip.in_(targets))
+        carved_counts = carved_query.group_by(CarvedFile.entity_ip).subquery()
+
+        flow_endpoints = scoped_flow(session.query(
             Flow.src_ip.label("entity_ip"), Flow.id.label("flow_id")
-        ).union_all(
-            session.query(Flow.dst_ip.label("entity_ip"), Flow.id.label("flow_id"))
+        )).union_all(
+            scoped_flow(session.query(Flow.dst_ip.label("entity_ip"), Flow.id.label("flow_id")))
         ).subquery()
         flow_counts = session.query(
             flow_endpoints.c.entity_ip,
@@ -1463,6 +1736,17 @@ class WatchtowerDB:
         
         if source:
             query = query.filter(_live_source_clause(Entity.source) if source == "live" else Entity.source == source)
+
+        scope_requested = any(value is not None for value in (
+            interface, capture_session_id, time_start, time_end, sensor_node_id,
+        )) or bool(targets)
+        if scope_requested:
+            flow_ips = scoped_flow(session.query(Flow.src_ip.label("entity_ip"))).union(
+                scoped_flow(session.query(Flow.dst_ip.label("entity_ip")))
+            )
+            alert_ips = scoped_alert(session.query(Alert.entity_ip.label("entity_ip")))
+            scoped_ips = flow_ips.union(alert_ips).subquery()
+            query = query.filter(Entity.ip.in_(select(scoped_ips.c[0])))
             
         entities = query.order_by(Entity.risk_score.desc()).all()
         
@@ -1788,7 +2072,8 @@ class WatchtowerDB:
         capture_session_id: str = None, finding_type: str = None,
         include_suppressed: bool = False, limit: int = 1000,
         sensor_node_id: str = None, after_last_seen: float = None,
-        after_id: int = None, offset: int = 0,
+        after_id: int = None, offset: int = 0, time_start: float = None,
+        time_end: float = None, target_ips: List[str] = None,
     ) -> List[Dict]:
         session = self._get_session()
         query = session.query(DetectionFinding)
@@ -1802,6 +2087,13 @@ class WatchtowerDB:
             query = query.filter(DetectionFinding.capture_session_id == capture_session_id)
         if sensor_node_id:
             query = query.filter(DetectionFinding.sensor_node_id == sensor_node_id)
+        targets = [str(value) for value in (target_ips or ()) if value]
+        if targets:
+            query = query.filter(or_(DetectionFinding.subject.in_(targets), DetectionFinding.target.in_(targets)))
+        if time_start is not None:
+            query = query.filter(DetectionFinding.last_seen >= float(time_start))
+        if time_end is not None:
+            query = query.filter(DetectionFinding.first_seen <= float(time_end))
         if finding_type:
             query = query.filter(DetectionFinding.finding_type == finding_type)
         if not include_suppressed:
@@ -1831,9 +2123,12 @@ class WatchtowerDB:
         self, subject: str, source: str = None, interface: str = None,
         capture_session_id: str = None, as_of: float = None, asset_role: str = None,
         persist: bool = True, sensor_node_id: str = None,
+        time_start: float = None, time_end: float = None, target_ips: List[str] = None,
     ) -> Dict:
         from core.detection.scoring import PriorityScorer, ScoringConfig
 
+        if persist and (time_start is not None or time_end is not None or target_ips):
+            raise ValueError("time- or target-scoped risk assessments cannot be persisted as rollup snapshots")
         as_of = float(as_of if as_of is not None else time.time())
         override = self.data_dir / "config" / "scoring.yaml"
         shipped = Path(__file__).resolve().parents[1] / "detection" / "scoring_profiles.yaml"
@@ -1861,13 +2156,15 @@ class WatchtowerDB:
         findings = self.get_detection_findings(
             subject=subject, source=source, interface=interface,
             capture_session_id=capture_session_id, include_suppressed=False, limit=100000,
-            sensor_node_id=sensor_node_id,
+            sensor_node_id=sensor_node_id, time_start=time_start, time_end=time_end,
+            target_ips=target_ips,
         )
         scope_type, scope_id = self._risk_scope(source, interface, capture_session_id, sensor_node_id)
         assessment = scorer.score(
             findings, as_of=as_of, asset_role=asset_role,
             scope={"type": scope_type, "id": scope_id, "source": source,
-                   "interface": interface, "session": capture_session_id, "node": sensor_node_id},
+                   "interface": interface, "session": capture_session_id, "node": sensor_node_id,
+                   "time_start": time_start, "time_end": time_end, "target_ips": list(target_ips or ())},
         )
         result = assessment.to_dict()
         if persist:
@@ -2114,7 +2411,8 @@ class WatchtowerDB:
     def get_alerts(self, entity_ip: str = None, source: str = None, limit: int = 100,
                    include_hidden: bool = False, interface: str = None,
                    capture_session_id: str = None, offset: int = 0,
-                   sensor_node_id: str = None) -> List[Dict]:
+                   sensor_node_id: str = None, time_start: float = None,
+                   time_end: float = None) -> List[Dict]:
         """Get alerts, optionally filtered."""
         if os.getenv("WATCHTOWER_SCORING_MODE", "dual").lower() == "v2":
             from core.detection.contracts import LEGACY_TYPE_MAP
@@ -2127,6 +2425,7 @@ class WatchtowerDB:
                 subject=entity_ip, source=source, interface=interface,
                 capture_session_id=capture_session_id,
                 include_suppressed=include_hidden, limit=limit,
+                time_start=time_start, time_end=time_end,
             )
             if sensor_node_id:
                 findings = [item for item in findings if item.get("sensor_node_id") == sensor_node_id]
@@ -2166,6 +2465,10 @@ class WatchtowerDB:
             query = query.filter(Alert.capture_session_id == capture_session_id)
         if sensor_node_id:
             query = query.filter(Alert.sensor_node_id == sensor_node_id)
+        if time_start is not None:
+            query = query.filter(Alert.timestamp >= float(time_start))
+        if time_end is not None:
+            query = query.filter(Alert.timestamp <= float(time_end))
 
         alerts = query.order_by(Alert.timestamp.desc(), Alert.id.desc()).offset(max(0, int(offset))).limit(limit).all()
         result = []
@@ -2340,7 +2643,9 @@ class WatchtowerDB:
     def get_flows(self, source: str = None, limit: int = 50, interface: str = None,
                   capture_session_id: str = None, offset: int = 0,
                   sensor_node_id: str = None, protocol: str = None, port: int = None,
-                  after_packet_count: int = None, after_id: int = None) -> List[Dict]:
+                  after_packet_count: int = None, after_id: int = None,
+                  target_ips: List[str] = None, time_start: float = None,
+                  time_end: float = None) -> List[Dict]:
         """Get flow records."""
         session = self._get_session()
         query = session.query(Flow)
@@ -2355,6 +2660,11 @@ class WatchtowerDB:
             query = query.filter(Flow.capture_session_id == capture_session_id)
         if sensor_node_id:
             query = query.filter(Flow.sensor_node_id == sensor_node_id)
+        if target_ips:
+            targets = [str(value) for value in target_ips if value]
+            if targets:
+                query = query.filter(or_(Flow.src_ip.in_(targets), Flow.dst_ip.in_(targets)))
+        query = _apply_time_window(query, Flow.start_time, Flow.last_seen, time_start, time_end)
         if protocol:
             query = query.filter(func.upper(Flow.protocol) == str(protocol).upper())
         if port is not None:
@@ -2381,7 +2691,9 @@ class WatchtowerDB:
         return result
 
     def summarize_flows(self, source: str = None, interface: str = None,
-                        capture_session_id: str = None, sensor_node_id: str = None) -> Dict[str, Any]:
+                        capture_session_id: str = None, sensor_node_id: str = None,
+                        target_ips: List[str] = None, time_start: float = None,
+                        time_end: float = None) -> Dict[str, Any]:
         """Return exact aggregate flow facts without loading every row."""
         with self.session_scope() as session:
             query = session.query(Flow)
@@ -2393,6 +2705,11 @@ class WatchtowerDB:
                 query = query.filter(Flow.capture_session_id == capture_session_id)
             if sensor_node_id:
                 query = query.filter(Flow.sensor_node_id == sensor_node_id)
+            if target_ips:
+                targets = [str(value) for value in target_ips if value]
+                if targets:
+                    query = query.filter(or_(Flow.src_ip.in_(targets), Flow.dst_ip.in_(targets)))
+            query = _apply_time_window(query, Flow.start_time, Flow.last_seen, time_start, time_end)
             aggregate = query.with_entities(
                 func.count(Flow.id),
                 func.coalesce(func.sum(Flow.packet_count), 0),
@@ -2493,7 +2810,8 @@ class WatchtowerDB:
                          interface: str = None, capture_session_id: str = None,
                          offset: int = 0, sensor_node_id: str = None,
                          protocol: str = None, port: int = None,
-                         after_packet_count: int = None, after_id: int = None) -> List[Dict]:
+                         after_packet_count: int = None, after_id: int = None,
+                         time_start: float = None, time_end: float = None) -> List[Dict]:
         """Get flows involving a specific IP."""
         session = self._get_session()
         query = session.query(Flow).filter(
@@ -2510,6 +2828,7 @@ class WatchtowerDB:
             query = query.filter(Flow.capture_session_id == capture_session_id)
         if sensor_node_id:
             query = query.filter(Flow.sensor_node_id == sensor_node_id)
+        query = _apply_time_window(query, Flow.start_time, Flow.last_seen, time_start, time_end)
         if protocol:
             query = query.filter(func.upper(Flow.protocol) == str(protocol).upper())
         if port is not None:
@@ -2693,16 +3012,19 @@ class WatchtowerDB:
             raise
 
     def get_endpoint_identity(self, ip: str, source: str = None, interface: str = None,
-                              capture_session_id: str = None, sensor_node_id: str = None) -> Optional[Dict]:
+                              capture_session_id: str = None, sensor_node_id: str = None,
+                              time_start: float = None, time_end: float = None) -> Optional[Dict]:
         rows = self.get_endpoint_identities(
             source=source, interface=interface, capture_session_id=capture_session_id, ip=ip, limit=1,
-            sensor_node_id=sensor_node_id,
+            sensor_node_id=sensor_node_id, time_start=time_start, time_end=time_end,
         )
         return rows[0] if rows else None
 
     def get_endpoint_identities(self, source: str = None, interface: str = None,
                                 capture_session_id: str = None, ip: str = None,
-                                limit: int = 1000, sensor_node_id: str = None) -> List[Dict]:
+                                limit: int = 1000, sensor_node_id: str = None,
+                                target_ips: List[str] = None, time_start: float = None,
+                                time_end: float = None) -> List[Dict]:
         session = self._get_session()
         query = session.query(EndpointIdentity)
         if ip:
@@ -2720,6 +3042,12 @@ class WatchtowerDB:
             query = query.filter(EndpointIdentity.capture_session_id == capture_session_id)
         if sensor_node_id:
             query = query.filter(EndpointIdentity.sensor_node_id == sensor_node_id)
+        targets = [str(value) for value in (target_ips or ()) if value]
+        if targets:
+            query = query.filter(EndpointIdentity.entity_ip.in_(targets))
+        query = _apply_time_window(
+            query, EndpointIdentity.first_seen, EndpointIdentity.last_seen, time_start, time_end,
+        )
         rows = query.order_by(EndpointIdentity.updated_at.desc(), EndpointIdentity.entity_ip.asc()).limit(limit).all()
         return [self._identity_row(row) for row in rows]
 
@@ -2772,7 +3100,9 @@ class WatchtowerDB:
 
     def get_identity_observations(self, *, subject_ip: str = None, source: str = None,
                                   interface: str = None, capture_session_id: str = None,
-                                  observation_type: str = None, limit: int = 500) -> List[Dict]:
+                                  observation_type: str = None, sensor_node_id: str = None,
+                                  time_start: float = None, time_end: float = None,
+                                  target_ips: List[str] = None, limit: int = 500) -> List[Dict]:
         session = self._get_session()
         query = session.query(IdentityObservation)
         if subject_ip:
@@ -2788,6 +3118,21 @@ class WatchtowerDB:
             query = query.filter(IdentityObservation.capture_interface == interface)
         if capture_session_id:
             query = query.filter(IdentityObservation.capture_session_id == capture_session_id)
+        if sensor_node_id:
+            query = query.filter(IdentityObservation.sensor_node_id == sensor_node_id)
+        if time_start is not None:
+            query = query.filter(
+                IdentityObservation.last_seen.is_not(None),
+                IdentityObservation.last_seen >= float(time_start),
+            )
+        if time_end is not None:
+            query = query.filter(
+                IdentityObservation.first_seen.is_not(None),
+                IdentityObservation.first_seen <= float(time_end),
+            )
+        targets = [str(item) for item in (target_ips or ()) if str(item)]
+        if targets:
+            query = query.filter(IdentityObservation.subject_ip.in_(targets))
         if observation_type:
             query = query.filter(IdentityObservation.observation_type == observation_type)
         rows = query.order_by(IdentityObservation.last_seen.desc(), IdentityObservation.subject_ip.asc()).limit(max(1, min(int(limit), 5000))).all()
@@ -2978,6 +3323,7 @@ class WatchtowerDB:
 
     def get_endpoint_process_observations(
         self, *, ip: str = None, sensor_node_id: str = None, limit: int = 100,
+        time_start: float = None, time_end: float = None,
     ) -> List[Dict]:
         session = self._get_session()
         query = session.query(EndpointProcessObservation).filter(
@@ -2988,6 +3334,10 @@ class WatchtowerDB:
                 EndpointProcessObservation.local_ip == ip,
                 EndpointProcessObservation.remote_ip == ip,
             ))
+        if time_start is not None:
+            query = query.filter(EndpointProcessObservation.observed_at >= float(time_start))
+        if time_end is not None:
+            query = query.filter(EndpointProcessObservation.observed_at <= float(time_end))
         rows = query.order_by(EndpointProcessObservation.observed_at.desc()).limit(max(1, min(int(limit), 500))).all()
         return [self._endpoint_observation_row(row) for row in rows]
 
@@ -3059,14 +3409,26 @@ class WatchtowerDB:
         session.commit()
         return {column.name: getattr(row, column.name) for column in row.__table__.columns if column.name != "token_hash"}
 
+    def mesh_enrollment_usable(self, token_hash: str) -> bool:
+        row = self._get_session().query(MeshEnrollment).filter_by(token_hash=token_hash).first()
+        return bool(row and not row.revoked_at and row.expires_at > time.time() and row.used_count < row.max_uses)
+
     def consume_mesh_enrollment(self, token_hash: str) -> Optional[Dict]:
-        session = self._get_session()
-        row = session.query(MeshEnrollment).filter_by(token_hash=token_hash).first()
-        if not row or row.revoked_at or row.expires_at <= time.time() or row.used_count >= row.max_uses:
-            return None
-        row.used_count += 1
-        session.commit()
-        return {column.name: getattr(row, column.name) for column in row.__table__.columns if column.name != "token_hash"}
+        now = time.time()
+        with self.session_scope(write=True) as session:
+            updated = session.query(MeshEnrollment).filter(
+                MeshEnrollment.token_hash == token_hash,
+                MeshEnrollment.revoked_at.is_(None),
+                MeshEnrollment.expires_at > now,
+                MeshEnrollment.used_count < MeshEnrollment.max_uses,
+            ).update(
+                {MeshEnrollment.used_count: MeshEnrollment.used_count + 1},
+                synchronize_session=False,
+            )
+            if updated != 1:
+                return None
+            row = session.query(MeshEnrollment).filter_by(token_hash=token_hash).one()
+            return {column.name: getattr(row, column.name) for column in row.__table__.columns if column.name != "token_hash"}
 
     def revoke_sensor_node(self, node_id: str, reason: str) -> bool:
         session = self._get_session()
@@ -3428,7 +3790,8 @@ class WatchtowerDB:
                            flow_dst: str = None, timestamp: float = 0.0,
                            vt_results: Dict = None, data: bytes = None,
                            source: str = "live", commit: bool = True,
-                           sensor_node_id: str = None):
+                           sensor_node_id: str = None, capture_session_id: str = None,
+                           capture_interface: str = None):
         """Insert a carved file using SQLAlchemy (deduplicates by sha256)."""
         session = self._get_session()
         existing = session.query(CarvedFile).filter_by(sha256=sha256).first()
@@ -3438,6 +3801,7 @@ class WatchtowerDB:
                 sha256=sha256, size=size, flow_src=flow_src, flow_dst=flow_dst,
                 timestamp=timestamp, vt_results=json.dumps(vt_results) if vt_results else None,
                 data=data, source=source,
+                capture_session_id=capture_session_id, capture_interface=capture_interface,
                 sensor_node_id=sensor_node_id or self.local_sensor_node_id(),
             )
             session.add(cf)
@@ -3457,7 +3821,9 @@ class WatchtowerDB:
                     logger.exception("Unable to enqueue artifact graph projection event")
 
     def get_carved_files(self, entity_ip: str = None, source: str = None,
-                         sensor_node_id: str = None) -> List[Dict]:
+                         sensor_node_id: str = None, interface: str = None,
+                         capture_session_id: str = None, time_start: float = None,
+                         time_end: float = None, limit: int = None) -> List[Dict]:
         """Get carved files, optionally filtered."""
         session = self._get_session()
         query = session.query(CarvedFile)
@@ -3470,8 +3836,18 @@ class WatchtowerDB:
                 query = query.filter_by(source=source)
         if sensor_node_id:
             query = query.filter(CarvedFile.sensor_node_id == sensor_node_id)
+        if interface:
+            query = query.filter(CarvedFile.capture_interface == interface)
+        if capture_session_id:
+            query = query.filter(CarvedFile.capture_session_id == capture_session_id)
+        query = _apply_time_window(
+            query, CarvedFile.timestamp, CarvedFile.timestamp, time_start, time_end,
+        )
         
-        files = query.order_by(CarvedFile.timestamp.desc()).all()
+        query = query.order_by(CarvedFile.timestamp.desc())
+        if limit is not None:
+            query = query.limit(max(1, min(int(limit), 500)))
+        files = query.all()
         result = []
         for f in files:
             # Exclude binary data from list view

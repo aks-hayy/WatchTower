@@ -26,6 +26,7 @@ class InvestigationResult:
     timeline: List[Dict] = field(default_factory=list)
     evidence: List[Dict] = field(default_factory=list)
     next_actions: List[str] = field(default_factory=list)
+    limitations: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -37,15 +38,30 @@ class InvestigationService:
         self.asset_profiler = LocalAssetProfiler(db)
 
     def investigate(self, ip: str, source: Optional[str] = None, persist: bool = True,
-                    sensor_node_id: Optional[str] = None) -> InvestigationResult:
-        entity = self.db.get_entity(ip) or {"ip": ip}
+                    sensor_node_id: Optional[str] = None, interface: Optional[str] = None,
+                    capture_session_id: Optional[str] = None, time_start: Optional[float] = None,
+                    time_end: Optional[float] = None) -> InvestigationResult:
+        scope_restricted = any(value is not None for value in (
+            source, sensor_node_id, interface, capture_session_id, time_start, time_end,
+        ))
+        entity = (self.db.get_entity(ip) if not scope_restricted else None) or {"ip": ip}
         effective_source = source or entity.get("source") or "live"
         profile = self.asset_profiler.build(
             ip, source=source, persist=persist, sensor_node_id=sensor_node_id,
+            interface=interface, capture_session_id=capture_session_id,
+            time_start=time_start, time_end=time_end,
         ).to_dict()
-        flow_kwargs = {"source": source, "limit": 5000}
-        alert_kwargs = {"entity_ip": ip, "source": source, "limit": 1000}
-        file_kwargs = {"entity_ip": ip, "source": source}
+        flow_kwargs = {"source": source, "limit": 5000, "interface": interface,
+                       "capture_session_id": capture_session_id, "time_start": time_start,
+                       "time_end": time_end}
+        alert_kwargs = {"entity_ip": ip, "source": source, "limit": 1000, "interface": interface,
+                        "capture_session_id": capture_session_id, "time_start": time_start,
+                        "time_end": time_end}
+        file_kwargs = {
+            "entity_ip": ip, "source": source, "interface": interface,
+            "capture_session_id": capture_session_id,
+            "time_start": time_start, "time_end": time_end,
+        }
         if sensor_node_id:
             flow_kwargs["sensor_node_id"] = sensor_node_id
             alert_kwargs["sensor_node_id"] = sensor_node_id
@@ -97,6 +113,15 @@ class InvestigationService:
         findings = self._findings(profile, alert_groups, files)
         confidence = self._confidence(entity, flows, alerts, files)
         next_actions = self._next_actions(profile, alert_groups, files, correlations)
+        limitations = []
+        if scope_restricted:
+            limitations.append(
+                "Global entity identity was excluded because it cannot be attributed to the selected capture scope."
+            )
+            if interface or capture_session_id or time_start is not None or time_end is not None:
+                limitations.append(
+                    "Artifacts without matching interface, capture-session, and time provenance are excluded."
+                )
         timeline.sort(key=lambda item: item.get("timestamp") or 0, reverse=True)
 
         summary = (
@@ -118,8 +143,9 @@ class InvestigationService:
             timeline=timeline[:200],
             evidence=evidence,
             next_actions=next_actions,
+            limitations=limitations,
         )
-        if persist:
+        if persist and not scope_restricted:
             self.db.upsert_evidence_links(evidence)
         return result
 

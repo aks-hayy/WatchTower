@@ -12,6 +12,8 @@ import uuid
 
 import yaml
 
+from core.operations.scope import EffectiveScope
+
 
 @dataclass(frozen=True)
 class GraphConfig:
@@ -96,57 +98,94 @@ class EvidenceGraphService:
                 break
         return {**self.status(), "materialized": delivered}
 
-    def neighborhood(self, ip: str, sensor_node_id: Optional[str] = None, depth: int = 2, limit: int = 100) -> Dict[str, Any]:
+    def neighborhood(self, ip: str, sensor_node_id: Optional[str] = None, depth: int = 2, limit: int = 100,
+                    scope: Optional[EffectiveScope | Dict[str, Any]] = None) -> Dict[str, Any]:
         self._require_available()
-        node_id = sensor_node_id or self.db.local_sensor_node_id()
+        effective = self._effective_scope(scope, node_id=sensor_node_id)
+        node_id = effective.node_id or self.db.local_sensor_node_id()
         root_id = self._endpoint_id(node_id, ip)
         depth = max(1, min(int(depth), 3))
         limit = max(1, min(int(limit), 250))
         query = f"""
-            MATCH (root {{id: $root_id}})-[relationships*1..{depth}]-(related)
+            MATCH path=(root {{id: $root_id}})-[*1..{depth}]-(related)
+            WHERE all(relationship IN relationships(path) WHERE
+                ($interface IS NULL OR coalesce(relationship.interface, '') = $interface)
+                AND ($session_id IS NULL OR coalesce(relationship.session, '') = $session_id)
+                AND ($time_start IS NULL OR coalesce(relationship.last_seen, relationship.observed_at, relationship.first_seen, 0.0) >= $time_start)
+                AND ($time_end IS NULL OR coalesce(relationship.first_seen, relationship.observed_at, relationship.last_seen, 0.0) <= $time_end)
+            )
+            AND ($target_ips IS NULL OR related.ip IN $target_ips OR root.ip IN $target_ips)
             WITH collect(DISTINCT root) + collect(DISTINCT related) AS nodes,
-                 relationships
+                 collect(DISTINCT relationships(path)) AS relationship_paths
             UNWIND nodes AS node
-            WITH collect(DISTINCT {{id: node.id, labels: labels(node), properties: properties(node)}}) AS node_rows, relationships
-            UNWIND relationships AS relationship_list
+            WITH collect(DISTINCT {{id: node.id, labels: labels(node), properties: properties(node)}}) AS node_rows, relationship_paths
+            UNWIND relationship_paths AS relationship_list
             UNWIND relationship_list AS relationship
             RETURN node_rows, collect(DISTINCT {{id: elementId(relationship), type: type(relationship), source: startNode(relationship).id, target: endNode(relationship).id, properties: properties(relationship)}})[..$limit] AS edge_rows
         """
-        records = self._run(query, {"root_id": root_id, "limit": limit})
+        records = self._run(query, {"root_id": root_id, "limit": limit, **self._scope_parameters(effective)})
         if not records:
-            return {"root": root_id, "nodes": [], "edges": [], "truncated": False}
+            return self._graph_result({"root": root_id, "nodes": [], "edges": [], "truncated": False}, effective)
         record = records[0]
-        return {"root": root_id, "nodes": record.get("node_rows") or [], "edges": record.get("edge_rows") or [], "truncated": len(record.get("edge_rows") or []) >= limit}
+        return self._graph_result({
+            "root": root_id, "nodes": record.get("node_rows") or [], "edges": record.get("edge_rows") or [],
+            "truncated": len(record.get("edge_rows") or []) >= limit,
+        }, effective)
 
-    def shortest_path(self, source_ip: str, target_ip: str, sensor_node_id: Optional[str] = None) -> Dict[str, Any]:
+    def shortest_path(self, source_ip: str, target_ip: str, sensor_node_id: Optional[str] = None,
+                      scope: Optional[EffectiveScope | Dict[str, Any]] = None) -> Dict[str, Any]:
         self._require_available()
-        node = sensor_node_id or self.db.local_sensor_node_id()
+        effective = self._effective_scope(scope, node_id=sensor_node_id, target_ips=[source_ip, target_ip])
+        node = effective.node_id or self.db.local_sensor_node_id()
         query = """
             MATCH (source {id: $source_id}), (target {id: $target_id}), path = shortestPath((source)-[*..6]-(target))
+            WHERE all(relationship IN relationships(path) WHERE
+                ($interface IS NULL OR coalesce(relationship.interface, '') = $interface)
+                AND ($session_id IS NULL OR coalesce(relationship.session, '') = $session_id)
+                AND ($time_start IS NULL OR coalesce(relationship.last_seen, relationship.observed_at, relationship.first_seen, 0.0) >= $time_start)
+                AND ($time_end IS NULL OR coalesce(relationship.first_seen, relationship.observed_at, relationship.last_seen, 0.0) <= $time_end)
+            )
             RETURN [item IN nodes(path) | {id: item.id, labels: labels(item), properties: properties(item)}] AS nodes,
                    [item IN relationships(path) | {id: elementId(item), type: type(item), source: startNode(item).id, target: endNode(item).id, properties: properties(item)}] AS edges
             LIMIT 1
         """
-        rows = self._run(query, {"source_id": self._endpoint_id(node, source_ip), "target_id": self._endpoint_id(node, target_ip)})
-        return rows[0] if rows else {"nodes": [], "edges": []}
+        rows = self._run(query, {
+            "source_id": self._endpoint_id(node, source_ip), "target_id": self._endpoint_id(node, target_ip),
+            **self._scope_parameters(effective),
+        })
+        return self._graph_result(rows[0] if rows else {"nodes": [], "edges": []}, effective)
 
     def timeline(self, ip: str, sensor_node_id: Optional[str] = None, start: Optional[float] = None,
-                 end: Optional[float] = None, limit: int = 200) -> Dict[str, Any]:
+                 end: Optional[float] = None, limit: int = 200,
+                 scope: Optional[EffectiveScope | Dict[str, Any]] = None) -> Dict[str, Any]:
         self._require_available()
-        node = sensor_node_id or self.db.local_sensor_node_id()
+        effective = self._effective_scope(
+            scope,
+            node_id=sensor_node_id,
+            time_start=start,
+            time_end=end,
+            target_ips=[ip],
+        )
+        scope_values = effective.to_dict()
+        scope_values["time_start"] = 0.0 if effective.time_start is None else effective.time_start
+        scope_values["time_end"] = time.time() if effective.time_end is None else effective.time_end
+        effective = EffectiveScope.from_dict(scope_values)
+        node = effective.node_id or self.db.local_sensor_node_id()
         rows = self._run("""
             MATCH (endpoint {id: $endpoint_id})-[relationship]-()
-            WHERE coalesce(relationship.last_seen, relationship.observed_at, 0.0) >= $start
-              AND coalesce(relationship.first_seen, relationship.observed_at, 0.0) <= $end
+            WHERE ($interface IS NULL OR coalesce(relationship.interface, '') = $interface)
+              AND ($session_id IS NULL OR coalesce(relationship.session, '') = $session_id)
+              AND coalesce(relationship.last_seen, relationship.observed_at, relationship.first_seen, 0.0) >= $time_start
+              AND coalesce(relationship.first_seen, relationship.observed_at, relationship.last_seen, 0.0) <= $time_end
             RETURN type(relationship) AS type, startNode(relationship).id AS source, endNode(relationship).id AS target,
                    properties(relationship) AS properties
             ORDER BY coalesce(relationship.last_seen, relationship.observed_at, 0.0) DESC
             LIMIT $limit
         """, {
-            "endpoint_id": self._endpoint_id(node, ip), "start": float(start or 0.0), "end": float(end or time.time()),
+            "endpoint_id": self._endpoint_id(node, ip), **self._scope_parameters(effective),
             "limit": max(1, min(int(limit), 500)),
         })
-        return {"items": rows, "truncated": len(rows) >= int(limit)}
+        return self._graph_result({"items": rows, "truncated": len(rows) >= int(limit)}, effective)
 
     def _apply(self, operation: str, payload: Dict[str, Any]) -> None:
         if operation == "flow":
@@ -412,6 +451,42 @@ class EvidenceGraphService:
         status = self.status()
         if not status["available"]:
             raise RuntimeError(status["reason"])
+
+    def _effective_scope(self, scope: Optional[EffectiveScope | Dict[str, Any]], **overrides: Any) -> EffectiveScope:
+        if isinstance(scope, EffectiveScope):
+            value = scope
+        else:
+            value = EffectiveScope.from_dict(scope or {})
+        values = value.to_dict()
+        for key, override in overrides.items():
+            if override is not None:
+                values[key] = override
+        return EffectiveScope.from_dict(values)
+
+    @staticmethod
+    def _scope_parameters(scope: EffectiveScope) -> Dict[str, Any]:
+        return {
+            "interface": scope.interface,
+            "session_id": scope.session_id,
+            "time_start": scope.time_start,
+            "time_end": scope.time_end,
+            "target_ips": list(scope.target_ips) or None,
+        }
+
+    def _graph_result(self, result: Dict[str, Any], scope: EffectiveScope) -> Dict[str, Any]:
+        status = self.status()
+        truncated = bool(result.get("truncated"))
+        limitations = []
+        if status.get("freshness") != "current":
+            limitations.append("The evidence graph is not current with the local evidence outbox.")
+        if truncated:
+            limitations.append("The graph result reached its configured result limit.")
+        return {
+            **result,
+            "effective_scope": scope.to_dict(),
+            "completeness": {"complete": not truncated and not limitations, "truncated": truncated},
+            "limitations": limitations,
+        }
 
     @staticmethod
     def _endpoint_id(node_id: str, ip: str) -> str:

@@ -1009,6 +1009,27 @@ def test_current_native_publication_failure_is_not_labeled_legacy(tmp_path):
         db.close()
 
 
+def test_offline_pcap_flows_are_queryable_with_the_offline_interface_scope(tmp_path):
+    capture = tmp_path / "offline-interface.pcap"
+    source = "pcap:offline-interface"
+    packet = scapy.Ether() / scapy.IP(src="192.0.2.10", dst="198.51.100.20") / scapy.UDP(sport=40000, dport=53)
+    packet.time = 1_700_000_000.0
+    scapy.wrpcap(str(capture), [packet])
+    db = WatchtowerDB(data_dir=str(tmp_path / "watchtower"))
+    try:
+        engine = ForensicsEngine(db=db, data_dir=str(tmp_path / "watchtower"), silent=True)
+        engine.analyze_pcap(str(capture), source_name=source, mode="memory", backend="python")
+
+        flows = db.get_flows(source=source, interface="offline", limit=10)
+        summary = db.summarize_flows(source=source, interface="offline")
+
+        assert len(flows) == 1
+        assert summary["flow_count"] == 1
+        assert summary["packet_count"] == 1
+    finally:
+        db.close()
+
+
 class _MemoryCredentialStore:
     def __init__(self):
         self.secrets = {}
